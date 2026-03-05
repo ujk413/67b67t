@@ -1,0 +1,393 @@
+import Fastify from "fastify";
+import cors from "@fastify/cors";
+import cookie from "@fastify/cookie";
+import multipart from "@fastify/multipart";
+import websocket from "@fastify/websocket";
+import argon2 from "argon2";
+import { nanoid } from "nanoid";
+import pg from "pg";
+
+const { Pool } = pg;
+
+const app = Fastify({ logger: true });
+
+await app.register(cors, { origin: true, credentials: true });
+await app.register(cookie);
+await app.register(multipart, { limits: { fileSize: 25 * 1024 * 1024 } });
+await app.register(websocket);
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+const COOKIE_SECURE = (process.env.COOKIE_SECURE ?? "true") === "true";
+const COOKIE_NAME = "token";
+
+async function getUserByToken(token) {
+  if (!token) return null;
+  const r = await pool.query(
+    `select u.id, u.username
+     from sessions s join users u on u.id=s.user_id
+     where s.token=$1`,
+    [token]
+  );
+  return r.rowCount ? r.rows[0] : null;
+}
+
+async function requireAuth(req, reply) {
+  const token = req.cookies?.[COOKIE_NAME];
+  const me = await getUserByToken(token);
+  if (!me) {
+    reply.code(401).send({ error: "unauthorized" });
+    return null;
+  }
+  return me;
+}
+
+function setSessionCookie(reply, token) {
+  reply.setCookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: COOKIE_SECURE,
+    path: "/"
+  });
+}
+
+app.get("/health", async () => ({ ok: true }));
+
+app.post("/auth/register", async (req, reply) => {
+  const body = req.body ?? {};
+  const username = typeof body.username === "string" ? body.username.trim().toLowerCase() : "";
+  const password = typeof body.password === "string" ? body.password : "";
+  if (!username || username.length < 3) return reply.code(400).send({ error: "username_too_short" });
+  if (!password || password.length < 3) return reply.code(400).send({ error: "password_too_short" });
+
+  const exists = await pool.query("select id from users where username=$1", [username]);
+  if (exists.rowCount) return reply.code(409).send({ error: "username_taken" });
+
+  const passwordHash = await argon2.hash(password);
+  const created = await pool.query(
+    "insert into users(username,password_hash) values($1,$2) returning id, username",
+    [username, passwordHash]
+  );
+
+  const token = nanoid(32);
+  await pool.query("insert into sessions(token,user_id) values($1,$2)", [token, created.rows[0].id]);
+
+  setSessionCookie(reply, token);
+  reply.send({ ok: true, user: created.rows[0] });
+});
+
+app.post("/auth/login", async (req, reply) => {
+  const body = req.body ?? {};
+  const username = typeof body.username === "string" ? body.username.trim().toLowerCase() : "";
+  const password = typeof body.password === "string" ? body.password : "";
+
+  const r = await pool.query("select id, username, password_hash from users where username=$1", [username]);
+  if (!r.rowCount) return reply.code(401).send({ error: "invalid_credentials" });
+
+  const u = r.rows[0];
+  const ok = await argon2.verify(u.password_hash, password);
+  if (!ok) return reply.code(401).send({ error: "invalid_credentials" });
+
+  const token = nanoid(32);
+  await pool.query("insert into sessions(token,user_id) values($1,$2)", [token, u.id]);
+
+  setSessionCookie(reply, token);
+  reply.send({ ok: true, user: { id: u.id, username: u.username } });
+});
+
+app.post("/auth/logout", async (req, reply) => {
+  const token = req.cookies?.[COOKIE_NAME];
+  if (token) await pool.query("delete from sessions where token=$1", [token]);
+  reply.clearCookie(COOKIE_NAME, { path: "/" });
+  reply.send({ ok: true });
+});
+
+app.get("/me", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+  reply.send({ ok: true, user: me });
+});
+
+app.put("/keys/me", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+  const body = req.body ?? {};
+  const pub = body.publicKeyJwk;
+  if (!pub || typeof pub !== "object") return reply.code(400).send({ error: "bad_pubkey" });
+  await pool.query("update users set pubkey_jwk=$1 where id=$2", [pub, me.id]);
+  reply.send({ ok: true });
+});
+
+app.get("/keys/:username", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+  const username = String(req.params.username || "").trim().toLowerCase();
+  const r = await pool.query("select username, pubkey_jwk from users where username=$1", [username]);
+  if (!r.rowCount) return reply.code(404).send({ error: "user_not_found" });
+  const row = r.rows[0];
+  if (!row.pubkey_jwk) return reply.code(409).send({ error: "user_no_pubkey" });
+  reply.send({ ok: true, username: row.username, publicKeyJwk: row.pubkey_jwk });
+});
+
+app.post("/rooms", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+
+  const body = req.body ?? {};
+  const kind = typeof body.kind === "string" ? body.kind : "dm";
+  const title = typeof body.title === "string" ? body.title.trim() : "";
+  const tag = typeof body.tag === "string" ? body.tag.trim().toLowerCase() : null;
+  const members = Array.isArray(body.members) ? body.members.map(x => String(x).trim().toLowerCase()).filter(Boolean) : [];
+  const uniq = Array.from(new Set([me.username, ...members])).slice(0, 30);
+
+  const ures = await pool.query("select id, username from users where username = any($1::text[])", [uniq]);
+  if (ures.rowCount !== uniq.length) return reply.code(400).send({ error: "some_users_not_found" });
+
+  const roomId = nanoid(12);
+  await pool.query("insert into rooms(id,kind,title,tag,created_by) values($1,$2,$3,$4,$5)", [
+    roomId,
+    kind,
+    title || null,
+    tag,
+    me.id
+  ]);
+
+  for (const u of ures.rows) {
+    await pool.query("insert into room_members(room_id,user_id) values($1,$2) on conflict do nothing", [roomId, u.id]);
+  }
+
+  reply.send({ ok: true, room: { id: roomId, kind, title: title || null, tag, created_at: new Date().toISOString() }, members: ures.rows });
+});
+
+app.get("/rooms", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+  const tag = typeof req.query?.tag === "string" ? req.query.tag.trim().toLowerCase() : "";
+
+  const r = await pool.query(
+    `select r.id, r.kind, r.title, r.tag, r.created_at
+     from room_members rm join rooms r on r.id=rm.room_id
+     where rm.user_id=$1
+     ${tag ? "and r.tag=$2" : ""}
+     order by r.created_at desc`,
+    tag ? [me.id, tag] : [me.id]
+  );
+
+  reply.send({ ok: true, rooms: r.rows });
+});
+
+app.post("/rooms/:id/key", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+
+  const roomId = String(req.params.id);
+  const body = req.body ?? {};
+  const keys = Array.isArray(body.keys) ? body.keys : [];
+  if (!keys.length) return reply.code(400).send({ error: "no_keys" });
+
+  const mem = await pool.query("select 1 from room_members where room_id=$1 and user_id=$2", [roomId, me.id]);
+  if (!mem.rowCount) return reply.code(403).send({ error: "not_member" });
+
+  for (const k of keys) {
+    const username = typeof k.username === "string" ? k.username.trim().toLowerCase() : "";
+    const iv_b64 = typeof k.iv_b64 === "string" ? k.iv_b64 : "";
+    const wrapped_key_b64 = typeof k.wrapped_key_b64 === "string" ? k.wrapped_key_b64 : "";
+    if (!username || !iv_b64 || !wrapped_key_b64) continue;
+
+    const u = await pool.query("select id from users where username=$1", [username]);
+    if (!u.rowCount) continue;
+
+    await pool.query(
+      `insert into room_keys(room_id,user_id,from_user_id,iv_b64,wrapped_key_b64)
+       values($1,$2,$3,$4,$5)
+       on conflict(room_id,user_id) do update set from_user_id=excluded.from_user_id, iv_b64=excluded.iv_b64, wrapped_key_b64=excluded.wrapped_key_b64, created_at=now()`,
+      [roomId, u.rows[0].id, me.id, iv_b64, wrapped_key_b64]
+    );
+  }
+
+  reply.send({ ok: true });
+});
+
+app.get("/rooms/:id/key", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+
+  const roomId = String(req.params.id);
+  const mem = await pool.query("select 1 from room_members where room_id=$1 and user_id=$2", [roomId, me.id]);
+  if (!mem.rowCount) return reply.code(403).send({ error: "not_member" });
+
+  const r = await pool.query(
+    `select rk.iv_b64, rk.wrapped_key_b64, u.username as from_username, u.pubkey_jwk as from_pub
+     from room_keys rk join users u on u.id=rk.from_user_id
+     where rk.room_id=$1 and rk.user_id=$2`,
+    [roomId, me.id]
+  );
+  if (!r.rowCount) return reply.code(404).send({ error: "no_room_key_for_user" });
+
+  const row = r.rows[0];
+  if (!row.from_pub) return reply.code(409).send({ error: "from_user_no_pubkey" });
+
+  reply.send({
+    ok: true,
+    from: row.from_username,
+    fromPublicKeyJwk: row.from_pub,
+    iv_b64: row.iv_b64,
+    wrapped_key_b64: row.wrapped_key_b64
+  });
+});
+
+app.get("/rooms/:id/messages", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+
+  const roomId = String(req.params.id);
+  const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 100)));
+
+  const mem = await pool.query("select 1 from room_members where room_id=$1 and user_id=$2", [roomId, me.id]);
+  if (!mem.rowCount) return reply.code(403).send({ error: "not_member" });
+
+  const r = await pool.query(
+    `select id, sender_username as sender, iv_b64, cipher_b64, media_id, created_at
+     from messages
+     where room_id=$1
+     order by created_at asc
+     limit $2`,
+    [roomId, limit]
+  );
+
+  reply.send({
+    ok: true,
+    messages: r.rows.map(x => ({
+      id: x.id,
+      sender: x.sender,
+      iv_b64: x.iv_b64,
+      cipher_b64: x.cipher_b64,
+      mediaId: x.media_id,
+      created_at: x.created_at
+    }))
+  });
+});
+
+const liveRooms = new Map();
+
+function roomKey(roomId) {
+  return `room:${roomId}`;
+}
+
+function addConnToRoom(roomId, ws) {
+  const k = roomKey(roomId);
+  if (!liveRooms.has(k)) liveRooms.set(k, new Set());
+  liveRooms.get(k).add(ws);
+}
+
+function removeConn(ws) {
+  for (const s of liveRooms.values()) s.delete(ws);
+}
+
+async function broadcastToRoom(roomId, payload) {
+  const k = roomKey(roomId);
+  const set = liveRooms.get(k);
+  if (!set) return;
+  const msg = JSON.stringify(payload);
+  for (const ws of set) {
+    if (ws.readyState === 1) ws.send(msg);
+  }
+}
+
+app.post("/rooms/:id/messages", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+
+  const roomId = String(req.params.id);
+  const body = req.body ?? {};
+  const iv_b64 = typeof body.iv_b64 === "string" ? body.iv_b64 : "";
+  const cipher_b64 = typeof body.cipher_b64 === "string" ? body.cipher_b64 : "";
+  const mediaId = typeof body.mediaId === "string" ? body.mediaId : null;
+
+  if (!iv_b64 || !cipher_b64) return reply.code(400).send({ error: "bad_payload" });
+
+  const mem = await pool.query("select 1 from room_members where room_id=$1 and user_id=$2", [roomId, me.id]);
+  if (!mem.rowCount) return reply.code(403).send({ error: "not_member" });
+
+  const ins = await pool.query(
+    `insert into messages(room_id,sender_id,sender_username,iv_b64,cipher_b64,media_id)
+     values($1,$2,$3,$4,$5,$6)
+     returning id, created_at`,
+    [roomId, me.id, me.username, iv_b64, cipher_b64, mediaId]
+  );
+
+  const message = {
+    id: ins.rows[0].id,
+    sender: me.username,
+    iv_b64,
+    cipher_b64,
+    mediaId,
+    created_at: ins.rows[0].created_at
+  };
+
+  await broadcastToRoom(roomId, { type: "msg", roomId, message });
+
+  reply.send({ ok: true, message });
+});
+
+app.post("/media", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+
+  const part = await req.file();
+  if (!part) return reply.code(400).send({ error: "no_file" });
+
+  const buf = await part.toBuffer();
+  const id = nanoid(16);
+
+  await pool.query(
+    `insert into media(id,owner_id,filename,content_type,size_bytes,data)
+     values($1,$2,$3,$4,$5,$6)`,
+    [id, me.id, part.filename || null, part.mimetype || "application/octet-stream", buf.length, buf]
+  );
+
+  reply.send({ ok: true, id });
+});
+
+app.get("/media/:id", async (req, reply) => {
+  const me = await requireAuth(req, reply);
+  if (!me) return;
+
+  const id = String(req.params.id);
+  const r = await pool.query("select id, content_type, filename, data from media where id=$1", [id]);
+  if (!r.rowCount) return reply.code(404).send({ error: "not_found" });
+
+  const row = r.rows[0];
+  reply.header("content-type", row.content_type || "application/octet-stream");
+  if (row.filename) reply.header("content-disposition", `inline; filename="${row.filename.replace(/"/g, "")}"`);
+  reply.send(row.data);
+});
+
+
+  reply.send({ ok: true, members: r.rows.map(x => x.username) });
+});
+app.get("/ws", { websocket: true }, async (conn, req) => {
+  const token = req.cookies?.[COOKIE_NAME];
+  const me = await getUserByToken(token);
+  if (!me) {
+    conn.socket.close();
+    return;
+  }
+
+  const ws = conn.socket;
+  ws.on("close", () => removeConn(ws));
+
+  const r = await pool.query(
+    `select r.id
+     from room_members rm join rooms r on r.id=rm.room_id
+     where rm.user_id=$1`,
+    [me.id]
+  );
+
+  for (const row of r.rows) addConnToRoom(row.id, ws);
+
+  ws.send(JSON.stringify({ type: "hello", user: me.username }));
+});
+
+const port = Number(process.env.PORT || 3000);
+await app.listen({ host: "0.0.0.0", port });

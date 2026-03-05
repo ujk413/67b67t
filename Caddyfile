@@ -1,0 +1,37 @@
+67b67t.ru {
+  root * /srv
+  file_server
+
+  # Disable caching for JS/CSS during development
+  @static {
+    path *.js *.css
+  }
+  header @static Cache-Control "no-cache, no-store, must-revalidate"
+
+  handle_path /api/* {
+    reverse_proxy api:3000
+  }
+
+  handle /ws* {
+    reverse_proxy api:3000
+  }
+}
+
+:80 {
+  root * /srv
+  file_server
+
+  # Disable caching for JS/CSS during development
+  @static {
+    path *.js *.css
+  }
+  header @static Cache-Control "no-cache, no-store, must-revalidate"
+
+  handle_path /api/* {
+    reverse_proxy api:3000
+  }
+
+  handle /ws* {
+    reverse_proxy api:3000
+  }
+}
