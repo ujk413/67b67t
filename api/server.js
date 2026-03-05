@@ -1542,6 +1542,7 @@ app.get("/posts/:postId/comments", async (req, reply) => {
 
 // --- WebSocket ---
 app.get("/ws", { websocket: true }, async (conn, req) => {
+  console.log("WebSocket connection established");
   let me = null;
 
   async function authenticateFromRequest(r) {
