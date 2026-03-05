@@ -499,6 +499,7 @@ app.post("/auth/register", async (req, reply) => {
 });
 
 app.post("/auth/login", async (req, reply) => {
+  console.log("Login attempt:", { username: req.body?.username, headers: req.headers });
   const body = req.body || {};
   const username = String(body.username || "").trim();
   const password = String(body.password || "");
@@ -531,6 +532,7 @@ app.post("/auth/login", async (req, reply) => {
     [rows[0].id, token_hash, ttlDays]
   );
 
+  console.log("Login successful:", { userId: rows[0].id, token_hash, ttlDays });
   reply.setCookie("token", token, authCookieOptions(req, ttlDays));
   return { user: { id: rows[0].id, username: rows[0].username } };
 });
