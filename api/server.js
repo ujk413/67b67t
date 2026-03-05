@@ -508,16 +508,20 @@ app.post("/auth/login", async (req, reply) => {
   if (username.length > 30) return reply.code(400).send({ error: "username_too_long" });
 
   const { rows } = await pool.query(`SELECT id, username, password_hash, banned FROM users WHERE username=$1 LIMIT 1`, [username]);
+  console.log("User found:", { found: rows.length, username, banned: rows[0]?.banned });
   if (!rows.length) return reply.code(401).send({ error: "bad_credentials" });
   if (rows[0].banned) return reply.code(403).send({ error: "account_banned" });
 
   const storedHash = String(rows[0].password_hash || "");
+  console.log("Password check:", { hashType: storedHash.startsWith("$argon2") ? "argon2" : "old" });
   if (storedHash.startsWith("$argon2")) {
     const ok = await argon2.verify(storedHash, password);
+    console.log("Argon2 verification:", { ok });
     if (!ok) return reply.code(401).send({ error: "bad_credentials" });
   } else {
     const [salt, stored] = storedHash.split(":");
     const check = sha256(salt + ':' + password);
+    console.log("Old password check:", { salt: salt.substring(0, 8) + "...", check: check === stored });
     if (check !== stored) return reply.code(401).send({ error: "bad_credentials" });
     const upgraded = await argon2.hash(password);
     await pool.query(`UPDATE users SET password_hash=$2 WHERE id=$1`, [rows[0].id, upgraded]);
