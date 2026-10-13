@@ -13,31 +13,42 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is migrating to Ubuntu 26 and ships a different
+    # Android SDK layout. 24.04 has the toolchain this project is tested on.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: mobile/package-lock.json
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      # No android-actions/setup-android here: the runner image already ships the
+      # Android SDK, and that action tries to install the retired `tools` package,
+      # which fails. Gradle auto-provisions anything missing (licenses are
+      # pre-accepted on GitHub runners).
+      - name: Show Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME/platforms" 2>/dev/null || true
+          ls "$ANDROID_HOME/build-tools" 2>/dev/null || true
 
       - name: Install JS dependencies
         working-directory: mobile
         run: npm ci
 
-      # mobile/android is generated (see mobile/.gitignore) — the checked-in
-      # folder holds only signing material, which is restored from secrets below.
+      # mobile/android is generated (see mobile/.gitignore) — the folder in the
+      # repo holds only signing material, restored from secrets below.
       - name: Generate native Android project
         working-directory: mobile
         run: npx expo prebuild --platform android --clean --no-install
@@ -63,6 +74,7 @@ jobs:
           keyPassword=$KEY_PASSWORD
           EOF
           sed -i 's/^ *//' mobile/android/key.properties
+          echo "keystore restored, $(stat -c%s mobile/android/keystores/release.keystore) bytes"
 
       - name: Build release APK
         working-directory: mobile/android
