@@ -1,0 +1,135 @@
+name: UI preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "mobile/**"
+      - ".github/workflows/preview.yml"
+      - "scripts/ci_preview_seed.sh"
+      - "scripts/ci_preview_capture.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The client hardcodes its API host (no server field in the UI), so a
+      # preview build has to point somewhere. 10.0.2.2 is the emulator's alias
+      # for the host loopback, where the throwaway backend below listens.
+      - name: Point the app at the preview backend
+        run: |
+          sed -i 's|https://67chat.ru/api|http://10.0.2.2:3999/api|' mobile/src/config.ts
+          grep DEFAULT_BASE_URL mobile/src/config.ts
+
+      - name: Install JS dependencies
+        working-directory: mobile
+        run: npm ci
+
+      - name: Generate native Android project
+        working-directory: mobile
+        run: npx expo prebuild --platform android --clean --no-install
+
+      # Release APKs bundle the JS bundle; debug APKs expect a running Metro.
+      - name: Allow cleartext HTTP to the preview backend
+        run: |
+          sed -i 's|<application |<application android:usesCleartextTraffic="true" |' \
+            mobile/android/app/src/main/AndroidManifest.xml
+          grep -o 'usesCleartextTraffic="[a-z]*"' mobile/android/app/src/main/AndroidManifest.xml
+
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p mobile/android/keystores
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > mobile/android/keystores/release.keystore
+          cat > mobile/android/key.properties <<EOF
+          storeFile=../keystores/release.keystore
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+          sed -i 's/^ *//' mobile/android/key.properties
+
+      - name: Build APK
+        working-directory: mobile/android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Collect APK
+        run: |
+          set -euo pipefail
+          cp "$(find mobile/android/app/build/outputs/apk/release -name '*.apk' | head -1)" preview.apk
+          ls -lh preview.apk
+
+      - name: Start backend and seed demo chats
+        run: |
+          set -euo pipefail
+          # The api container runs as uid 1000; the bind-mounted uploads dir is
+          # created by docker as root, which makes every upload 500.
+          sudo mkdir -p data/uploads
+          sudo chown -R 1000:1000 data/uploads
+          cat > .env.ci <<EOF
+          POSTGRES_USER=messenger
+          POSTGRES_PASSWORD=ci_password
+          POSTGRES_DB=messenger
+          DATABASE_URL=postgres://messenger:ci_password@postgres:5432/messenger
+          ORIGIN=http://10.0.2.2:3999,http://localhost:3999
+          ENCRYPTION_KEY=$(openssl rand -base64 32)
+          TURN_SECRET=$(openssl rand -hex 32)
+          TURN_REALM=localhost
+          USE_S3=false
+          HCAPTCHA_SECRET=
+          EOF
+          printf 'services:\n  api:\n    ports:\n      - "3999:3000"\n' > docker-compose.ci.yml
+          docker compose --env-file .env.ci -f docker-compose.yml -f docker-compose.ci.yml \
+            up -d --build postgres api
+          for i in $(seq 1 90); do
+            if curl -fsS http://localhost:3999/health >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS http://localhost:3999/health
+          bash scripts/ci_preview_seed.sh http://localhost:3999
+
+      - name: Boot emulator, install APK, capture screens
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_5
+          disable-animations: true
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+            -camera-back none -camera-front none
+          script: |
+            adb install -r preview.apk
+            bash scripts/ci_preview_capture.sh preview-shots
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: preview-shots
+          path: preview-shots/
+          retention-days: 30
