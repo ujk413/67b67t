@@ -44,8 +44,31 @@ sys.exit(1)
 PY
 }
 
+# The emulator software-renders the screen; under load system_server throws
+# "isn't responding" dialogs that sit on top of everything. Clear them before
+# every interaction, otherwise taps land on the dialog instead of the app.
+dismiss_dialogs() {
+  local tries=0
+  while [ $tries -lt 4 ]; do
+    if center_of "isn't responding" >/dev/null 2>&1 \
+       || center_of "has stopped" >/dev/null 2>&1; then
+      log "вижу системный диалог — закрываю"
+      if center_of "Wait" > /tmp/waitpos; then
+        adb shell input tap $(cat /tmp/waitpos)
+      else
+        adb shell input keyevent KEYCODE_BACK
+      fi
+      sleep 4
+      tries=$((tries + 1))
+    else
+      return 0
+    fi
+  done
+}
+
 tap_text() {
   local coords
+  dismiss_dialogs
   if coords=$(center_of "$1"); then
     log "тапаю «$1» по $coords"
     adb shell input tap $coords
@@ -65,13 +88,17 @@ type_into() { # type_into <label> <text>
 # ── ждём, пока эмулятор реально догрузится ────────────────────────────────
 echo "→ жду загрузку эмулятора"
 adb wait-for-device
-for _ in $(seq 1 60); do
+for _ in $(seq 1 90); do
   [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
   sleep 5
 done
 log "boot_completed=$(adb shell getprop sys.boot_completed | tr -d '\r')"
 
-# Без этого system_server вешает ANR-диалог поверх всего экрана.
+echo "→ снижаю разрешение: software-рендер не тянет 1080x1920"
+adb shell wm size 720x1280
+adb shell wm density 320
+sleep 15
+
 adb shell settings put global hide_error_dialogs 1
 adb shell settings put global window_animation_scale 0
 adb shell settings put global transition_animation_scale 0
@@ -79,14 +106,14 @@ adb shell settings put global animator_duration_scale 0
 adb shell wm dismiss-keyguard || true
 
 echo "→ даю системе успокоиться"
-sleep 30
-adb shell input keyevent KEYCODE_BACK || true   # сбросить любой висящий диалог
-sleep 2
+sleep 45
+dismiss_dialogs
 
 echo "→ запускаю приложение"
 adb shell am force-stop "$PKG" || true
 adb shell am start -n "$PKG/.MainActivity" >/dev/null
-sleep 25
+sleep 30
+dismiss_dialogs
 
 echo "→ экран входа"
 shot 01-login
@@ -95,38 +122,42 @@ echo "→ логинюсь как $USER_NAME"
 type_into "Username" "$USER_NAME"
 type_into "Password" "$PASSWORD"
 tap_text "Login" || tap_text "Войти" || true
-sleep 20
+sleep 25
+dismiss_dialogs
 
-# Если всё ещё видим форму входа — логин не прошёл, пробуем ещё раз.
+# If the login form is still there, the attempt did not go through.
 if center_of "Username" >/dev/null 2>&1; then
-  log "!! форма входа на месте — повторяю попытку"
+  log "!! форма входа на месте — повторяю"
   type_into "Username" "$USER_NAME"
   type_into "Password" "$PASSWORD"
   tap_text "Login" || true
-  sleep 20
+  sleep 25
+  dismiss_dialogs
 fi
 
 echo "→ главный экран"
 shot 02-main
 
-echo "→ открываю личку"
+echo "→ личка"
 if coords=$(center_of "mira"); then
   adb shell input tap $coords
-  sleep 10
+  sleep 12
+  dismiss_dialogs
   shot 03-chat
   adb shell input keyevent KEYCODE_BACK
-  sleep 5
+  sleep 6
 else
-  log "!! чат mira не найден в списке"
+  log "!! чат mira не найден"
 fi
 
 echo "→ группа"
 if coords=$(center_of "Роблокс"); then
   adb shell input tap $coords
-  sleep 10
+  sleep 12
+  dismiss_dialogs
   shot 04-group
   adb shell input keyevent KEYCODE_BACK
-  sleep 5
+  sleep 6
 else
   log "!! группа не найдена"
 fi
@@ -134,10 +165,11 @@ fi
 echo "→ профиль"
 if coords=$(center_of "onyx"); then
   adb shell input tap $coords
-  sleep 8
+  sleep 10
+  dismiss_dialogs
   shot 05-profile
   adb shell input keyevent KEYCODE_BACK
-  sleep 3
+  sleep 4
 else
   log "!! профиль не найден"
 fi
