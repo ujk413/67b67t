@@ -1,0 +1,28 @@
+## Tor configuration for Messenger 67
+## This creates a hidden service (.onion address)
+
+# Run as daemon
+RunAsDaemon 0
+
+# Data directory
+DataDirectory /var/lib/tor
+
+# Hidden Service configuration
+HiddenServiceDir /var/lib/tor/messenger67/
+HiddenServicePort 80 caddy:80
+HiddenServicePort 443 caddy:443
+
+# Security settings
+HiddenServiceVersion 3
+HiddenServiceNonAnonymousMode 0
+
+# Logging
+Log notice stdout
+
+# Performance
+NumEntryGuards 8
+CircuitBuildTimeout 30
+
+# Additional security
+CookieAuthentication 1
+ControlPort 9051

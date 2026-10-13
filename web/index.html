@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>67</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/app.css?v=20261012c" />
+</head>
+<body>
+  <div id="app"></div>
+
+  <!--
+    Load libsignal + curve25519 as ES modules from a CDN that transpiles CJS to
+    ESM. The previous <script src="...@0.1.4"> tag pointed at a version that does
+    not exist (404 → window.libsignal undefined), so web E2E never initialised.
+    esm.sh serves the real published version (0.0.16) as an ES module.
+  -->
+  <script type="module">
+    import * as libsignal from 'https://esm.sh/@privacyresearch/libsignal-protocol-typescript@0.0.16';
+    import { Curve25519Wrapper } from 'https://esm.sh/@privacyresearch/curve25519-typescript@0.0.12';
+    import * as keystore from '/keystore.js';
+    window.libsignal = libsignal;
+    window.Curve25519Wrapper = Curve25519Wrapper;
+    window.SigStore = keystore.SigStore;
+    window.Keystore = keystore;
+    window.dispatchEvent(new Event('libsignal-ready'));
+  </script>
+
+  <script src="/crypto.js?v=20261012c"></script>
+  <script src="/groupcrypto.js?v=20261012c"></script>
+  <script src="/webrtc.js?v=20261012c"></script>
+  <script type="module" src="/app.js?v=20261012c"></script>
+</body>
+</html>

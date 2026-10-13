@@ -1,0 +1,29 @@
+{
+  "name": "Messenger 67",
+  "short_name": "67",
+  "description": "Secure messenger with E2E encryption",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0f14",
+  "theme_color": "#4da3ff",
+  "orientation": "portrait-primary",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["social", "communication"],
+  "shortcuts": [
+    {
+      "name": "New Message",
+      "short_name": "New",
+      "description": "Start a new conversation",
+      "url": "/",
+      "icons": []
+    }
+  ]
+}

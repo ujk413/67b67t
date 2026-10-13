@@ -1,0 +1,96 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "mobile/**"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install JS dependencies
+        working-directory: mobile
+        run: npm ci
+
+      # mobile/android is generated (see mobile/.gitignore) — the checked-in
+      # folder holds only signing material, which is restored from secrets below.
+      - name: Generate native Android project
+        working-directory: mobile
+        run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 secret is not set"
+            exit 1
+          fi
+          mkdir -p mobile/android/keystores
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > mobile/android/keystores/release.keystore
+          cat > mobile/android/key.properties <<EOF
+          storeFile=../keystores/release.keystore
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+          sed -i 's/^ *//' mobile/android/key.properties
+
+      - name: Build release APK
+        working-directory: mobile/android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Rename artifact
+        id: apk
+        run: |
+          set -euo pipefail
+          SRC=$(find mobile/android/app/build/outputs/apk/release -name '*.apk' | head -1)
+          NAME="messenger67-$(date -u +%Y%m%d-%H%M%S).apk"
+          cp "$SRC" "$NAME"
+          echo "path=$NAME" >> "$GITHUB_OUTPUT"
+          ls -lh "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: messenger67-apk
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 30
+
+      # Stable download link for the phone: Releases → apk-latest
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-latest
+          name: "Messenger67 — latest APK"
+          body: |
+            Автосборка из ветки `main`.
+            Коммит: ${{ github.sha }}
+          prerelease: true
+          files: ${{ steps.apk.outputs.path }}

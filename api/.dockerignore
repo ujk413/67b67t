@@ -1,0 +1,11 @@
+node_modules
+npm-debug.log
+*.bak
+*.bak_fix1
+server.js.bak
+server.js.bak_fix1
+Dockerfile
+.dockerignore
+.env
+.env.*
+data

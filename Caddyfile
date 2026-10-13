@@ -1,0 +1,77 @@
+67chat.ru {
+  root * /srv
+
+  handle_path /api/* {
+    reverse_proxy api:3000
+  }
+
+  handle /ws* {
+    reverse_proxy api:3000
+  }
+
+  handle /crypto.js {
+    file_server
+  }
+
+  handle /keystore.js {
+    file_server
+  }
+
+  handle /webrtc.js {
+    file_server
+  }
+
+  handle {
+    try_files {path} /index.html
+    file_server
+  }
+
+  @static {
+    path *.js *.css
+  }
+  header @static Cache-Control "no-cache, no-store, must-revalidate"
+
+  @app_shell {
+    path / /index.html /sw.js /manifest.webmanifest
+  }
+  header @app_shell Cache-Control "no-cache, no-store, must-revalidate"
+}
+
+:80 {
+  root * /srv
+
+  handle_path /api/* {
+    reverse_proxy api:3000
+  }
+
+  handle /ws* {
+    reverse_proxy api:3000
+  }
+
+  handle /crypto.js {
+    file_server
+  }
+
+  handle /keystore.js {
+    file_server
+  }
+
+  handle /webrtc.js {
+    file_server
+  }
+
+  handle {
+    try_files {path} /index.html
+    file_server
+  }
+
+  @static {
+    path *.js *.css
+  }
+  header @static Cache-Control "no-cache, no-store, must-revalidate"
+
+  @app_shell {
+    path / /index.html /sw.js /manifest.webmanifest
+  }
+  header @app_shell Cache-Control "no-cache, no-store, must-revalidate"
+}

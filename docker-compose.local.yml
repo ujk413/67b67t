@@ -1,0 +1,31 @@
+services:
+  api:
+    environment:
+      DATABASE_URL: ${LOCAL_DATABASE_URL:-postgres://messenger:change-me@postgres:5432/messenger}
+      ORIGIN: ${LOCAL_ORIGIN:-http://localhost,http://127.0.0.1}
+      NODE_ENV: development
+
+  caddy:
+    ports:
+      - "80:80"
+    volumes:
+      - ./Caddyfile.local:/etc/caddy/Caddyfile:ro
+      - ./web:/srv:ro
+      - ./data/caddy/data:/data
+      - ./data/caddy/config:/config
+
+  turn:
+    environment:
+      TURN_SECRET: ${TURN_SECRET:-change-me}
+      TURN_REALM: ${LOCAL_TURN_REALM:-localhost}
+    command: >
+      -n --log-file=stdout
+      --min-port=10000 --max-port=10100
+      --realm=${LOCAL_TURN_REALM:-localhost}
+      --fingerprint
+      --listening-ip=0.0.0.0
+      --lt-cred-mech
+      --user=${LOCAL_TURN_USER:-messenger}:${LOCAL_TURN_PASSWORD:-change-me}
+      --no-cli
+      --no-tls
+      --no-dtls

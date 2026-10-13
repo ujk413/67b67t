@@ -1,0 +1,29 @@
+http://localhost {
+  root * /srv
+
+  handle_path /api/* {
+    reverse_proxy api:3000
+  }
+
+  handle /ws* {
+    reverse_proxy api:3000
+  }
+
+  handle /crypto.js {
+    file_server
+  }
+
+  handle /webrtc.js {
+    file_server
+  }
+
+  handle {
+    try_files {path} /index.html
+    file_server
+  }
+
+  @static {
+    path *.js *.css
+  }
+  header @static Cache-Control "no-cache, no-store, must-revalidate"
+}
