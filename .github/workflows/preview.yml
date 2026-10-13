@@ -115,14 +115,19 @@ jobs:
       - name: Boot emulator, install APK, capture screens
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 34
-          target: google_apis
+          # Lighter than google_apis/34: the app needs no Play services, and a
+          # smaller image + more RAM keeps system_server from throwing ANRs
+          # while swiftshader software-renders the screen.
+          api-level: 30
+          target: default
           arch: x86_64
-          profile: pixel_5
+          profile: pixel_2
+          ram-size: 3072M
+          heap-size: 512M
           disable-animations: true
           emulator-options: >-
             -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
-            -camera-back none -camera-front none
+            -no-snapshot -camera-back none -camera-front none
           script: |
             adb install -r preview.apk
             bash scripts/ci_preview_capture.sh preview-shots

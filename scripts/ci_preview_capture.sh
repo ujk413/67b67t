@@ -9,9 +9,11 @@ USER_NAME="onyx"
 PASSWORD="Passw0rd!long"
 mkdir -p "$OUT"
 
+log() { echo "  $*"; }
+
 shot() {
   adb exec-out screencap -p > "$OUT/$1.png"
-  echo "  снял $1.png ($(stat -c%s "$OUT/$1.png") байт)"
+  log "снял $1.png ($(stat -c%s "$OUT/$1.png") байт)"
 }
 
 dump_ui() {
@@ -45,25 +47,46 @@ PY
 tap_text() {
   local coords
   if coords=$(center_of "$1"); then
-    echo "  тапаю «$1» по $coords"
+    log "тапаю «$1» по $coords"
     adb shell input tap $coords
-    sleep 1
+    sleep 2
     return 0
   fi
-  echo "  !! не нашёл «$1»"
+  log "!! не нашёл «$1»"
   return 1
 }
 
 type_into() { # type_into <label> <text>
   tap_text "$1" || return 1
   adb shell input text "$2"
-  sleep 1
+  sleep 2
 }
+
+# ── ждём, пока эмулятор реально догрузится ────────────────────────────────
+echo "→ жду загрузку эмулятора"
+adb wait-for-device
+for _ in $(seq 1 60); do
+  [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
+  sleep 5
+done
+log "boot_completed=$(adb shell getprop sys.boot_completed | tr -d '\r')"
+
+# Без этого system_server вешает ANR-диалог поверх всего экрана.
+adb shell settings put global hide_error_dialogs 1
+adb shell settings put global window_animation_scale 0
+adb shell settings put global transition_animation_scale 0
+adb shell settings put global animator_duration_scale 0
+adb shell wm dismiss-keyguard || true
+
+echo "→ даю системе успокоиться"
+sleep 30
+adb shell input keyevent KEYCODE_BACK || true   # сбросить любой висящий диалог
+sleep 2
 
 echo "→ запускаю приложение"
 adb shell am force-stop "$PKG" || true
 adb shell am start -n "$PKG/.MainActivity" >/dev/null
-sleep 12
+sleep 25
 
 echo "→ экран входа"
 shot 01-login
@@ -72,32 +95,53 @@ echo "→ логинюсь как $USER_NAME"
 type_into "Username" "$USER_NAME"
 type_into "Password" "$PASSWORD"
 tap_text "Login" || tap_text "Войти" || true
-sleep 12
+sleep 20
+
+# Если всё ещё видим форму входа — логин не прошёл, пробуем ещё раз.
+if center_of "Username" >/dev/null 2>&1; then
+  log "!! форма входа на месте — повторяю попытку"
+  type_into "Username" "$USER_NAME"
+  type_into "Password" "$PASSWORD"
+  tap_text "Login" || true
+  sleep 20
+fi
 
 echo "→ главный экран"
 shot 02-main
 
-echo "→ открываю первый чат"
-if center_of "mira" > /tmp/c1; then
-  adb shell input tap $(cat /tmp/c1)
-  sleep 6
+echo "→ открываю личку"
+if coords=$(center_of "mira"); then
+  adb shell input tap $coords
+  sleep 10
   shot 03-chat
   adb shell input keyevent KEYCODE_BACK
-  sleep 3
+  sleep 5
 else
-  echo "  !! чат не найден в списке"
+  log "!! чат mira не найден в списке"
+fi
+
+echo "→ группа"
+if coords=$(center_of "Роблокс"); then
+  adb shell input tap $coords
+  sleep 10
+  shot 04-group
+  adb shell input keyevent KEYCODE_BACK
+  sleep 5
+else
+  log "!! группа не найдена"
 fi
 
 echo "→ профиль"
-if center_of "onyx" > /tmp/c2; then
-  adb shell input tap $(cat /tmp/c2)
-  sleep 5
-  shot 04-profile
+if coords=$(center_of "onyx"); then
+  adb shell input tap $coords
+  sleep 8
+  shot 05-profile
   adb shell input keyevent KEYCODE_BACK
-  sleep 2
+  sleep 3
 else
-  echo "  !! профиль не найден"
+  log "!! профиль не найден"
 fi
 
+adb logcat -d > "$OUT/logcat.txt" 2>/dev/null || true
 echo "→ готово, файлы:"
 ls -la "$OUT"
