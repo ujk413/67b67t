@@ -7,6 +7,7 @@ OUT="${1:-preview-shots}"
 PKG="ru.b67t.messenger.mobile"
 USER_NAME="onyx"
 PASSWORD="Passw0rd!long"
+API="http://localhost:3999"
 mkdir -p "$OUT"
 
 log() { echo "  $*"; }
@@ -72,6 +73,8 @@ dismiss_dialogs() {
   done
 }
 
+hide_keyboard() { adb shell input keyevent KEYCODE_BACK; sleep 2; }
+
 tap_text() {
   local coords
   dismiss_dialogs
@@ -84,12 +87,68 @@ tap_text() {
   return 1
 }
 
+# The soft keyboard covers the lower half of the screen, so it has to go before
+# the next field can be tapped — otherwise the tap lands on the keyboard and the
+# text ends up appended to the field that still has focus.
 type_into() { # type_into <label> <text>
   tap_text "$1" || return 1
   dismiss_dialogs
   adb shell input text "$2"
   sleep 2
+  hide_keyboard
   dismiss_dialogs
+}
+
+logged_in() { ! center_of "Username" >/dev/null 2>&1; }
+
+# Fallback: skip the UI entirely. Log in over HTTP, then write the session token
+# straight into the app's AsyncStorage database and restart it.
+inject_token() {
+  log "план Б: вписываю токен прямо в AsyncStorage"
+  local token
+  token=$(curl -s -H 'content-type: application/json' -H 'x-session-transport: bearer' \
+    -d "{\"username\":\"$USER_NAME\",\"password\":\"$PASSWORD\"}" "$API/auth/login" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')
+  [ -n "$token" ] || { log "!! токен не получен"; return 1; }
+  log "токен получен (${#token} символов)"
+
+  adb root >/dev/null 2>&1 || true
+  sleep 3
+  adb shell am force-stop "$PKG"
+  sleep 3
+
+  local db="/data/data/$PKG/databases/RKStorage"
+  if ! adb shell "ls $db" >/dev/null 2>&1; then
+    log "!! база AsyncStorage не найдена: $db"
+    adb shell "ls /data/data/$PKG/databases" 2>&1 | head -5
+    return 1
+  fi
+
+  adb pull "$db" /tmp/RKStorage >/dev/null 2>&1 || { log "!! не смог вытащить базу"; return 1; }
+  python3 - "$token" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect('/tmp/RKStorage')
+con.execute("CREATE TABLE IF NOT EXISTS catalystLocalStorage (key TEXT PRIMARY KEY, value TEXT)")
+con.execute("INSERT OR REPLACE INTO catalystLocalStorage (key, value) VALUES (?, ?)",
+            ("mobile.token", sys.argv[1]))
+con.commit()
+print("  ключей в базе:", con.execute("SELECT count(*) FROM catalystLocalStorage").fetchone()[0])
+con.close()
+PY
+  adb push /tmp/RKStorage "$db" >/dev/null 2>&1 || { log "!! не смог залить базу"; return 1; }
+  adb shell "rm -f ${db}-wal ${db}-shm" >/dev/null 2>&1 || true
+  local owner
+  owner=$(adb shell stat -c '%u:%g' "/data/data/$PKG" 2>/dev/null | tr -d '\r')
+  if [ -n "$owner" ]; then
+    adb shell chown "$owner" "$db" >/dev/null 2>&1 || true
+    adb shell chmod 660 "$db" >/dev/null 2>&1 || true
+    log "владелец базы выставлен: $owner"
+  fi
+
+  adb shell am start -n "$PKG/.MainActivity" >/dev/null
+  sleep 30
+  dismiss_dialogs
+  return 0
 }
 
 # ── ждём, пока эмулятор реально догрузится ────────────────────────────────
@@ -100,6 +159,8 @@ for _ in $(seq 1 90); do
   sleep 5
 done
 log "boot_completed=$(adb shell getprop sys.boot_completed | tr -d '\r')"
+adb root >/dev/null 2>&1 || true
+sleep 3
 
 echo "→ снижаю разрешение: software-рендер не тянет 1080x1920"
 adb shell wm size 720x1280
@@ -132,45 +193,48 @@ echo "→ экран входа"
 shot 01-login
 
 echo "→ логинюсь как $USER_NAME"
-for attempt in 1 2 3; do
+for attempt in 1 2; do
   log "попытка $attempt"
   type_into "Username" "$USER_NAME"
   type_into "Password" "$PASSWORD"
-  adb shell input keyevent KEYCODE_BACK   # спрятать клавиатуру, иначе кнопка под ней
-  sleep 3
   dismiss_dialogs
   tap_text "Login" || tap_text "Войти" || true
   sleep 25
   dismiss_dialogs
-  center_of "Username" >/dev/null 2>&1 || { log "вошли"; break; }
+  logged_in && { log "вошли"; break; }
   log "форма входа на месте"
 done
+
+logged_in || inject_token
+logged_in || log "!! всё ещё не вошли — снимаю что есть"
 
 echo "→ главный экран"
 shot 02-main
 
-echo "→ личка"
-if coords=$(center_of "mira"); then
-  tap_at "$coords"; sleep 12; dismiss_dialogs; shot 03-chat
-  adb shell input keyevent KEYCODE_BACK; sleep 6
-else
-  log "!! чат mira не найден"
-fi
+if logged_in; then
+  echo "→ личка"
+  if coords=$(center_of "mira"); then
+    tap_at "$coords"; sleep 12; dismiss_dialogs; shot 03-chat
+    adb shell input keyevent KEYCODE_BACK; sleep 6
+  else
+    log "!! чат mira не найден"
+  fi
 
-echo "→ группа"
-if coords=$(center_of "Роблокс"); then
-  tap_at "$coords"; sleep 12; dismiss_dialogs; shot 04-group
-  adb shell input keyevent KEYCODE_BACK; sleep 6
-else
-  log "!! группа не найдена"
-fi
+  echo "→ группа"
+  if coords=$(center_of "Роблокс"); then
+    tap_at "$coords"; sleep 12; dismiss_dialogs; shot 04-group
+    adb shell input keyevent KEYCODE_BACK; sleep 6
+  else
+    log "!! группа не найдена"
+  fi
 
-echo "→ профиль"
-if coords=$(center_of "onyx"); then
-  tap_at "$coords"; sleep 10; dismiss_dialogs; shot 05-profile
-  adb shell input keyevent KEYCODE_BACK; sleep 4
-else
-  log "!! профиль не найден"
+  echo "→ профиль"
+  if coords=$(center_of "@onyx"); then
+    tap_at "$coords"; sleep 10; dismiss_dialogs; shot 05-profile
+    adb shell input keyevent KEYCODE_BACK; sleep 4
+  else
+    log "!! профиль не найден"
+  fi
 fi
 
 # Keep the last UI dump around: it is what the script actually saw.
