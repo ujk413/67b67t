@@ -131,7 +131,8 @@ jobs:
             -no-snapshot -camera-back none -camera-front none
           script: |
             adb install -r preview.apk
-            bash scripts/ci_preview_capture.sh preview-shots
+            mkdir -p preview-shots
+            bash scripts/ci_preview_capture.sh preview-shots 2>&1 | tee preview-shots/script.log
 
       - uses: actions/upload-artifact@v4
         if: always()

@@ -22,28 +22,37 @@ dump_ui() {
   adb pull /sdcard/ui.xml /tmp/ui.xml >/dev/null 2>&1 || true
 }
 
-# Centre of the first node whose text/content-desc contains $1.
-center_of() {
+# Centre of the first (or last) node whose text/content-desc contains $1.
+# "last" matters for the auth screen: the word "Login" appears twice — once as
+# the mode toggle at the top, once as the submit button at the bottom.
+_center() {
+  local want="$1" mode="${2:-first}"
   dump_ui
   [ -s /tmp/ui.xml ] || return 1
-  python3 - "$1" <<'PY'
+  python3 - "$want" "$mode" <<'PY'
 import re, sys, xml.etree.ElementTree as ET
-want = sys.argv[1].lower()
+want, mode = sys.argv[1].lower(), sys.argv[2]
 try:
     root = ET.parse('/tmp/ui.xml').getroot()
 except Exception:
     sys.exit(1)
+hits = []
 for n in root.iter('node'):
     blob = f"{n.get('text') or ''}|{n.get('content-desc') or ''}".lower()
     if want in blob:
         nums = list(map(int, re.findall(r'\d+', n.get('bounds') or '')))
         if len(nums) == 4:
             x1, y1, x2, y2 = nums
-            print((x1 + x2) // 2, (y1 + y2) // 2)
-            sys.exit(0)
-sys.exit(1)
+            hits.append(((x1 + x2) // 2, (y1 + y2) // 2))
+if not hits:
+    sys.exit(1)
+x, y = hits[-1] if mode == "last" else hits[0]
+print(x, y)
 PY
 }
+
+center_of()      { _center "$1" first; }
+center_of_last() { _center "$1" last; }
 
 tap_at() { adb shell input tap $1; sleep 2; }
 
@@ -80,6 +89,19 @@ tap_text() {
   dismiss_dialogs
   if coords=$(center_of "$1"); then
     log "тапаю «$1» по $coords"
+    tap_at "$coords"
+    return 0
+  fi
+  log "!! не нашёл «$1»"
+  return 1
+}
+
+# Same, but for labels that appear more than once (see _center).
+tap_text_last() {
+  local coords
+  dismiss_dialogs
+  if coords=$(center_of_last "$1"); then
+    log "тапаю «$1» (последнее совпадение) по $coords"
     tap_at "$coords"
     return 0
   fi
@@ -198,7 +220,7 @@ for attempt in 1 2; do
   type_into "Username" "$USER_NAME"
   type_into "Password" "$PASSWORD"
   dismiss_dialogs
-  tap_text "Login" || tap_text "Войти" || true
+  tap_text_last "Login" || tap_text_last "Войти" || true
   sleep 25
   dismiss_dialogs
   logged_in && { log "вошли"; break; }
