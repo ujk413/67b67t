@@ -121,7 +121,10 @@ type_into() { # type_into <label> <text>
   dismiss_dialogs
 }
 
-logged_in() { ! center_of "Username" >/dev/null 2>&1; }
+# The "Register" toggle only exists on the auth card, so its absence means we
+# are past the login screen. Checking for the "Username" placeholder is not
+# enough — it disappears as soon as the field has text in it.
+logged_in() { ! center_of "Register" >/dev/null 2>&1; }
 
 # Fallback: skip the UI entirely. Log in over HTTP, then write the session token
 # straight into the app's AsyncStorage database and restart it.

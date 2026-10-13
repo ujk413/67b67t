@@ -35,10 +35,14 @@ jobs:
       # The client hardcodes its API host (no server field in the UI), so a
       # preview build has to point somewhere. 10.0.2.2 is the emulator's alias
       # for the host loopback, where the throwaway backend below listens.
+      # The API container serves its routes at the root — Caddy is what strips
+      # the /api prefix in production — so the base URL carries no suffix here,
+      # and the websocket path is patched to match.
       - name: Point the app at the preview backend
         run: |
-          sed -i 's|https://67chat.ru/api|http://10.0.2.2:3999/api|' mobile/src/config.ts
-          grep DEFAULT_BASE_URL mobile/src/config.ts
+          sed -i 's|https://67chat.ru/api|http://10.0.2.2:3999|' mobile/src/config.ts
+          sed -i 's|url.pathname = "/api/ws".replace("/api/api/", "/api/");|url.pathname = "/ws";|' mobile/src/config.ts
+          grep -nE 'DEFAULT_BASE_URL =|url.pathname =' mobile/src/config.ts
 
       - name: Install JS dependencies
         working-directory: mobile
