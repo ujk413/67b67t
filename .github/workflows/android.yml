@@ -108,11 +108,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Имена APK содержат метку времени, поэтому без этой чистки релиз
-          # копит сборки. Оставляем только ту, что собирается сейчас.
+          # Имя APK постоянное, поэтому удаляем только то, что с ним не
+          # совпадает (старые сборки с меткой времени). Актуальный файл не
+          # трогаем: если снести его до загрузки нового, релиз на минуту
+          # остаётся пустым и ссылка отдаёт 404.
+          KEEP="messenger67.apk"
           gh release view apk-latest --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[].name' 2>/dev/null | while read -r name; do
               [ -n "$name" ] || continue
+              [ "$name" = "$KEEP" ] && continue
               gh release delete-asset apk-latest "$name" \
                 --repo "$GITHUB_REPOSITORY" --yes || true
             done
