@@ -33,21 +33,22 @@ KEY_PROPERTIES = pathlib.Path("mobile/android/key.properties")
 
 LOADER = """
 // --- релизная подпись (вставлено CI) ---
-def keystorePropertiesFile = rootProject.file("../key.properties")
-def keystoreProperties = new Properties()
-if (keystorePropertiesFile.exists()) {
-    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+// key.properties лежит рядом с settings.gradle, то есть в корне android-проекта,
+// поэтому путь считается от rootProject без "../".
+def keystorePropertiesFile = rootProject.file("key.properties")
+if (!keystorePropertiesFile.exists()) {
+    throw new GradleException("нет key.properties: " + keystorePropertiesFile)
 }
+def keystoreProperties = new Properties()
+keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
 // --- конец вставки ---
 """
 
 RELEASE_SIGNING_CONFIG = """        release {
-            if (keystorePropertiesFile.exists()) {
-                storeFile file(keystoreProperties['storeFile'])
-                storePassword keystoreProperties['storePassword']
-                keyAlias keystoreProperties['keyAlias']
-                keyPassword keystoreProperties['keyPassword']
-            }
+            storeFile file(keystoreProperties['storeFile'])
+            storePassword keystoreProperties['storePassword']
+            keyAlias keystoreProperties['keyAlias']
+            keyPassword keystoreProperties['keyPassword']
         }
 """
 
