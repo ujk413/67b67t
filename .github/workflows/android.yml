@@ -97,6 +97,19 @@ jobs:
           retention-days: 30
 
       # Stable download link for the phone: Releases → apk-latest
+      - name: Убрать предыдущие APK из релиза
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Имена APK содержат метку времени, поэтому без этой чистки релиз
+          # копит сборки. Оставляем только ту, что собирается сейчас.
+          gh release view apk-latest --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' 2>/dev/null | while read -r name; do
+              [ -n "$name" ] || continue
+              gh release delete-asset apk-latest "$name" \
+                --repo "$GITHUB_REPOSITORY" --yes || true
+            done
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: apk-latest
