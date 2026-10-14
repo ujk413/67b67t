@@ -85,7 +85,8 @@ jobs:
         run: |
           set -euo pipefail
           SRC=$(find mobile/android/app/build/outputs/apk/release -name '*.apk' | head -1)
-          NAME="messenger67-$(date -u +%Y%m%d-%H%M%S).apk"
+          # Постоянное имя: ссылка на релиз не меняется от сборки к сборке.
+          NAME="messenger67.apk"
           cp "$SRC" "$NAME"
           echo "path=$NAME" >> "$GITHUB_OUTPUT"
           ls -lh "$NAME"
