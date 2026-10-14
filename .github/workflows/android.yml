@@ -76,6 +76,12 @@ jobs:
           sed -i 's/^ *//' mobile/android/key.properties
           echo "keystore restored, $(stat -c%s mobile/android/keystores/release.keystore) bytes"
 
+      # Expo prebuild генерирует build.gradle, где release подписывается
+      # ОТЛАДОЧНЫМ ключом. Без этого шага восстановленный keystore и
+      # key.properties просто игнорируются, и APK уезжает как CN=Android Debug.
+      - name: Включить релизную подпись в Gradle
+        run: python3 scripts/ci_patch_signing.py
+
       - name: Build release APK
         working-directory: mobile/android
         run: ./gradlew assembleRelease --no-daemon --stacktrace
