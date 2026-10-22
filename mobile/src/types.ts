@@ -10,6 +10,15 @@ export type User = {
 };
 
 export type Room = {
+  is_saved?: boolean;
+  my_role?: string;
+  preferences?: {
+    pinned?: boolean;
+    muted?: boolean;
+    hidden?: boolean;
+    archived?: boolean;
+    marked_unread?: boolean;
+  };
   id: string;
   kind: "dm" | "group" | "channel";
   title?: string | null;
@@ -33,6 +42,10 @@ export type Room = {
 };
 
 export type Message = {
+  client_message_id?: string | null;
+  edited_at?: string | null;
+  delivery?: "queued" | "sending" | "failed";
+  delivery_error?: string;
   id: string;
   room_id: string;
   sender_id: string;
@@ -47,10 +60,10 @@ export type Message = {
   read_by?: string[];
   reply_to?: {
     id?: string;
-    text?: string;
+    text?: string | null;
     sender_id?: string;
-    sender_username?: string;
-    sender_display_name?: string;
+    sender_username?: string | null;
+    sender_display_name?: string | null;
   } | null;
   reactions?: Record<string, string[]>;
   media_kind?: string | null;

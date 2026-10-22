@@ -1,21 +1,41 @@
-import { Image, Pressable, StyleSheet, Text, View } from "react-native";
-import { Video, ResizeMode } from "expo-av";
+import { VoicePlayer } from "./VoicePlayer";
+import { useTheme } from "../ThemeProvider";
+import { Alert, Image, Pressable, StyleSheet, Text, View } from "react-native";
+import { Video, ResizeMode } from "./Video";
 import { telegramColors, telegramMetrics, nameColorFor } from "../theme";
 import { Avatar } from "./Avatar";
 import { shortTime } from "../format";
-import type { Message } from "../types";
+import { reactionPeople } from "../presentation";
+import { Icon } from "./Icon";
+import { messageStatus } from "../data/messages";
+import { RichText } from "./RichText";
+import { useMediaHeaders, useProtectedMedia } from "../MediaSession";
+import type { Message, User } from "../types";
 
 type MessageBubbleProps = {
   message: Message;
   meId: string;
   baseUrl: string;
+  participants?: User[];
+  joinedPrevious?: boolean;
+  joinedNext?: boolean;
+  onLongPress?: () => void;
   playing?: boolean;
   showAvatar?: boolean;
+  group?: boolean;
+  onReplyPress?: (id: string) => void;
+  onUsername?: (username: string) => void;
   onPlayVoice?: () => void;
   onReact?: () => void;
   onOpenMedia?: (message: Message) => void;
-  mediaUrl: (baseUrl: string, mediaId: string | null | undefined) => string | null;
-  mediaThumbUrl: (baseUrl: string, mediaId: string | null | undefined) => string | null;
+  mediaUrl: (
+    baseUrl: string,
+    mediaId: string | null | undefined,
+  ) => string | null;
+  mediaThumbUrl: (
+    baseUrl: string,
+    mediaId: string | null | undefined,
+  ) => string | null;
 };
 
 export function MessageBubble({
@@ -23,86 +43,170 @@ export function MessageBubble({
   meId,
   baseUrl,
   playing,
+  participants = [],
+  joinedPrevious,
+  joinedNext,
+  onLongPress,
   showAvatar,
+  group = true,
+  onReplyPress,
+  onUsername,
   onPlayVoice,
   onReact,
   onOpenMedia,
   mediaUrl,
   mediaThumbUrl,
 }: MessageBubbleProps) {
+  const styles = useStyles();
+  const { colors: telegramColors } = useTheme();
+
   const isOwn = message.sender_id === meId;
   const url = mediaUrl(baseUrl, message.media_id);
   const thumb = mediaThumbUrl(baseUrl, message.media_id) || url;
-  const senderName = message.sender_display_name || message.sender_username || "User";
-  const nameColor = nameColorFor(message.sender_id);
+  const senderName =
+    message.sender_display_name || message.sender_username || "Пользователь";
+  const nameColorStyle = { color: nameColorFor(message.sender_id) };
   const time = shortTime(message.created_at);
-  const read = isOwn && message.read_by && message.read_by.length > 1;
+  const read = !!message.read_by?.some((id) => id !== message.sender_id);
+  const people = [...participants];
+  if (!people.some((user) => user.id === message.sender_id))
+    people.push({
+      id: message.sender_id,
+      username: message.sender_username || "",
+      display_name: message.sender_display_name,
+      avatar_id: message.sender_avatar_id,
+    });
+  const status = message.delivery ? messageStatus(message) : "";
+  const reserve = status ? 25 : message.edited_at ? 23 : isOwn ? 13 : 9;
 
   return (
-    <View style={[styles.wrapper, isOwn ? styles.wrapperOwn : styles.wrapperOther]}>
+    <View
+      style={[
+        styles.wrapper,
+        isOwn ? styles.wrapperOwn : styles.wrapperOther,
+        { marginTop: joinedPrevious ? 1 : 5 },
+      ]}
+    >
       {showAvatar && !isOwn && (
         <Avatar
-          user={{ id: message.sender_id, username: message.sender_username || "", display_name: message.sender_display_name }}
+          user={{
+            id: message.sender_id,
+            username: message.sender_username || "",
+            display_name: message.sender_display_name,
+            avatar_id: message.sender_avatar_id,
+          }}
           baseUrl={baseUrl}
           size={telegramMetrics.bubble.avatarSize}
           mediaUrl={mediaUrl}
         />
       )}
-      {showAvatar && !isOwn && <View style={{ width: telegramMetrics.bubble.avatarGap }} />}
-      {!showAvatar && !isOwn && <View style={{ width: telegramMetrics.bubble.avatarSize + telegramMetrics.bubble.avatarGap }} />}
+      {showAvatar && !isOwn && <View style={styles.avatarGap} />}
+      {!showAvatar && !isOwn && group && <View style={styles.avatarSpacer} />}
 
       <View
         style={[
           styles.bubble,
           isOwn ? styles.bubbleOwn : styles.bubbleIn,
-          {
-            maxWidth: `${telegramMetrics.bubble.maxWidthRatio * 100}%`,
-          },
+          isOwn
+            ? {
+                borderTopRightRadius: joinedPrevious ? 8 : 22,
+                borderBottomRightRadius: joinedNext ? 8 : 22,
+              }
+            : {
+                borderTopLeftRadius: joinedPrevious ? 8 : 22,
+                borderBottomLeftRadius: joinedNext ? 8 : 22,
+              },
         ]}
       >
-        {!isOwn && (
-          <Text style={[styles.senderName, { color: nameColor }]} numberOfLines={1}>
+        {!isOwn && group && showAvatar && (
+          <Text style={[styles.senderName, nameColorStyle]} numberOfLines={1}>
             {senderName}
           </Text>
         )}
 
         {message.reply_to?.text && (
-          <View style={[styles.replyContainer, isOwn ? styles.replyOwn : styles.replyIn]}>
-            <View style={[styles.replyLine, isOwn ? styles.replyLineOwn : styles.replyLineIn]} />
+          <Pressable
+            onLongPress={onLongPress}
+            onPress={() =>
+              message.reply_to?.id && onReplyPress?.(message.reply_to.id)
+            }
+            style={[
+              styles.replyContainer,
+              isOwn ? styles.replyOwn : styles.replyIn,
+            ]}
+          >
+            <View
+              style={[
+                styles.replyLine,
+                isOwn ? styles.replyLineOwn : styles.replyLineIn,
+              ]}
+            />
             <View style={styles.replyContent}>
               <Text style={styles.replyName} numberOfLines={1}>
-                {message.reply_to.sender_display_name || message.reply_to.sender_username || "User"}
+                {message.reply_to.sender_display_name ||
+                  message.reply_to.sender_username ||
+                  "Пользователь"}
               </Text>
               <Text style={styles.replyText} numberOfLines={2}>
                 {message.reply_to.text}
               </Text>
             </View>
-          </View>
+          </Pressable>
         )}
 
-        <MessageContent
-          message={message}
-          url={url}
-          thumb={thumb}
-          playing={playing}
-          onPlayVoice={onPlayVoice}
-          onOpenMedia={onOpenMedia}
-          isOwn={isOwn}
-        />
-
-        <View style={styles.metaRow}>
-          <Text style={[styles.time, isOwn ? styles.timeOwn : styles.timeIn]}>
-            {time}
-            {read ? " ✓✓" : isOwn ? " ✓" : ""}
-          </Text>
-          {onReact && (
-            <Pressable onPress={onReact} hitSlop={8}>
-              <Text style={styles.reactButton}>+</Text>
-            </Pressable>
-          )}
+        <View
+          style={{
+            position: "relative",
+            paddingBottom: message.type === "text" ? 0 : 18,
+          }}
+        >
+          <MessageContent
+            message={message}
+            url={url}
+            thumb={thumb}
+            playing={playing}
+            onPlayVoice={onPlayVoice}
+            onOpenMedia={onOpenMedia}
+            isOwn={isOwn}
+            onUsername={onUsername}
+            onLongPress={onLongPress}
+            reserveMeta={reserve}
+          />
+          {message.type !== "text" && !!message.text && <RichText text={message.text} onUsername={onUsername} onLongPress={onLongPress} reserveMeta={reserve} />}
+          <View
+            style={styles.metaRow}
+            accessible
+            accessibilityLabel={`${time}, ${isOwn ? messageStatus(message) : ""}`}
+          >
+            <Text style={[styles.time, isOwn ? styles.timeOwn : styles.timeIn]}>
+              {message.edited_at ? "изменено · " : ""}
+              {time}
+              {status ? ` · ${status}` : ""}
+            </Text>
+            {isOwn && !message.delivery && (
+              <Icon
+                name={read ? "checks" : "check"}
+                size={read ? 16 : 14}
+                color={
+                  read
+                    ? telegramColors.chat.sentCheckRead
+                    : telegramColors.chat.outTime
+                }
+              />
+            )}
+          </View>
         </View>
-
-        {message.reactions && <ReactionBar reactions={message.reactions} />}
+        {message.reactions && (
+          <ReactionBar
+            reactions={message.reactions}
+            people={people}
+            group={group}
+            meId={meId}
+            baseUrl={baseUrl}
+            mediaUrl={mediaUrl}
+            onReact={onReact}
+          />
+        )}
       </View>
     </View>
   );
@@ -116,7 +220,12 @@ function MessageContent({
   onPlayVoice,
   onOpenMedia,
   isOwn,
+  onUsername,
+  onLongPress,
+  reserveMeta,
 }: {
+  onLongPress?: () => void;
+  reserveMeta?: number;
   message: Message;
   url: string | null;
   thumb: string | null;
@@ -124,29 +233,61 @@ function MessageContent({
   onPlayVoice?: () => void;
   onOpenMedia?: (message: Message) => void;
   isOwn: boolean;
+  onUsername?: (username: string) => void;
 }) {
-  const textColor = isOwn ? telegramColors.chat.messageTextOut : telegramColors.chat.messageTextIn;
+  const headers = useMediaHeaders();
+  const { autoDownload } = useTheme();
+  const protectedUri = useProtectedMedia(message, message.type==='voice' || autoDownload);
+  const styles = useStyles();
+  const { colors: telegramColors } = useTheme();
 
-  if (message.type === "text") {
-    return <Text style={[styles.text, { color: textColor }]}>{message.text || ""}</Text>;
+  const textColor = isOwn
+    ? telegramColors.chat.messageTextOut
+    : telegramColors.chat.messageTextIn;
+
+  if (message.meta?.media_encryption) {
+    if(protectedUri) {
+      const info=message.meta.media_encryption as {mime:string;name:string};
+      return <MessageContent message={{...message,media_mime:info.mime,meta:{...message.meta,media_encryption:undefined,filename:info.name}}} url={protectedUri} thumb={protectedUri} isOwn={isOwn} onOpenMedia={()=>onOpenMedia?.(message)} onLongPress={onLongPress} />;
+    }
+    return <Pressable onPress={() => onOpenMedia?.(message)} onLongPress={onLongPress} style={{ padding: 14, minHeight: 48 }}><Text style={{ color: textColor }}>{String((message.meta.media_encryption as { name?: string }).name || "Вложение")} · Открыть</Text></Pressable>;
   }
 
-  if (message.type === "voice" && onPlayVoice) {
+  if (message.type === "text") {
     return (
-      <Pressable style={styles.voiceButton} onPress={onPlayVoice}>
-        <Text style={[styles.voiceText, { color: textColor }]}>
-          {playing ? "⏸ Stop" : "▶️ Play"}
-          {message.duration_sec ? ` ${Math.round(message.duration_sec)}s` : ""}
-        </Text>
-      </Pressable>
+      <RichText
+        text={message.text || ""}
+        onUsername={onUsername}
+        onLongPress={onLongPress}
+        reserveMeta={reserveMeta}
+      />
     );
   }
 
+  if (message.type === "voice" && url) return <VoicePlayer uri={url} initialDuration={Number(message.meta?.duration_ms) || (message.duration_sec || 0)*1000} />;
+
+  if (
+    (message.type === "video_note" ||
+      (message.type === "media" && message.media_mime?.startsWith("video/"))) &&
+    url &&
+    onOpenMedia &&
+    !autoDownload
+  )
+    return (
+      <Pressable
+        onPress={() => onOpenMedia(message)}
+        onLongPress={onLongPress}
+        style={{ padding: 16, minHeight: 48 }}
+      >
+        <Text style={{ color: textColor }}>Видео · Нажмите для просмотра</Text>
+      </Pressable>
+    );
+
   if (message.type === "video_note" && url && onOpenMedia) {
     return (
-      <Pressable onPress={() => onOpenMedia(message)}>
+      <Pressable onPress={() => onOpenMedia(message)} onLongPress={onLongPress}>
         <Video
-          source={{ uri: url }}
+          source={{ uri: url, headers }}
           style={styles.videoNote}
           useNativeControls={false}
           resizeMode={ResizeMode.COVER}
@@ -160,16 +301,26 @@ function MessageContent({
     const mime = message.media_mime || "";
     if (mime.startsWith("image/")) {
       return (
-        <Pressable onPress={() => onOpenMedia(message)}>
-          <Image source={{ uri: thumb || url }} style={styles.mediaImage} resizeMode="cover" />
+        <Pressable
+          onPress={() => onOpenMedia(message)}
+          onLongPress={onLongPress}
+        >
+          <Image
+            source={{ uri: autoDownload ? url : thumb || url, headers }}
+            style={styles.mediaImage}
+            resizeMode="cover"
+          />
         </Pressable>
       );
     }
     if (mime.startsWith("video/")) {
       return (
-        <Pressable onPress={() => onOpenMedia(message)}>
+        <Pressable
+          onPress={() => onOpenMedia(message)}
+          onLongPress={onLongPress}
+        >
           <Video
-            source={{ uri: url }}
+            source={{ uri: url, headers }}
             style={styles.mediaVideo}
             useNativeControls
             resizeMode={ResizeMode.CONTAIN}
@@ -178,174 +329,266 @@ function MessageContent({
       );
     }
     return (
-      <Pressable onPress={() => onOpenMedia(message)} style={styles.fileCard}>
-        <Text style={[styles.fileTitle, { color: textColor }]}>{message.text || "File"}</Text>
-        <Text style={styles.fileMime}>{mime || "unknown"}</Text>
+      <Pressable
+        onPress={() => onOpenMedia(message)}
+        onLongPress={onLongPress}
+        style={styles.fileCard}
+      >
+        <Text style={[styles.fileTitle, { color: textColor }]}>
+          {String(message.meta?.filename || "Файл")}
+        </Text>
+        <Text style={styles.fileMime}>{mime || "Вложение"}</Text>
       </Pressable>
     );
   }
 
-  return <Text style={[styles.text, { color: textColor }]}>[{message.type}]</Text>;
+  return (
+    <Text style={[styles.text, { color: textColor }]}>[{message.type}]</Text>
+  );
 }
 
-function ReactionBar({ reactions }: { reactions: Record<string, string[]> }) {
-  const items = Object.entries(reactions).filter(([, users]) => users.length > 0);
+function ReactionBar({
+  reactions,
+  people,
+  group,
+  meId,
+  baseUrl,
+  mediaUrl,
+  onReact,
+}: {
+  reactions: Record<string, string[]>;
+  people: User[];
+  group: boolean;
+  meId: string;
+  baseUrl: string;
+  mediaUrl: (base: string, id: string | null | undefined) => string | null;
+  onReact?: () => void;
+}) {
+  const styles = useStyles();
+  const { colors } = useTheme();
+  const items = Object.entries(reactions).filter(([, ids]) => ids.length);
   if (!items.length) return null;
-
   return (
     <View style={styles.reactions}>
-      {items.map(([emoji, users]) => (
-        <View key={emoji} style={styles.reactionChip}>
-          <Text style={styles.reactionText}>
-            {emoji} {users.length}
-          </Text>
-        </View>
-      ))}
+      {items.map(([emoji, ids]) => {
+        const users = reactionPeople(ids, people);
+        const names = users.map((user) =>
+          user.id === meId
+            ? "Вы"
+            : user.display_name || user.username || "Участник",
+        );
+        return (
+          <Pressable
+            key={emoji}
+            onPress={onReact}
+            onLongPress={() =>
+              Alert.alert(`Реакция ${emoji}`, names.join("\n"))
+            }
+            accessibilityRole="button"
+            accessibilityLabel={`${emoji}: ${names.join(", ")}`}
+            style={[
+              styles.reactionChip,
+              {
+                borderColor: ids.includes(meId)
+                  ? colors.text.blue
+                  : "transparent",
+              },
+            ]}
+          >
+            <Text style={styles.reactionText}>{emoji}</Text>
+            {group ? (
+              <Text style={{ fontSize: 12, color: colors.text.secondary }}>
+                {users.length}
+              </Text>
+            ) : (
+              <View style={{ flexDirection: "row", marginLeft: 2 }}>
+                {users.map((user, index) => (
+                  <View
+                    key={user.id}
+                    style={{
+                      marginLeft: index ? -4 : 0,
+                      borderRadius: 12,
+                      borderWidth: 1,
+                      borderColor: colors.chat.inBubble,
+                    }}
+                  >
+                    <Avatar
+                      user={user}
+                      baseUrl={baseUrl}
+                      size={18}
+                      mediaUrl={mediaUrl}
+                    />
+                  </View>
+                ))}
+              </View>
+            )}
+          </Pressable>
+        );
+      })}
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  wrapper: {
-    width: "100%",
-    flexDirection: "row",
-    marginVertical: 1,
-  },
-  wrapperOwn: {
-    justifyContent: "flex-end",
-  },
-  wrapperOther: {
-    justifyContent: "flex-start",
-  },
-  bubble: {
-    borderRadius: telegramMetrics.bubble.radius,
-    paddingHorizontal: telegramMetrics.bubble.paddingH,
-    paddingVertical: telegramMetrics.bubble.paddingV,
-  },
-  bubbleIn: {
-    backgroundColor: telegramColors.chat.inBubble,
-  },
-  bubbleOwn: {
-    backgroundColor: telegramColors.chat.outBubble,
-  },
-  senderName: {
-    fontSize: telegramMetrics.font.messageName,
-    fontWeight: "600",
-    marginBottom: 2,
-  },
-  replyContainer: {
-    flexDirection: "row",
-    marginBottom: 6,
-    borderRadius: 6,
-    padding: 6,
-  },
-  replyIn: {
-    backgroundColor: "rgba(255,255,255,0.05)",
-  },
-  replyOwn: {
-    backgroundColor: "rgba(0,0,0,0.1)",
-  },
-  replyLine: {
-    width: 2,
-    borderRadius: 1,
-    marginRight: 6,
-  },
-  replyLineIn: {
-    backgroundColor: telegramColors.chat.inReplyLine,
-  },
-  replyLineOwn: {
-    backgroundColor: telegramColors.chat.outReplyLine,
-  },
-  replyContent: {
-    flex: 1,
-  },
-  replyName: {
-    fontSize: 13,
-    fontWeight: "600",
-    color: telegramColors.chat.inReplyName,
-    marginBottom: 2,
-  },
-  replyText: {
-    fontSize: 13,
-    color: telegramColors.chat.inReplyMessage,
-  },
-  text: {
-    fontSize: telegramMetrics.font.messageText,
-    lineHeight: 20,
-  },
-  metaRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginTop: 4,
-  },
-  time: {
-    fontSize: telegramMetrics.font.messageTime,
-  },
-  timeIn: {
-    color: telegramColors.chat.inTime,
-  },
-  timeOwn: {
-    color: telegramColors.chat.outTime,
-  },
-  reactButton: {
-    fontSize: 14,
-    color: telegramColors.text.gray5,
-    marginLeft: 8,
-  },
-  reactions: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 4,
-    marginTop: 4,
-  },
-  reactionChip: {
-    backgroundColor: "rgba(255,255,255,0.1)",
-    borderRadius: 10,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-  },
-  reactionText: {
-    fontSize: 12,
-    color: telegramColors.text.primary,
-  },
-  voiceButton: {
-    paddingVertical: 8,
-  },
-  voiceText: {
-    fontSize: 14,
-    fontWeight: "600",
-  },
-  videoNote: {
-    width: 180,
-    height: 180,
-    borderRadius: 90,
-    backgroundColor: "#000",
-  },
-  mediaImage: {
-    width: 240,
-    height: 240,
-    borderRadius: 8,
-    backgroundColor: "#000",
-  },
-  mediaVideo: {
-    width: 280,
-    height: 200,
-    borderRadius: 8,
-    backgroundColor: "#000",
-  },
-  fileCard: {
-    padding: 10,
-    borderRadius: 8,
-    backgroundColor: "rgba(255,255,255,0.05)",
-  },
-  fileTitle: {
-    fontSize: 14,
-    fontWeight: "600",
-  },
-  fileMime: {
-    fontSize: 12,
-    color: telegramColors.text.gray5,
-    marginTop: 2,
-  },
-});
+const useStyles = () => {
+  const { colors: telegramColors } = useTheme();
+  return StyleSheet.create({
+    wrapper: {
+      width: "100%",
+      flexDirection: "row",
+      marginVertical: 1,
+    },
+    wrapperOwn: {
+      justifyContent: "flex-end",
+    },
+    wrapperOther: {
+      justifyContent: "flex-start",
+    },
+    avatarGap: {
+      width: telegramMetrics.bubble.avatarGap,
+    },
+    avatarSpacer: {
+      width:
+        telegramMetrics.bubble.avatarSize + telegramMetrics.bubble.avatarGap,
+    },
+    bubble: {
+      maxWidth: `${telegramMetrics.bubble.maxWidthRatio * 100}%`,
+      borderRadius: telegramMetrics.bubble.radius,
+      paddingHorizontal: telegramMetrics.bubble.paddingH,
+      paddingVertical: telegramMetrics.bubble.paddingV,
+    },
+    bubbleIn: {
+      backgroundColor: telegramColors.chat.inBubble,
+    },
+    bubbleOwn: {
+      backgroundColor: telegramColors.chat.outBubble,
+    },
+    senderName: {
+      fontSize: telegramMetrics.font.messageName,
+      fontWeight: "600",
+      marginBottom: 2,
+    },
+    replyContainer: {
+      flexDirection: "row",
+      marginBottom: 6,
+      borderRadius: 12,
+      padding: 6,
+    },
+    replyIn: {
+      backgroundColor: telegramColors.chat.replyBackgroundIn,
+    },
+    replyOwn: {
+      backgroundColor: telegramColors.chat.replyBackgroundOut,
+    },
+    replyLine: {
+      width: 2,
+      borderRadius: 1,
+      marginRight: 6,
+    },
+    replyLineIn: {
+      backgroundColor: telegramColors.chat.inReplyLine,
+    },
+    replyLineOwn: {
+      backgroundColor: telegramColors.chat.outReplyLine,
+    },
+    replyContent: {
+      flex: 1,
+    },
+    replyName: {
+      fontSize: 13,
+      fontWeight: "600",
+      color: telegramColors.chat.inReplyName,
+      marginBottom: 2,
+    },
+    replyText: {
+      fontSize: 13,
+      color: telegramColors.chat.inReplyMessage,
+    },
+    text: {
+      fontSize: telegramMetrics.font.messageText,
+      lineHeight: 20,
+    },
+    metaRow: {
+      position: "absolute",
+      right: 0,
+      bottom: 0,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 3,
+    },
+    time: {
+      fontSize: 11,
+      lineHeight: 14,
+    },
+    timeIn: {
+      color: telegramColors.chat.inTime,
+    },
+    timeOwn: {
+      color: telegramColors.chat.outTime,
+    },
+    reactButton: {
+      fontSize: 14,
+      color: telegramColors.text.gray5,
+      marginLeft: 8,
+    },
+    reactions: {
+      flexDirection: "row",
+      flexWrap: "wrap",
+      gap: 4,
+      marginTop: 4,
+    },
+    reactionChip: {
+      backgroundColor: telegramColors.chat.reactionChip,
+      borderRadius: 14,
+      borderWidth: 1,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 3,
+      paddingHorizontal: 6,
+      paddingVertical: 3,
+      minHeight: 26,
+    },
+    reactionText: {
+      fontSize: 14,
+      color: telegramColors.text.primary,
+    },
+    voiceButton: {
+      paddingVertical: 8,
+    },
+    voiceText: {
+      fontSize: 14,
+      fontWeight: "600",
+    },
+    videoNote: {
+      width: 180,
+      height: 180,
+      borderRadius: 90,
+      backgroundColor: telegramColors.windowBackgroundGray,
+    },
+    mediaImage: {
+      width: 240,
+      height: 240,
+      borderRadius: 14,
+      backgroundColor: telegramColors.windowBackgroundGray,
+    },
+    mediaVideo: {
+      width: 280,
+      height: 200,
+      borderRadius: 14,
+      backgroundColor: telegramColors.windowBackgroundGray,
+    },
+    fileCard: {
+      padding: 10,
+      borderRadius: 8,
+      backgroundColor: telegramColors.chat.fileCard,
+    },
+    fileTitle: {
+      fontSize: 14,
+      fontWeight: "600",
+    },
+    fileMime: {
+      fontSize: 12,
+      color: telegramColors.text.gray5,
+      marginTop: 2,
+    },
+  });
+};

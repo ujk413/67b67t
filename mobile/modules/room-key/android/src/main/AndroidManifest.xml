@@ -1,0 +1,16 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+  <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+  <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+  <application>
+    <service android:name="expo.modules.notifications.service.ExpoFirebaseMessagingService" tools:node="remove" />
+    <service android:name=".CallMessagingService" android:exported="false">
+      <intent-filter android:priority="10"><action android:name="com.google.firebase.MESSAGING_EVENT" /></intent-filter>
+    </service>
+    <service android:name=".ActiveCallService" android:exported="false" android:foregroundServiceType="microphone|camera" />
+    <receiver android:name=".DeclineCallReceiver" android:exported="false" />
+    <activity android:name=".IncomingCallActivity" android:exported="false" android:showWhenLocked="true" android:turnScreenOn="true" android:excludeFromRecents="true" android:theme="@android:style/Theme.Material.NoActionBar" />
+  </application>
+</manifest>

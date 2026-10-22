@@ -1,58 +1,56 @@
-function randomBase64(size = 32) {
-  const bytes = new Uint8Array(size);
-  crypto.getRandomValues(bytes);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-  return globalThis.btoa(binary);
-}
+import { requireOptionalNativeModule } from 'expo';
+import { storage } from './storage';
+import { request } from './api';
 
+type Cipher = {type:number;body:string;sender_device_id?:string;recipient_device_id?:string};
+const native = requireOptionalNativeModule<{
+  signalBundleAsync(user:string,count:number):Promise<string>;
+  signalHasSessionAsync(user:string,peer:string,device:string):Promise<boolean>;
+  signalSessionAsync(user:string,peer:string,device:string,bundle:string):Promise<void>;
+  signalEncryptAsync(user:string,peer:string,device:string,text:string):Promise<string>;
+  signalDecryptAsync(user:string,peer:string,device:string,cipher:string):Promise<string>;
+}>('RoomKey');
+export async function getMobileDeviceId(userId:string) {
+  const key = `mobile.e2eDeviceId.${userId}`, existing = await storage.get(key);
+  if (existing && /^\d+$/.test(existing)) return existing;
+  const bytes = crypto.getRandomValues(new Uint32Array(1));
+  const generated = String((bytes[0] % 16380) + 2);
+  await storage.set(key, generated); return generated;
+}
 export class E2EEncryption {
-  private initialized = false;
-  private bundle: {
-    identityKey: string;
-    registrationId: number;
-    signedPreKey: { keyId: number; publicKey: string; signature: string };
-  } | null = null;
-  // Pre-key ids must be unique per device (server ignores duplicates), so keep them increasing.
-  private nextPreKeyId = Math.floor(Date.now() / 1000) % 2000000000;
-
-  async initialize(_userId: string): Promise<void> {
-    this.initialized = true;
+  private user = '';
+  private options = {base:'',token:''};
+  private sessions = new Map<string,Promise<void>>();
+  configure(base:string,token:string) { this.options={base,token}; }
+  async initialize(user:string) { if (!native) throw Error('Установите новую APK для шифрованных групп'); this.user=user; }
+  async getPublicKeys(count=20) {
+    if (!native || !this.user) throw Error('Ключи ещё загружаются');
+    return JSON.parse(await native.signalBundleAsync(this.user,count));
   }
-
-  // Fresh batch of one-time pre-keys with new ids, reusing the identity/signed pre-key of this session.
-  async getPublicKeys(count = 20): Promise<{
-    identityKey: string;
-    registrationId: number;
-    preKeys: Array<{ keyId: number; publicKey: string }>;
-    signedPreKey: { keyId: number; publicKey: string; signature: string };
-  }> {
-    if (!this.initialized) throw new Error("E2E not initialized");
-    if (!this.bundle) {
-      this.bundle = {
-        identityKey: randomBase64(32),
-        registrationId: Math.floor(Math.random() * 1000000),
-        signedPreKey: {
-          keyId: 1,
-          publicKey: randomBase64(32),
-          signature: randomBase64(64),
-        },
-      };
+  async encrypt(peer:string,text:string,device?:string):Promise<Cipher> {
+    if (!native || !this.user) throw Error('Ключи ещё загружаются');
+    const user=this.user, {base,token}=this.options;
+    let target=device;
+    if (!target) { const devices=await request<{device_id:string}[]>(base,`/e2e/devices/${peer}`,{token}); target=devices[0]?.device_id; }
+    if (!target) throw Error('У участника пока нет ключей шифрования. Нужно обновить его приложение.');
+    const id=peer+'|'+target;
+    if (!await native.signalHasSessionAsync(user,peer,target)) {
+      let task=this.sessions.get(id);
+      if (!task) {
+        task=(async()=>{ const bundle=await request(base,`/e2e/keys/${peer}?device_id=${encodeURIComponent(target!)}`,{token});
+          await native.signalSessionAsync(user,peer,target!,JSON.stringify(bundle)); })();
+        this.sessions.set(id,task); task.finally(()=>this.sessions.delete(id)).catch(()=>{});
+      }
+      await task;
     }
-    const preKeys = Array.from({ length: count }, () => ({
-      keyId: this.nextPreKeyId++,
-      publicKey: randomBase64(32),
-    }));
-    return { ...this.bundle, preKeys };
+    return {...JSON.parse(await native.signalEncryptAsync(user,peer,target,text)),sender_device_id:await getMobileDeviceId(user),recipient_device_id:target};
   }
-
-  async encrypt(_recipientId: string, _plaintext: string): Promise<{ type: number; body: string }> {
-    throw new Error("Signal sessions are disabled in the Android client; room encryption is used.");
-  }
-
-  async decrypt(_senderId: string, _ciphertext: { type: number; body: string }): Promise<string> {
-    throw new Error("Signal sessions are disabled in the Android client; room encryption is used.");
+  async decrypt(peer:string,cipher:Cipher):Promise<string> {
+    if (!native || !this.user) throw Error('Ключи ещё загружаются');
+    let device=cipher.sender_device_id;
+    if (!device) { const {base,token}=this.options; const devices=await request<{device_id:string}[]>(base,`/e2e/devices/${peer}`,{token}); device=devices[0]?.device_id || '1'; }
+    // A pre-key message creates the inbound session. Fetching a peer bundle here would consume an unrelated one-time key.
+    return native.signalDecryptAsync(this.user,peer,device,JSON.stringify(cipher));
   }
 }
-
 export const e2e = new E2EEncryption();

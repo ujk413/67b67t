@@ -1,85 +1,88 @@
 /**
- * Telegram Android — ночная тема.
+ * Светлая тема в стиле современного мессенджера (на базе структуры Telegram Android).
  *
- * Значения не подобраны на глаз: они сняты из официального файла темы
- * /root/PrimeGram/TMessagesProj/src/main/assets/night.attheme и из дефолтов
- * ThemeColors.java. Это те же самые числа, которыми рисуется настоящая телега.
+ * Белый фон, изумрудный акцент, серые вторичные тексты. Размеры (telegramMetrics)
+ * остались от Android-версии Telegram.
  */
 
 // ─────────────────────────── цвета ───────────────────────────
-// ВАЖНО: формат #RRGGBBAA — как ждёт React Native.
-// Telegram в своих .attheme хранит #AARRGGBB (альфа первой), поэтому при
-// копировании значений из PrimeGram байты надо переставлять, иначе RN
-// прочитает #FF181819 как «красный FF, зелёный 18, синий 18, альфа 19» —
-// то есть полупрозрачный красный, и весь интерфейс станет розовым.
+// ВАЖНО: формат #RRGGBBAA, как ждёт React Native (альфа последней).
 
 export const telegramColors = {
   // окна и шапки
-  windowBackground: "#181819", // фон списка чатов
-  windowBackgroundGray: "#000000",
-  actionBar: "#232326", // шапка
-  actionBarIcon: "#FFFFFF",
-  actionBarTitle: "#FFFFFF",
-  actionBarSubtitle: "#F2F2F273",
-  graySection: "#0B0B0C", // заголовки секций
-  divider: "#000000",
+  windowBackground: "#FFFFFF", // фон списка чатов
+  windowBackgroundGray: "#F2F4F7", // поля, плейсхолдеры медиа
+  actionBar: "#FFFFFF", // шапка
+  actionBarIcon: "#111827",
+  actionBarTitle: "#0B1220",
+  actionBarSubtitle: "#6B7280",
+  graySection: "#F3F4F6", // заголовки секций
+  divider: "#EEF0F3",
 
   text: {
-    primary: "#FFFFFF", // windowBackgroundWhiteBlackText
-    secondary: "#FFFFFF6E", // windowBackgroundWhiteGrayText
-    gray2: "#FDFDFF6E",
-    gray3: "#868686",
-    gray4: "#6A6A6A",
-    gray5: "#7D8B99", // серо-голубой, тот самый
-    blue: "#64B5EF", // акцент, ссылки
+    primary: "#0B1220",
+    secondary: "#6B7280",
+    gray2: "#9CA3AF",
+    gray3: "#868E9A",
+    gray4: "#A0A7B2",
+    gray5: "#6B7280",
+    blue: "#0FA37F", // акцент (имя ключа историческое): кнопки, ссылки
+    onAccent: "#FFFFFF", // текст и иконки поверх акцентного фона
   },
 
   // список чатов
   chats: {
-    name: "#F1F1F1",
-    message: "#828282", // превью последнего сообщения
-    date: "#787878",
-    nameMessage: "#EBEBEB", // имя отправителя внутри превью
-    unreadCounter: "#399EF3", // синий бейдж
-    unreadCounterMuted: "#454545", // приглушённый (без звука)
+    name: "#0B1220",
+    message: "#6B7280", // превью последнего сообщения
+    date: "#9CA3AF",
+    nameMessage: "#374151", // имя отправителя внутри превью
+    unreadCounter: "#14B88F", // бейдж непрочитанных
+    unreadCounterMuted: "#C4C9D1", // приглушённый (без звука)
     unreadCounterText: "#FFFFFF",
-    pinnedIcon: "#646464",
-    verified: "#46AAF7",
-    selectedBackground: "#5F9DE32A", // подсветка нажатия
+    pinnedIcon: "#9CA3AF",
+    verified: "#14B88F",
+    selectedBackground: "#14B88F1A", // подсветка нажатия
+    searchBackground: "#F2F4F7", // поле поиска
+    searchHint: "#8A93A2",
   },
 
   // чат
   chat: {
-    wallpaper: "#0F0F10", // фон переписки
-    inBubble: "#1F2123", // входящее
-    outBubble: "#366CAF", // исходящее
-    messageTextIn: "#FAFAFA",
-    messageTextOut: "#FAFAFA",
-    linkIn: "#79C4FC",
-    linkOut: "#AEDFFF",
-    inTime: "#7D7F81",
-    outTime: "#94D3F6",
-    inMenu: "#5D6364",
-    outMenu: "#8EC4F3",
-    serviceBackground: "#37373796", // плашка «сегодня» / системное сообщение
+    wallpaper: "#F3F5F8", // фон переписки
+    inBubble: "#FFFFFF", // входящее
+    outBubble: "#DDF5EC", // исходящее
+    messageTextIn: "#0B1220",
+    messageTextOut: "#0B1220",
+    linkIn: "#0FA37F",
+    linkOut: "#0B7F61",
+    inTime: "#9CA3AF",
+    outTime: "#5E8F80",
+    inMenu: "#9CA3AF",
+    outMenu: "#5E8F80",
+    serviceBackground: "#0B122033", // плашка «сегодня» / системное сообщение
     serviceText: "#FFFFFF",
-    inReplyLine: "#79C4FC",
-    inReplyName: "#79C4FC",
-    inReplyMessage: "#FFFFFF",
-    outReplyLine: "#7ECEFF",
-    outReplyName: "#9FD9FF",
-    outReplyMessage: "#FFFFFF",
-    sentCheck: "#C9F0FFE1", // галочка «отправлено»
-    sentCheckRead: "#C9F0FFE1", // галочка «прочитано»
+    inReplyLine: "#14B88F",
+    inReplyName: "#0FA37F",
+    inReplyMessage: "#374151",
+    outReplyLine: "#14B88F",
+    outReplyName: "#0B7F61",
+    outReplyMessage: "#374151",
+    sentCheck: "#14B88F", // галочка «отправлено»
+    sentCheckRead: "#14B88F", // галочка «прочитано»
+    replyBackgroundIn: "#0B12200A",
+    replyBackgroundOut: "#0B12200F",
+    reactionChip: "#0B12200F",
+    fileCard: "#0B12200A",
   },
 
   // панель ввода
   composer: {
-    background: "#1E1E1F",
-    text: "#FFFFFF",
-    hint: "#FFFFFF64",
-    icons: "#FFFFFF64",
-    overlayText: "#64B5EF",
+    background: "#FFFFFF",
+    inputBackground: "#F2F4F7",
+    text: "#0B1220",
+    hint: "#8A93A2",
+    icons: "#6B7280",
+    overlayText: "#0FA37F",
   },
 
   // аватары — телега красит по id собеседника, набор фиксированный
@@ -105,11 +108,23 @@ export const telegramColors = {
   },
 
   misc: {
-    switchTrack: "#606060",
-    switchTrackChecked: "#459CE3",
-    progress: "#64B5FD",
-    inLoader: "#5098E9",
-    outLoader: "#FFFFFF",
+    switchTrack: "#C4C9D1",
+    switchTrackChecked: "#14B88F",
+    progress: "#14B88F",
+    inLoader: "#14B88F",
+    outLoader: "#0FA37F",
+    error: "#E5484D",
+    mediaOverlay: "#000000D9", // фон просмотра медиа и звонков
+    mediaOverlayText: "#FFFFFF",
+    mediaOverlayControl: "#FFFFFF1A",
+    mediaOverlayControlBorder: "#FFFFFF14",
+    backdrop: "#00000080", // затемнение под модальными окнами
+    callAccept: "#4CD96433",
+    callReject: "#FF4D6D33",
+    callEnd: "#FF4D6DCC",
+    callBackground: "#000000", // экран звонка
+    callLocalVideo: "#1A1A1A",
+    callControl: "#FFFFFF33",
   },
 } as const;
 
@@ -142,11 +157,11 @@ export const telegramMetrics = {
 
   // пузыри
   bubble: {
-    radius: 12,
+    radius: 22,
     tailWidth: 8,
-    paddingH: 9,
-    paddingV: 7,
-    maxWidthRatio: 0.78, // телега не даёт пузырю больше ~78% ширины
+    paddingH: 11,
+    paddingV: 6,
+    maxWidthRatio: 0.84, // телега не даёт пузырю больше ~78% ширины
     avatarSize: 32,
     avatarGap: 8,
     betweenMessages: 2, // внутри одной серии
@@ -159,9 +174,9 @@ export const telegramMetrics = {
   // панель ввода
   composer: {
     minHeight: 48,
-    buttonSize: 42,
+    buttonSize: 48,
     paddingH: 8,
-    radius: 20,
+    radius: 23,
   },
 
   avatarPaletteSize: 7,

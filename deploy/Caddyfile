@@ -1,0 +1,16 @@
+{$SITE_DOMAIN} {
+  root * /srv
+  encode zstd gzip
+  handle_path /api/* {
+    reverse_proxy api:3000
+  }
+  handle /ws* {
+    reverse_proxy api:3000
+  }
+  handle {
+    try_files {path} /index.html
+    file_server
+  }
+  @shell path / /index.html /sw.js /manifest.webmanifest *.js *.css
+  header @shell Cache-Control "no-cache, no-store, must-revalidate"
+}

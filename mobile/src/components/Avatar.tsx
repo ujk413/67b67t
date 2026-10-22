@@ -1,5 +1,8 @@
+import { useState } from "react";
+import { useMediaHeaders } from "../MediaSession";
+import { useTheme } from "../ThemeProvider";
 import { Image, StyleSheet, Text, View } from "react-native";
-import { avatarColorFor } from "../theme";
+import { avatarColorFor, telegramColors } from "../theme";
 import { displayName, roomTitle } from "../format";
 import type { Room, User } from "../types";
 
@@ -9,20 +12,43 @@ type AvatarProps = {
   meId?: string | null;
   baseUrl: string;
   size: number;
-  mediaUrl: (baseUrl: string, mediaId: string | null | undefined) => string | null;
+  mediaUrl: (
+    baseUrl: string,
+    mediaId: string | null | undefined,
+  ) => string | null;
 };
 
-export function Avatar({ user, room, meId, baseUrl, size, mediaUrl }: AvatarProps) {
-  const mediaId = user?.avatar_id || room?.avatar_id || room?.other_avatar_id || null;
+export function Avatar({
+  user,
+  room,
+  meId,
+  baseUrl,
+  size,
+  mediaUrl,
+}: AvatarProps) {
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  const headers = useMediaHeaders();
+  const styles = useStyles();
+  const { colors: telegramColors } = useTheme();
+
+  const mediaId =
+    user?.avatar_id || room?.avatar_id || room?.other_avatar_id || null;
   const title = user ? displayName(user) : room ? roomTitle(room, meId) : "?";
   const url = mediaUrl(baseUrl, mediaId);
-  const id = user?.id || room?.id || "fallback";
+  const id =
+    user?.id ||
+    (room?.kind === "dm" ? room.other_user_id : room?.id) ||
+    "fallback";
 
-  if (url) {
+  if (url && failedUrl !== url) {
     return (
       <Image
-        source={{ uri: url }}
-        style={[styles.avatar, { width: size, height: size, borderRadius: size / 2 }]}
+        source={{ uri: url, headers }}
+        onError={() => setFailedUrl(url)}
+        style={[
+          styles.avatar,
+          { width: size, height: size, borderRadius: size / 2 },
+        ]}
       />
     );
   }
@@ -47,14 +73,17 @@ export function Avatar({ user, room, meId, baseUrl, size, mediaUrl }: AvatarProp
   );
 }
 
-const styles = StyleSheet.create({
-  avatar: {},
-  fallback: {
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  text: {
-    color: "#FFFFFF",
-    fontWeight: "700",
-  },
-});
+const useStyles = () => {
+  const { colors: telegramColors } = useTheme();
+  return StyleSheet.create({
+    avatar: {},
+    fallback: {
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    text: {
+      color: telegramColors.text.onAccent,
+      fontWeight: "700",
+    },
+  });
+};

@@ -33,6 +33,8 @@ export class WebRTCCall {
   private events: CallEvents;
   private isInitiator: boolean;
   private iceServers: any[] | undefined;
+  private pendingCandidates: RTCIceCandidateInit[] = [];
+  private remoteReady = false;
 
   constructor(config: CallConfig, events: CallEvents, isInitiator: boolean, iceServers?: any[]) {
     this.config = config;
@@ -112,6 +114,8 @@ export class WebRTCCall {
     if (!this.pc) throw new Error('Peer connection not initialized');
 
     await this.pc.setRemoteDescription(new RTCSessionDescription(offer as any));
+    this.remoteReady = true;
+    await this.flushCandidates();
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
     return answer;
@@ -120,11 +124,18 @@ export class WebRTCCall {
   async handleAnswer(answer: RTCSessionDescriptionInit): Promise<void> {
     if (!this.pc) throw new Error('Peer connection not initialized');
     await this.pc.setRemoteDescription(new RTCSessionDescription(answer as any));
+    this.remoteReady = true;
+    await this.flushCandidates();
   }
 
   async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
-    if (!this.pc) throw new Error('Peer connection not initialized');
+    if (!this.pc || !this.remoteReady) { this.pendingCandidates.push(candidate); return; }
     await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+  }
+
+  private async flushCandidates() {
+    if (!this.pc || !this.remoteReady) return;
+    for (const candidate of this.pendingCandidates.splice(0)) await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
   }
 
   getLocalDescription(): RTCSessionDescriptionInit | null {
@@ -158,6 +169,8 @@ export class WebRTCCall {
   }
 
   async end(): Promise<void> {
+    this.pendingCandidates = [];
+    this.remoteReady = false;
     if (this.localStream) {
       this.localStream.getTracks().forEach(track => track.stop());
       this.localStream = null;

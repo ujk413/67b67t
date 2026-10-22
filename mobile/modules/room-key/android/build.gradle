@@ -1,0 +1,36 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'ru.b67t.roomkey'
+version = '1.0.0'
+
+android {
+  namespace 'ru.b67t.roomkey'
+  defaultConfig {
+    versionCode 1
+    versionName '1.0.0'
+  }
+}
+
+// Upstream's 2019 generated protobuf classes are incompatible with modern javalite.
+// Retain the v3 protocol implementation, regenerate only its wire schemas with protoc 3.25.9.
+configurations { signalProtocol { transitive = false } }
+def compatibleSignal = tasks.register('compatibleSignal', Jar) {
+  archiveFileName = 'signal-protocol-v3-compatible.jar'
+  destinationDirectory = layout.buildDirectory.dir('signal')
+  from { zipTree(configurations.signalProtocol.singleFile) }
+  exclude 'org/whispersystems/libsignal/state/StorageProtos*'
+  exclude 'org/whispersystems/libsignal/protocol/SignalProtos*'
+  exclude 'org/whispersystems/libsignal/fingerprint/FingerprintProtos*'
+}
+dependencies {
+  implementation (findProject(':expo-notifications') ?: 'host.exp.exponent:expo.modules.notifications:55.0.27')
+  implementation 'com.google.firebase:firebase-messaging:25.0.1'
+  signalProtocol 'org.whispersystems:signal-protocol-java:2.8.1'
+  implementation files(compatibleSignal)
+  implementation 'org.whispersystems:curve25519-java:0.5.0'
+  implementation 'com.google.protobuf:protobuf-javalite:3.25.9'
+  testImplementation 'junit:junit:4.13.2'
+}

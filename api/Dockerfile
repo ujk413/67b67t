@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:22-alpine
 
 # ffmpeg powers voice-message / video-note transcoding and thumbnails.
 RUN apk add --no-cache ffmpeg wget

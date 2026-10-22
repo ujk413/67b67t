@@ -1,0 +1,9 @@
+services:
+  api:
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-service-account.json
+    volumes:
+      - type: bind
+        source: ${FIREBASE_SERVICE_ACCOUNT_PATH:?Set an absolute Firebase service account JSON path}
+        target: /run/secrets/firebase-service-account.json
+        read_only: true

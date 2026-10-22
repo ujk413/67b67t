@@ -18,11 +18,15 @@ release.keystore
 # Firebase / Google
 google-services.json
 GoogleService-Info.plist
+firebase-service-account*.json
+secrets/
 
 # ─────────────────────────────────────────────────────────────
 #  РАНТАЙМ-ДАННЫЕ. База, загрузки, приватные ключи TLS и Tor.
 # ─────────────────────────────────────────────────────────────
 data/
+!mobile/src/data/
+!mobile/src/data/**
 api/uploads/
 uploads/
 builds/
@@ -40,6 +44,7 @@ check_password.js
 #  ЗАВИСИМОСТИ И СБОРКА
 # ─────────────────────────────────────────────────────────────
 node_modules/
+__pycache__/
 .expo/
 .gradle/
 *.apk

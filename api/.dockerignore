@@ -9,3 +9,7 @@ Dockerfile
 .env
 .env.*
 data
+
+secrets/
+*service-account*.json
+google-services.json

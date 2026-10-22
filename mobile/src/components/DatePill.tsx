@@ -1,3 +1,4 @@
+import { useTheme } from "../ThemeProvider";
 import { StyleSheet, Text, View } from "react-native";
 import { telegramColors } from "../theme";
 
@@ -6,6 +7,9 @@ type DatePillProps = {
 };
 
 export function DatePill({ text }: DatePillProps) {
+  const styles = useStyles();
+  const { colors: telegramColors } = useTheme();
+
   return (
     <View style={styles.container}>
       <View style={styles.pill}>
@@ -15,21 +19,24 @@ export function DatePill({ text }: DatePillProps) {
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    width: "100%",
-    alignItems: "center",
-    paddingVertical: 8,
-  },
-  pill: {
-    backgroundColor: telegramColors.chat.serviceBackground,
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-  },
-  text: {
-    fontSize: 13,
-    fontWeight: "500",
-    color: telegramColors.chat.serviceText,
-  },
-});
+const useStyles = () => {
+  const { colors: telegramColors } = useTheme();
+  return StyleSheet.create({
+    container: {
+      width: "100%",
+      alignItems: "center",
+      paddingVertical: 8,
+    },
+    pill: {
+      backgroundColor: telegramColors.chat.serviceBackground,
+      borderRadius: 12,
+      paddingHorizontal: 12,
+      paddingVertical: 6,
+    },
+    text: {
+      fontSize: 13,
+      fontWeight: "500",
+      color: telegramColors.chat.serviceText,
+    },
+  });
+};

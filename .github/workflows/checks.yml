@@ -1,0 +1,31 @@
+name: Messenger checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            mobile/package-lock.json
+            api/package-lock.json
+      - run: npm ci
+        working-directory: mobile
+      - run: npm ci
+        working-directory: api
+      - run: npm run typecheck
+        working-directory: mobile
+      - run: npm test
+        working-directory: mobile
+      - run: npm test
+        working-directory: api
+      - run: node --check api/server.js

@@ -1,39 +1,91 @@
-# Firebase Setup Instructions
+# Android push в 67chat
 
-## Для Android
+Проект Firebase: `chat-78f57`, Android app:
+`1:533935745307:android:55e0b7570717dca7c48bbe`.
+Пакет остаётся `ru.b67t.messenger.mobile`. Проект создан 21 октября 2026
+на плане Spark, без Google Analytics. Клиентский JSON сохранён в
+`mobile/google-services.json` и исключён из Git.
 
-1. Создайте проект в Firebase Console: https://console.firebase.google.com/
-2. Добавьте Android приложение с package name: `ru.b67t.messenger.mobile`
-3. Скачайте `google-services.json`
-4. Поместите файл в `mobile/google-services.json`
+## Доставка с сервера
 
-## Для iOS
+Создан отдельный аккаунт `chat67-push@chat-78f57.iam.gserviceaccount.com`
+с ролью `roles/firebasecloudmessaging.admin`. Пользовательские Google OAuth
+credentials не передаются на сервер. В FCM отправляются «Новое сообщение»
+и идентификаторы, без текста и имени отправителя.
 
-1. В том же проекте Firebase добавьте iOS приложение
-2. Скачайте `GoogleService-Info.plist`
-3. Поместите файл в `mobile/GoogleService-Info.plist`
+Серверный JSON: `/etc/messenger67/firebase-service-account.json`, UID/GID
+1000:1000, режим 0400. Каталог имеет UID/GID 0:1000 и режим 0710.
+Резервная копия — `/var/backups/messenger67/firebase-service-account.json`,
+0600. В образ и архив исходников ключ не включается.
 
-## Настройка Cloud Messaging
+В серверном `.env`:
 
-1. В Firebase Console → Project Settings → Cloud Messaging
-2. Включите Cloud Messaging API (legacy) если нужно
-3. Скопируйте Server Key для использования в API
-
-## Установка зависимостей
-
-```bash
-cd mobile
-npm install
-npx expo prebuild
+```dotenv
+FIREBASE_SECRETS_DIR=/etc/messenger67
+GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase-service-account.json
 ```
 
-## Запуск
+`docker-compose.server.yml` монтирует этот каталог только для чтения.
+Обычное обновление через тот же Compose сохраняет Firebase-конфигурацию.
+Для остальных Compose-конфигураций оставлен `docker-compose.firebase.yml`.
+Ключ не следует пересоздавать при каждом обновлении.
 
-```bash
-# Development build
-npx expo run:android
-# или
-npx expo run:ios
+Для повторной настройки с рабочего компьютера используется официальный
+Firebase CLI и `node scripts/configure_firebase.cjs chat-78f57`. Скрипт
+добавляет только нужную роль к существующей IAM-политике, сохраняет прежний
+локальный ключ и не выводит секреты. Требуется авторизованная CLI-сессия.
+После одноразовой настройки выйти из CLI командой `firebase logout`.
+
+## Сборка
+
+`app.config.js` обнаруживает клиентский JSON и включает FCM. Плагин
+`expo-notifications` задаёт канал `messages`, звук и иконку уведомлений.
+В GitHub Actions требуется secret `ANDROID_GOOGLE_SERVICES_JSON` с
+содержимым клиентского JSON. Серверный приватный ключ в CI приложения не нужен.
+Secret настроен 21 октября 2026 для `ujk413/67b67t`.
+
+```powershell
+# Из mobile
+npm ci
+npx expo prebuild --platform android --no-install
+# Из корня проекта
+python scripts/ci_patch_signing.py
+# Из mobile/android
+$env:NODE_ENV='production'
+.\gradlew.bat assembleRelease --no-daemon --console=plain
 ```
 
-**Примечание:** После добавления native модулей (Firebase, WebRTC) нужно использовать `expo run:android` вместо `expo start`, так как требуется Expo Dev Client.
+Локально нельзя использовать `prebuild --clean` без сохранения keystore
+и key.properties. Подпись остаётся прежней для обновления без удаления данных.
+`npm ci` применяет проверяемое исправление SDK expo-notifications 55.0.27:
+после ошибки получения токена его можно запросить повторно. При смене
+версии зависимости этот небольшой patch нужно пересмотреть.
+
+## Проверка
+
+Войти в приложение, разрешить уведомления Android. В настройках приложения
+показывается результат регистрации; доступны повтор подключения и проверочное
+FCM-уведомление. Закрыть переписку или свернуть приложение, отправить сообщение
+со второго аккаунта. Проверить звук/вибрацию, значок, открытие нужного чата
+нажатием на уведомление, получение после обычного завершения фонового процесса.
+Системная команда принудительной остановки Android отключает доставку до
+следующего открытия приложения и не используется как проверка фонового режима.
+
+Проверки в коде охватывают смену аккаунта во время получения токена, отзыв
+разрешения, восстановление сети, обновление токена, активный чат, отключённые
+чаты и авторизацию тестового маршрута. Проверка настоящей доставки проводится
+отдельно на устройстве с сервисами Google.
+
+## Подтверждено 21 октября 2026
+
+Подписанная release APK 1.1.4/code 9 установлена на Android 16/API 36
+Google APIs emulator. После разрешения Android зарегистрирован настоящий
+FCM-токен; статус приложения — «Включены · звук и вибрация».
+Получены проверочное уведомление и уведомления об обычных сообщениях в фоне
+и после `am kill`. Нажатие на последнее уведомление при холодном запуске
+открыло нужный чат и загрузило оба сообщения. Скриншоты сохранены в
+`builds/screenshots/push/`. Тестовые аккаунты и их регистрации удалены.
+Эмулятор не подтверждает физический звук, вибрацию и badge лаунчера телефона.
+
+Firebase CLI после настройки разлогинен, `login:list` возвращает отсутствие
+авторизованных аккаунтов. Сервер продолжает использовать свой отдельный ключ.

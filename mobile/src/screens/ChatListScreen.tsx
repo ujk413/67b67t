@@ -1,10 +1,26 @@
-import { FlatList, RefreshControl, StyleSheet, View } from "react-native";
-import { telegramColors } from "../theme";
+import { useRef, useState } from "react";
+import {
+  FlatList,
+  ScrollView,
+  Modal,
+  Pressable,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
+import { useTheme } from "../ThemeProvider";
+import { Icon } from "../components/Icon";
 import { MainHeader } from "../components/MainHeader";
 import { ChatListItem } from "../components/ChatListItem";
 import type { Room, User } from "../types";
 
-type ChatListScreenProps = {
+type Props = {
+  folders?: { id: string; title: string; room_ids: string[] }[];
+  selectedFolder?: string | null;
+  onFolder?: (id: string | null) => void;
+  onFolders?: () => void;
+  onSaved?: () => void;
   user: User;
   rooms: Room[];
   baseUrl: string;
@@ -12,60 +28,263 @@ type ChatListScreenProps = {
   onRefresh: () => void;
   onProfilePress: () => void;
   onRoomPress: (room: Room) => void;
-  mediaUrl: (baseUrl: string, mediaId: string | null | undefined) => string | null;
+  onLogout?: () => void;
+  onCompose?: () => void;
+  onSearch?: () => void;
+  onArchive?: () => void;
+  onRoomMenu?: (room: Room) => void;
+  archivedCount?: number;
+  mediaUrl: (base: string, id: string | null | undefined) => string | null;
 };
-
-export function ChatListScreen({
-  user,
-  rooms,
-  baseUrl,
-  refreshing,
-  onRefresh,
-  onProfilePress,
-  onRoomPress,
-  mediaUrl,
-}: ChatListScreenProps) {
+export function ChatListScreen(p: Props) {
+  const { colors } = useTheme();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const list = useRef<FlatList<Room>>(null);
+  const action = (run?: () => void) => {
+    setMenuOpen(false);
+    run?.();
+  };
   return (
-    <View style={styles.container}>
+    <View style={{ flex: 1, backgroundColor: colors.windowBackground }}>
       <MainHeader
-        user={user}
-        baseUrl={baseUrl}
-        onProfilePress={onProfilePress}
-        mediaUrl={mediaUrl}
+        title="Чаты"
+        onSearchPress={() => p.onSearch?.()}
+        onMenuPress={() => setMenuOpen(true)}
       />
+      {!!p.folders?.length && <ScrollView horizontal style={{ maxHeight: 48 }} contentContainerStyle={{ paddingHorizontal: 8 }}>{[{ id: null, title: "Все чаты" }, ...p.folders].map(folder => <Pressable key={folder.id || "all"} onPress={() => p.onFolder?.(folder.id)} accessibilityRole="tab" accessibilityState={{ selected: p.selectedFolder === folder.id }} style={{ padding: 12, borderBottomWidth: p.selectedFolder === folder.id ? 2 : 0, borderColor: colors.text.blue }}><Text style={{ color: p.selectedFolder === folder.id ? colors.text.blue : colors.text.secondary }}>{folder.title}</Text></Pressable>)}</ScrollView>}
       <FlatList
-        data={rooms}
-        keyExtractor={(item) => item.id}
+        ref={list}
+        data={p.rooms}
+        keyExtractor={(room) => room.id}
         renderItem={({ item }) => (
           <ChatListItem
             room={item}
-            meId={user.id}
-            baseUrl={baseUrl}
-            onPress={() => onRoomPress(item)}
-            mediaUrl={mediaUrl}
+            meId={p.user.id}
+            baseUrl={p.baseUrl}
+            onPress={() => p.onRoomPress(item)}
+            onLongPress={() => p.onRoomMenu?.(item)}
+            mediaUrl={p.mediaUrl}
           />
         )}
+        ListHeaderComponent={
+          p.archivedCount ? (
+            <Pressable
+              onPress={p.onArchive}
+              accessibilityRole="button"
+              style={[styles.archive, { borderColor: colors.divider }]}
+            >
+              <Text style={{ color: colors.text.secondary, fontSize: 14 }}>
+                Архив
+              </Text>
+              <Text style={{ color: colors.text.secondary }}>
+                {p.archivedCount}
+              </Text>
+            </Pressable>
+          ) : null
+        }
+        ListEmptyComponent={
+          <View style={styles.empty}>
+            <Text
+              style={{
+                color: colors.text.primary,
+                fontSize: 18,
+                fontWeight: "600",
+              }}
+            >
+              Начните общение
+            </Text>
+            <Text
+              style={{
+                color: colors.text.secondary,
+                textAlign: "center",
+                marginTop: 8,
+              }}
+            >
+              Найдите человека по имени пользователя или создайте группу
+            </Text>
+            <Pressable
+              onPress={p.onCompose}
+              style={{ padding: 16, minHeight: 48 }}
+            >
+              <Text style={{ color: colors.text.blue, fontWeight: "600" }}>
+                Написать сообщение
+              </Text>
+            </Pressable>
+          </View>
+        }
         refreshControl={
           <RefreshControl
-            refreshing={refreshing}
-            onRefresh={onRefresh}
-            tintColor={telegramColors.misc.progress}
+            refreshing={p.refreshing}
+            onRefresh={p.onRefresh}
+            tintColor={colors.misc.progress}
           />
         }
-        contentContainerStyle={rooms.length === 0 && styles.emptyContent}
+        contentContainerStyle={{ paddingBottom: 88 }}
+        keyboardShouldPersistTaps="handled"
+        style={{ flex: 1 }}
       />
+      <Pressable
+        onPress={p.onCompose}
+        accessibilityRole="button"
+        accessibilityLabel="Начать новую переписку"
+        style={({ pressed }) => [
+          styles.compose,
+          { backgroundColor: colors.text.blue, opacity: pressed ? 0.85 : 1 },
+        ]}
+      >
+        <Icon name="compose" size={23} color={colors.text.onAccent} />
+        <Text
+          style={{
+            color: colors.text.onAccent,
+            fontWeight: "600",
+            fontSize: 15,
+          }}
+        >
+          Написать
+        </Text>
+      </Pressable>
+      <View
+        style={[
+          styles.tabs,
+          {
+            borderColor: colors.divider,
+            backgroundColor: colors.windowBackground,
+          },
+        ]}
+      >
+        <Pressable
+          onPress={() =>
+            list.current?.scrollToOffset({ offset: 0, animated: true })
+          }
+          accessibilityRole="tab"
+          accessibilityState={{ selected: true }}
+          accessibilityLabel="Чаты"
+          style={styles.tab}
+        >
+          <Icon name="chats" size={23} color={colors.text.blue} />
+          <Text
+            style={{ color: colors.text.blue, fontSize: 11, fontWeight: "600" }}
+          >
+            Чаты
+          </Text>
+        </Pressable>
+        <Pressable
+          onPress={p.onProfilePress}
+          accessibilityRole="tab"
+          accessibilityLabel="Настройки"
+          style={styles.tab}
+        >
+          <Icon name="settings" size={23} color={colors.text.secondary} />
+          <Text style={{ color: colors.text.secondary, fontSize: 11 }}>
+            Настройки
+          </Text>
+        </Pressable>
+      </View>
+      <Modal
+        visible={menuOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setMenuOpen(false)}
+      >
+        <Pressable
+          style={[styles.backdrop, { backgroundColor: colors.misc.backdrop }]}
+          onPress={() => setMenuOpen(false)}
+        >
+          <View
+            style={[styles.menu, { backgroundColor: colors.windowBackground }]}
+          >
+            <Pressable
+              style={styles.menuItem}
+              onPress={() => action(p.onCompose)}
+            >
+              <Text style={{ color: colors.text.primary, fontSize: 16 }}>
+                Новая переписка
+              </Text>
+            </Pressable>
+            <Pressable style={styles.menuItem} onPress={() => action(p.onSaved)}><Text style={{ color: colors.text.primary, fontSize: 16 }}>Избранное</Text></Pressable>
+            <Pressable style={styles.menuItem} onPress={() => action(p.onFolders)}><Text style={{ color: colors.text.primary, fontSize: 16 }}>Папки чатов</Text></Pressable>
+            <Pressable
+              style={styles.menuItem}
+              onPress={() => action(p.onArchive)}
+            >
+              <Text style={{ color: colors.text.primary, fontSize: 16 }}>
+                Архив
+              </Text>
+            </Pressable>
+            <Pressable
+              style={styles.menuItem}
+              onPress={() => action(p.onProfilePress)}
+            >
+              <Text style={{ color: colors.text.primary, fontSize: 16 }}>
+                Настройки и профиль
+              </Text>
+            </Pressable>
+            {p.onLogout && (
+              <Pressable
+                style={styles.menuItem}
+                onPress={() => action(p.onLogout)}
+              >
+                <Text style={{ color: colors.misc.error, fontSize: 16 }}>
+                  Выйти
+                </Text>
+              </Pressable>
+            )}
+          </View>
+        </Pressable>
+      </Modal>
     </View>
   );
 }
-
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: telegramColors.windowBackground,
+  archive: {
+    minHeight: 48,
+    paddingHorizontal: 20,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    borderBottomWidth: StyleSheet.hairlineWidth,
   },
-  emptyContent: {
-    flexGrow: 1,
+  empty: { alignItems: "center", paddingHorizontal: 32, paddingTop: 72 },
+  compose: {
+    position: "absolute",
+    bottom: 76,
+    right: 16,
+    minHeight: 52,
+    paddingHorizontal: 20,
+    borderRadius: 28,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    elevation: 3,
+    shadowColor: "#000",
+    shadowOpacity: 0.12,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+  },
+  tabs: {
+    flexDirection: "row",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    minHeight: 56,
+  },
+  tab: {
+    flex: 1,
     alignItems: "center",
     justifyContent: "center",
+    gap: 3,
+    minHeight: 56,
+    paddingVertical: 6,
+  },
+  backdrop: {
+    flex: 1,
+    alignItems: "flex-end",
+    paddingTop: 54,
+    paddingRight: 12,
+  },
+  menu: { minWidth: 210, borderRadius: 20, paddingVertical: 8 },
+  menuItem: {
+    minHeight: 48,
+    justifyContent: "center",
+    paddingHorizontal: 18,
+    paddingVertical: 12,
   },
 });
