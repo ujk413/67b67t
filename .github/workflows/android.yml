@@ -23,7 +23,7 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: mobile/package-lock.json
 
@@ -46,6 +46,25 @@ jobs:
       - name: Install JS dependencies
         working-directory: mobile
         run: npm ci
+
+      - name: Typecheck and mobile regression tests
+        working-directory: mobile
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Restore Firebase Android configuration when configured
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON }}
+        run: |
+          python3 - <<'PYCODE'
+          import os, pathlib
+          value = os.environ.get('GOOGLE_SERVICES_JSON', '')
+          if value:
+              pathlib.Path('mobile/google-services.json').write_text(value)
+          else:
+              print('Firebase is not configured: push delivery is disabled in this APK')
+          PYCODE
 
       # mobile/android is generated (see mobile/.gitignore) — the folder in the
       # repo holds only signing material, restored from secrets below.
@@ -84,7 +103,7 @@ jobs:
 
       - name: Build release APK
         working-directory: mobile/android
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        run: ./gradlew :67chat-room-key:testDebugUnitTest assembleRelease --no-daemon --stacktrace
 
       - name: Rename artifact
         id: apk
@@ -130,3 +149,31 @@ jobs:
             Коммит: ${{ github.sha }}
           prerelease: true
           files: ${{ steps.apk.outputs.path }}
+
+      # Публикация на сервер: приложение само увидит новый versionCode и
+      # предложит обновиться (Android всё равно спросит подтверждение).
+      # Пропускается, если секреты для деплоя не заданы.
+      - name: Publish APK to the update server
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_SSH_KEY:-}" ] || [ -z "${DEPLOY_HOST:-}" ]; then
+            echo "::warning::DEPLOY_SSH_KEY/DEPLOY_HOST not set: skipping in-app update publish"
+            exit 0
+          fi
+          VERSION=$(python3 -c "import json;print(json.load(open('mobile/app.json'))['expo']['version'])")
+          VERSION_CODE=$(python3 -c "import json;print(json.load(open('mobile/app.json'))['expo']['android']['versionCode'])")
+          install -m 700 -d ~/.ssh
+          printf '%s' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          SSH="ssh -i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          TARGET="${DEPLOY_USER:-root}@${DEPLOY_HOST}"
+          REMOTE_APK="/tmp/67chat-release-${VERSION_CODE}.apk"
+          scp -i "$HOME/.ssh/deploy_key" -o StrictHostKeyChecking=accept-new "${{ steps.apk.outputs.path }}" "${TARGET}:${REMOTE_APK}"
+          scp -i "$HOME/.ssh/deploy_key" -o StrictHostKeyChecking=accept-new scripts/publish_apk.sh "${TARGET}:/tmp/publish_apk.sh"
+          $SSH "$TARGET" "chmod +x /tmp/publish_apk.sh && RELEASE_DIR=/opt/messenger67/data/releases VERSION='${VERSION}' VERSION_CODE='${VERSION_CODE}' /tmp/publish_apk.sh '${REMOTE_APK}' 'Автосборка из main' && rm -f '${REMOTE_APK}'"
+          # Проверяем, что сервер действительно отдаёт новую версию.
+          $SSH "$TARGET" "curl -fsS https://67chat.ru/api/app/version | head -c 300"

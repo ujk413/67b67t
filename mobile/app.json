@@ -1,34 +1,32 @@
 {
   "expo": {
-    "name": "Messenger67",
+    "name": "67chat",
     "slug": "messenger67-mobile",
-    "version": "1.0.3",
+    "version": "1.3.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "icon": "./assets/brand/app-1024.png",
+    "userInterfaceStyle": "automatic",
     "plugins": [],
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/brand/splash.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSCameraUsageDescription": "Messenger needs camera access for video calls and sending photos",
-        "NSMicrophoneUsageDescription": "Messenger needs microphone access for voice and video calls",
-        "NSPhotoLibraryUsageDescription": "Messenger needs photo library access to send images"
+        "NSCameraUsageDescription": "Камера нужна для фото, видеокружков и звонков",
+        "NSMicrophoneUsageDescription": "Микрофон нужен для голосовых сообщений и звонков",
+        "NSPhotoLibraryUsageDescription": "Доступ к галерее нужен для отправки фото и видео"
       },
       "googleServicesFile": "./GoogleService-Info.plist"
     },
     "android": {
       "package": "ru.b67t.messenger.mobile",
-      "versionCode": 4,
+      "versionCode": 11,
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
+        "backgroundColor": "#14B88F",
+        "foregroundImage": "./assets/brand/app-1024.png"
       },
       "predictiveBackGestureEnabled": false,
       "permissions": [
@@ -39,7 +37,8 @@
         "ACCESS_NETWORK_STATE",
         "WAKE_LOCK",
         "FOREGROUND_SERVICE",
-        "POST_NOTIFICATIONS"
+        "POST_NOTIFICATIONS",
+        "REQUEST_INSTALL_PACKAGES"
       ]
     },
     "web": {

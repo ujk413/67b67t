@@ -1,0 +1,118 @@
+# Standalone deployment for a fresh Ubuntu server. Do not merge with prod.yml.
+name: messenger67
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+services:
+  postgres:
+    image: postgres:16
+    container_name: messenger67-postgres
+    environment:
+      POSTGRES_USER: messenger
+      POSTGRES_DB: messenger
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run scripts/init_server.py first}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U messenger -d messenger"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    logging: *logging
+  api:
+    build: ./api
+    container_name: messenger67-api
+    environment:
+      DATABASE_URL: postgres://messenger:${POSTGRES_PASSWORD}@postgres:5432/messenger
+      PORT: "3000"
+      NODE_ENV: production
+      COOKIE_SECURE: "true"
+      ORIGIN: https://${SITE_DOMAIN:?Set SITE_DOMAIN}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY}
+      TURN_SECRET: ${TURN_SECRET:?Set TURN_SECRET}
+      TURN_EXTERNAL_IP: ${PUBLIC_IPV4:?Set PUBLIC_IPV4}
+      TURN_URLS: turn:${PUBLIC_IPV4}:3478?transport=udp,turn:${PUBLIC_IPV4}:3478?transport=tcp
+      ADMIN_USERNAMES: ${ADMIN_USERNAMES:-}
+      HCAPTCHA_SECRET: ${HCAPTCHA_SECRET:-}
+      USE_S3: "false"
+      WEB_PUSH_PUBLIC_KEY: ${WEB_PUSH_PUBLIC_KEY:-}
+      WEB_PUSH_PRIVATE_KEY: ${WEB_PUSH_PRIVATE_KEY:-}
+      WEB_PUSH_SUBJECT: https://${SITE_DOMAIN}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      APP_RELEASE_DIR: /app/releases
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./data/uploads:/app/uploads
+      # Signed APK + latest.json written by the release job; served by
+      # /app/version and /app/android.apk so phones can self-update.
+      - ./data/releases:/app/releases
+      - ${FIREBASE_SECRETS_DIR:-./secrets}:/run/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+  caddy:
+    image: caddy:2
+    container_name: messenger67-caddy
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./web:/srv:ro
+      - ./data/caddy/data:/data
+      - ./data/caddy/config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+  turn:
+    # coturn 4.18.0; pin the verified image to avoid surprise CLI changes.
+    image: coturn/coturn@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
+    container_name: messenger67-turn
+    entrypoint: ["turnserver"]
+    # Ubuntu: use the host's real address, not a guessed Docker bridge address.
+    network_mode: host
+    command:
+      - -c
+      - /dev/null
+      - --log-file=stdout
+      - --pidfile=/tmp/turnserver.pid
+      - --listening-port=3478
+      - --listening-ip=0.0.0.0
+      - --relay-ip=${TURN_RELAY_IP:?Set the host IPv4 assigned to its NIC}
+      - --external-ip=${PUBLIC_IPV4}/${TURN_RELAY_IP}
+      - --realm=${SITE_DOMAIN}
+      - --min-port=10000
+      - --max-port=10100
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET}
+      - --fingerprint
+      - --no-tls
+      # DTLS and the admin CLI are off by default in this pinned release.
+      - --no-multicast-peers
+      - --no-tcp-relay
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=100.64.0.0-100.127.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --denied-peer-ip=198.18.0.0-198.19.255.255
+      - --denied-peer-ip=240.0.0.0-255.255.255.255
+      - --total-quota=100
+      - --user-quota=12
+    restart: unless-stopped
+    logging: *logging

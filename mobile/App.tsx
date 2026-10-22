@@ -1,61 +1,120 @@
+import { protectedUploader } from "./src/protectedUpload";
+import { nativeCalls } from "./src/nativeCalls";
+import { GroupEncryption } from "./src/groupEncryption";
+import { getMobileDeviceId } from "./src/crypto";
+import { openMediaFile, removePrivateMedia } from "./src/mediaFiles";
+import { userError } from "./src/errors";
+import { MediaViewer } from "./src/components/MediaViewer";
+import { Icon } from "./src/components/Icon";
+import { restoreSessionEffect } from "./src/restoreSessionEffect";
+import { startConnection } from "./src/startConnection";
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { MediaSession, MediaDecoder, useMediaHeaders } from "./src/MediaSession";
+import { useChatPresence } from "./src/hooks/useChatPresence";
+import { useAccountData } from "./src/hooks/useAccountData";
+import { mobileApi } from "./src/mobileApi";
+import { mergeMessages } from "./src/data/messages";
+import { Workspace, MessageActions } from "./src/screens/Workspace";
+import { AppNavigation } from "./src/components/AppNavigation";
+import { ConnectionBanner } from "./src/components/ConnectionBanner";
+import { UpdateBanner } from "./src/components/UpdateBanner";
+import { useAppUpdate } from "./src/hooks/useAppUpdate";
+import { ThemeProvider, useTheme } from "./src/ThemeProvider";
 import "react-native-get-random-values";
+import { StatusBar } from "expo-status-bar";
+import { Audio } from "expo-av";
+import { ResizeMode, Video } from './src/components/Video';
+import * as DocumentPicker from "expo-document-picker";
+import * as ImagePicker from "expo-image-picker";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   AppState,
-  BackHandler,
+  FlatList,
   Image,
+  BackHandler,
   KeyboardAvoidingView,
   Linking,
   Modal,
   Platform,
   Pressable,
-  SafeAreaView,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from "react-native";
-import { StatusBar } from "expo-status-bar";
-import { Audio, Video, ResizeMode } from "expo-av";
-import * as ImagePicker from "expo-image-picker";
-import * as DocumentPicker from "expo-document-picker";
-import { RTCView } from "react-native-webrtc";
-
-import { api } from "./src/api";
-import { displayName, roomTitle, roomPreview, shortTime } from "./src/format";
-import { storage } from "./src/storage";
+import { api, request, resetUnauthorizedGuard, setUnauthorizedHandler } from "./src/api";
+import {
+  DEFAULT_BASE_URL,
+  mediaThumbUrl,
+  mediaUrl,
+  normalizeBaseUrl,
+  wsUrlFromApi,
+} from "./src/config";
+import { displayName, roomPreview, roomTitle, shortTime } from "./src/format";
+import {
+  STORAGE_KEYS,
+  storage,
+  restoreSessionToken,
+  removeSessionTokens,
+} from "./src/storage";
+import type { Message, Room, User } from "./src/types";
 import { e2e } from "./src/crypto";
 import { pushNotifications } from "./src/notifications";
 import { WebRTCCall } from "./src/webrtc";
-import { encryptRoomText, decryptRoomText } from "./src/roomCrypto";
-import type { Message, Room, User } from "./src/types";
-import { DEFAULT_BASE_URL, normalizeBaseUrl } from "./src/config";
+import {
+  decryptRoomText,
+  encryptRoomText,
+  clearDerivedRoomKeys,
+} from "./src/roomCrypto";
+import { RTCView } from "react-native-webrtc";
 import { telegramColors } from "./src/theme";
-
-// Screens
 import { AuthScreen } from "./src/screens/AuthScreen";
 import { ChatListScreen } from "./src/screens/ChatListScreen";
 import { ChatScreen } from "./src/screens/ChatScreen";
 import { ProfileScreen } from "./src/screens/ProfileScreen";
 
-const STORAGE_KEYS = { token: "auth.token" };
+type AuthMode = "login" | "register";
+type ReactionTarget = {
+  id: string;
+  reactions?: Record<string, string[]> | null;
+} | null;
+
 const REACTION_SET = ["👍", "❤️", "😂", "🔥", "😮", "👎"];
 const TYPING_TTL_MS = 8000;
 const TYPING_SEND_INTERVAL_MS = 3000;
 
-function mediaUrl(baseUrl: string, mediaId: string | null | undefined) {
-  return mediaId ? `${baseUrl}/media/${mediaId}` : null;
+export default function Root() {
+  return (
+    <SafeAreaProvider>
+      <ThemeProvider>
+        <App />
+      </ThemeProvider>
+    </SafeAreaProvider>
+  );
 }
 
-function mediaThumbUrl(baseUrl: string, mediaId: string | null | undefined) {
-  return mediaId ? `${baseUrl}/media/${mediaId}/thumb` : null;
-}
+function App() {
+  const styles = useStyles();
+  const { colors: telegramColors } = useTheme();
 
-export default function App() {
-  const [baseUrl, setBaseUrl] = useState(normalizeBaseUrl(DEFAULT_BASE_URL));
+  const theme = useTheme();
+  const [workspace, setWorkspace] = useState<string | null>(null);
+  const [searchMatches, setSearchMatches] = useState<{
+    roomId: string;
+    ids: string[];
+    index: number;
+  } | null>(null);
+  const [connection, setConnection] = useState("connecting");
+  const [selectionReset, setSelectionReset] = useState(0);
+  const [actionMessages, setActionMessages] = useState<Message[]>([]);
+  const [editing, setEditing] = useState<Message | null>(null);
+  const [focusId, setFocusId] = useState<string | null>(null);
+  const [forwarding, setForwarding] = useState<Message[]>([]);
+  const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL);
   const [token, setToken] = useState<string | null>(null);
   const [me, setMe] = useState<User | null>(null);
   const [rooms, setRooms] = useState<Room[]>([]);
@@ -68,21 +127,27 @@ export default function App() {
   const [refreshingMessages, setRefreshingMessages] = useState(false);
   const [busyUpload, setBusyUpload] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [composer, setComposer] = useState("");
-  const [typingUsers, setTypingUsers] = useState<Record<string, { username: string; roomId: string }>>({});
-  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  // Who is typing, keyed by roomId:userId. Entries expire after TYPING_TTL_MS if no update arrives.
+  const [typingUsers, setTypingUsers] = useState<
+    Record<string, { username: string; roomId: string }>
+  >({});
+  const typingTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>(
+    {},
+  );
+  const typingSentAtRef = useRef(0);
+  const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileName, setProfileName] = useState("");
   const [newPassword, setNewPassword] = useState("");
-  const [reactionTarget, setReactionTarget] = useState<{ id: string; reactions: Record<string, string[]> | null } | null>(null);
+  const [reactionTarget, setReactionTarget] = useState<ReactionTarget>(null);
   const [viewerMessage, setViewerMessage] = useState<Message | null>(null);
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const [playingId, setPlayingId] = useState<string | null>(null);
-
   const [incomingCall, setIncomingCall] = useState<{
+    callId?: string;
     roomId: string;
     callerId: string;
     callerName: string;
@@ -90,219 +155,312 @@ export default function App() {
     offer: any;
   } | null>(null);
   const [activeCall, setActiveCall] = useState<WebRTCCall | null>(null);
-  const [callState, setCallState] = useState<"idle" | "calling" | "ringing" | "connected">("idle");
+  const [callState, setCallState] = useState<
+    "idle" | "calling" | "ringing" | "connected"
+  >("idle");
   const [localStream, setLocalStream] = useState<any>(null);
   const [remoteStream, setRemoteStream] = useState<any>(null);
+  const [speakerEnabled, setSpeakerEnabled] = useState(false);
+  const [autoAnswerId, setAutoAnswerId] = useState<string | null>(null);
   const [isAudioEnabled, setIsAudioEnabled] = useState(true);
   const [isVideoEnabled, setIsVideoEnabled] = useState(false);
-
   const wsRef = useRef<WebSocket | null>(null);
-  const onWsMessageRef = useRef<((data: any) => void) | null>(null);
-  const resyncRef = useRef<(() => Promise<void>) | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const audioRef = useRef<Audio.Sound | null>(null);
+  const roomSecretCache = useRef<Map<string, string>>(new Map());
+  // Latest-value refs so the long-lived WebSocket/AppState callbacks never see stale state.
   const tokenRef = useRef<string | null>(null);
   const activeRoomIdRef = useRef<string | null>(null);
-  const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const roomSecretCache = useRef(new Map<string, string>());
-  const audioRef = useRef<Audio.Sound | null>(null);
-  const typingTimersRef = useRef<Record<string, NodeJS.Timeout>>({});
-  const typingSentAtRef = useRef(0);
-  const unauthorizedGuardRef = useRef(0);
-  const callRef = useRef<WebRTCCall | null>(null);
   const callActiveRef = useRef(false);
-
+  const onWsMessageRef = useRef<((data: any) => Promise<void>) | null>(null);
+  const resyncRef = useRef<(() => Promise<void>) | null>(null);
+  useEffect(() => {
+    void pushNotifications
+      .setBadgeCount(
+        rooms
+          .filter((r) => !r.preferences?.muted)
+          .reduce((sum, r) => sum + (r.unread_count || 0), 0),
+      )
+      .catch(() => {});
+  }, [rooms]);
+  const groupEncryption = useMemo(() => me?.id && token ? new GroupEncryption(me.id, baseUrl, token, () => local.repository.current) : null, [me?.id, token, baseUrl]);
+  async function encodeText(roomId: string, text: string) {
+    if (rooms.find(room => room.id === roomId)?.kind === 'group' && groupEncryption && await groupEncryption.enabled(roomId)) return groupEncryption.encrypt(roomId, text);
+    const secret = await getRoomSecret(roomId); if (!secret) throw Error('Ключ переписки недоступен');
+    return {type:'text', ...(await encryptRoomText(roomId,secret,text))};
+  }
+  const appUpdate = useAppUpdate(baseUrl, true);
+  const local = useAccountData({
+    me,
+    token,
+    baseUrl,
+    activeRoomId,
+    decode: prepareMessage,
+    encode: encodeText,
+    onMessages: setMessages,
+    onRooms: setRooms,
+    onError: setError,
+    onRevoke: () => {
+      setActiveRoomId(null);
+      setActiveRoomMembers([]);
+      setError("Доступ к переписке прекращён");
+    },
+    getSecret: getRoomSecret,
+  });
+  useEffect(() => {
+    if (!activeRoomId || !local.ready) return;
+    let active = true;
+    void local.repository.current
+      ?.get<{ text: string; reply?: Message | null }>(`draft:${activeRoomId}`, {
+        text: "",
+      })
+      .then((draft) => {
+        if (active) {
+          setComposer(draft.text);
+          local.setReply(draft.reply || null);
+        }
+      })
+      .catch((e) => setError(String(e)));
+    return () => {
+      active = false;
+    };
+  }, [activeRoomId, local.ready]);
+  useEffect(() => {
+    if (local.ready)
+      void local.repository.current?.saveRooms(rooms).catch(() => {});
+  }, [rooms, local.ready]);
+  useEffect(() => {
+    if (!token || !me) return;
+    let stopped = false,
+      dispose: (() => void) | undefined;
+    pushNotifications.onMessage((data) => {
+      if (data.room_id)
+        void mobileApi(baseUrl, token)
+          .room(data.room_id)
+          .then((room) => {
+            setWorkspace(null);
+            setProfileOpen(false);
+            return openRoom(room);
+          })
+          .catch((e) => setError(String(e)));
+    });
+    void pushNotifications
+      .connect(baseUrl, token, () => activeRoomIdRef.current)
+      .then((fn) => {
+        if (stopped) fn();
+        else dispose = fn;
+      })
+      .catch((e) => setError(String(e)));
+    return () => {
+      stopped = true;
+      dispose?.();
+    };
+  }, [token, me?.id]);
+  useEffect(() => {
+    if (token) void pushNotifications.refresh().catch(() => {});
+  }, [activeRoomId, token]);
+  function changeComposer(text: string) {
+    setComposer(text);
+    notifyTyping(text.length > 0);
+    if (activeRoomId)
+      void local.repository.current
+        ?.set(`draft:${activeRoomId}`, { text, reply: local.reply })
+        .catch((e) => setError(String(e)));
+  }
   tokenRef.current = token;
   activeRoomIdRef.current = activeRoomId;
-  callRef.current = activeCall;
-  callActiveRef.current = callState !== "idle";
+  callActiveRef.current =
+    !!activeCall || !!incomingCall || callState !== "idle";
 
   useEffect(() => {
-    const load = async () => {
-      const savedToken = await storage.get(STORAGE_KEYS.token);
-      if (savedToken) {
-        try {
-          setBaseUrl(normalizeBaseUrl(DEFAULT_BASE_URL));
-          setToken(savedToken);
-          await bootstrap(normalizeBaseUrl(DEFAULT_BASE_URL), savedToken);
-        } catch (e) {
-          console.error("Bootstrap failed:", errorText(e));
-          await storage.del(STORAGE_KEYS.token);
-        }
-      }
-      setLoading(false);
-    };
-    load();
+    // Ignore late failures from a previous session when another user has logged in.
+    setUnauthorizedHandler((failedToken) => {
+      if (failedToken !== tokenRef.current) return;
+      void clearSession();
+      setError("Сеанс завершён. Войдите снова.");
+    });
+    return () => setUnauthorizedHandler(null);
   }, []);
 
-  function resetUnauthorizedGuard() {
-    unauthorizedGuardRef.current = Date.now();
-  }
-
-  function shouldPause() {
-    return !tokenRef.current || Date.now() - unauthorizedGuardRef.current > 600000;
-  }
+  useEffect(
+    () =>
+      restoreSessionEffect({
+        restoreSessionToken,
+        storage,
+        normalizeBaseUrl,
+        DEFAULT_BASE_URL,
+        setBaseUrl,
+        setMe,
+        tokenRef,
+        resetUnauthorizedGuard,
+        setToken,
+        bootstrap,
+        setError,
+        errorText,
+        setLoading,
+        reconnectTimerRef,
+        wsRef,
+        audioRef,
+        recording,
+      }),
+    [],
+  );
 
   useEffect(() => {
-    if (!token) return;
-    resetUnauthorizedGuard();
-    let cancelled = false;
-    let attempt = 0;
+    setProfileName(me?.display_name || "");
+  }, [me?.display_name]);
 
-    const connect = () => {
-      if (cancelled || shouldPause()) return;
-      const ws = new WebSocket(`${baseUrl.replace(/^http/, "ws")}/ws`);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        attempt = 0;
-        clearTimeout(reconnectTimerRef.current!);
-        reconnectTimerRef.current = null;
-        if (wsRef.current !== ws || !tokenRef.current) return;
-        try {
-          ws.send(JSON.stringify({ type: "auth", token: tokenRef.current }));
-          if (activeRoomIdRef.current) {
-            ws.send(JSON.stringify({ type: "rooms.join", room_id: activeRoomIdRef.current }));
-          }
-          resyncRef.current?.();
-        } catch {}
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          onWsMessageRef.current?.(data);
-        } catch {}
-      };
-
-      const clearTimer = () => {
-        if (reconnectTimerRef.current) {
-          clearTimeout(reconnectTimerRef.current);
-          reconnectTimerRef.current = null;
-        }
-      };
-
-      const closeSocket = () => {
-        try {
-          ws.close();
-        } catch {}
-      };
-
-      ws.onerror = () => {};
-
-      ws.onclose = () => {
-        if (wsRef.current !== ws) return;
-        wsRef.current = null;
-        if (cancelled || shouldPause()) return;
-        const delay = Math.min(30000, 1000 * 2 ** attempt);
-        attempt += 1;
-        reconnectTimerRef.current = setTimeout(connect, Math.round(delay * (0.75 + Math.random() * 0.5)));
-      };
-    };
-
-    const sub = AppState.addEventListener("change", (state) => {
-      if (state === "active") {
-        attempt = 0;
-        connect();
-      } else if (state === "background" && !callActiveRef.current) {
-        if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-        try {
-          wsRef.current?.close();
-        } catch {}
-      }
-    });
-
-    connect();
-    return () => {
-      cancelled = true;
-      sub.remove();
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      try {
-        wsRef.current?.close();
-      } catch {}
-    };
-  }, [baseUrl, token]);
+  useEffect(
+    () =>
+      startConnection({
+        token,
+        baseUrl,
+        wsRef,
+        reconnectTimerRef,
+        callActiveRef,
+        activeRoomIdRef,
+        resyncRef,
+        onWsMessageRef,
+        AppState,
+        WebSocket,
+        wsUrlFromApi,
+        setConnection,
+      }),
+    [baseUrl, token],
+  );
 
   onWsMessageRef.current = handleWsMessage;
   resyncRef.current = resyncAfterReconnect;
 
   async function resyncAfterReconnect() {
-    const activeToken = tokenRef.current;
-    if (!activeToken) return;
+    if (!tokenRef.current) return;
+    await local.sync();
     try {
-      const roomList = await api.rooms(baseUrl, activeToken);
-      const prepared = await prepareRooms(roomList, baseUrl, activeToken);
-      const roomId = activeRoomIdRef.current;
-      if (!roomId) {
-        setRooms(prepared);
-      } else {
-        const roomMessages = await api.roomMessages(baseUrl, activeToken, roomId);
-        const preparedMessages = await prepareMessages(roomMessages, baseUrl, activeToken);
-        if (activeRoomIdRef.current === roomId) {
-          setMessages(preparedMessages);
-          await api.markRead(baseUrl, activeToken, roomId);
-          setRooms(prepared.map((item) => (item.id === roomId ? { ...item, unread_count: 0 } : item)));
-        } else {
-          setRooms(prepared);
-        }
+      const list = await api.rooms(baseUrl, tokenRef.current);
+      setRooms(await prepareRooms(list));
+      if (
+        activeRoomIdRef.current &&
+        !list.some((room) => room.id === activeRoomIdRef.current)
+      ) {
+        setActiveRoomId(null);
+        setMessages([]);
       }
-    } catch (e) {
-      console.error("Resync failed:", errorText(e));
-    }
-    await replenishPrekeys(activeToken);
+    } catch {}
+    await replenishPrekeys(tokenRef.current);
   }
 
-  async function replenishPrekeys(activeToken: string, userId = me?.id, nextBaseUrl = baseUrl) {
+  async function replenishPrekeys(
+    activeToken: string,
+    userId = me?.id,
+    nextBaseUrl = baseUrl,
+  ) {
     if (!userId) return;
     try {
       const deviceId = await getMobileDeviceId(userId);
-      const { unused } = await api.e2ePrekeyCount(nextBaseUrl, activeToken, deviceId);
-      if (unused >= 10) return;
+      const { unused } = await api.e2ePrekeyCount(
+        nextBaseUrl,
+        activeToken,
+        deviceId,
+      );
+      e2e.configure(nextBaseUrl, activeToken);
       await e2e.initialize(userId);
-      await api.uploadE2EKeys(nextBaseUrl, activeToken, deviceId, await e2e.getPublicKeys(20));
+      if (unused >= 10) return;
+      await api.uploadE2EKeys(
+        nextBaseUrl,
+        activeToken,
+        deviceId,
+        await e2e.getPublicKeys(20),
+      );
     } catch (e) {
       console.error("Failed to replenish pre-keys:", errorText(e));
     }
   }
 
   async function handleWsMessage(data: any) {
-    if (data.type === "auth.required") {
+    const receivingToken = token;
+    if (data.type === "auth.required" || data.type === 'auth.error') {
       await clearSession();
-      setError("Session expired");
+      setError("Сеанс завершён. Войдите снова.");
       return;
     }
     if (data.type === "rooms.update" && Array.isArray(data.rooms)) {
       setRooms(await prepareRooms(data.rooms, baseUrl, token));
       return;
     }
-    if (data.type === "message.new") {
-      const incoming = await prepareMessage(data.message as Message, baseUrl, token);
-      setRooms((prev) => reorderRooms(updateRoomPreview(prev, incoming, me?.id || null), incoming.room_id));
-      if (incoming.room_id === activeRoomId && token) {
-        setMessages((prev) => upsertMessage(prev, incoming));
+    if (data.type === "message.new" || data.type === "message.update") {
+      const incoming = await prepareMessage(
+        data.message as Message,
+        baseUrl,
+        token,
+      );
+      if (tokenRef.current !== receivingToken) return;
+      void local.repository.current?.saveMessages([incoming]).catch(() => {});
+      setRooms((prev) =>
+        reorderRooms(
+          updateRoomPreview(prev, incoming, me?.id || null),
+          incoming.room_id,
+        ),
+      );
+      if (incoming.room_id === activeRoomIdRef.current && tokenRef.current) {
+        setMessages((prev) => mergeMessages(prev, [incoming]));
         try {
-          await api.markRead(baseUrl, token, incoming.room_id);
+          // Read receipts are sent by the visible-message callback.
         } catch {}
       }
       return;
     }
+    if (data.type === 'sender_key.available' && data.room_id) {
+      try { await groupEncryption?.inbox(data.room_id); if (data.room_id === activeRoomIdRef.current) await local.open(rooms.find(room => room.id === data.room_id)!); } catch {}
+      return;
+    }
     if (data.type === "message.delete" && data.message_id) {
+      void local.repository.current
+        ?.removeMessage(data.message_id)
+        .catch(() => {});
       setMessages((prev) => prev.filter((item) => item.id !== data.message_id));
       return;
     }
-    if (data.type === "reaction.add" && data.message_id && data.emoji && data.user_id) {
+    if (
+      data.type === "reaction.add" &&
+      data.message_id &&
+      data.emoji &&
+      data.user_id
+    ) {
       setMessages((prev) =>
-        prev.map((item) => (item.id === data.message_id ? withReaction(item, data.emoji, data.user_id, true) : item))
+        prev.map((item) =>
+          item.id === data.message_id
+            ? withReaction(item, data.emoji, data.user_id, true)
+            : item,
+        ),
       );
       return;
     }
-    if (data.type === "reaction.remove" && data.message_id && data.emoji && data.user_id) {
+    if (
+      data.type === "reaction.remove" &&
+      data.message_id &&
+      data.emoji &&
+      data.user_id
+    ) {
       setMessages((prev) =>
-        prev.map((item) => (item.id === data.message_id ? withReaction(item, data.emoji, data.user_id, false) : item))
+        prev.map((item) =>
+          item.id === data.message_id
+            ? withReaction(item, data.emoji, data.user_id, false)
+            : item,
+        ),
       );
       return;
     }
-    if (data.type === "messages.read" && Array.isArray(data.message_ids) && data.user_id) {
+    if (
+      data.type === "messages.read" &&
+      Array.isArray(data.message_ids) &&
+      data.user_id
+    ) {
       setMessages((prev) =>
-        prev.map((item) => (data.message_ids.includes(item.id) ? withRead(item, data.user_id) : item))
+        prev.map((item) =>
+          data.message_ids.includes(item.id)
+            ? withRead(item, data.user_id)
+            : item,
+        ),
       );
       return;
     }
@@ -311,7 +469,10 @@ export default function App() {
       clearTimeout(typingTimersRef.current[key]);
       delete typingTimersRef.current[key];
       if (data.is_typing) {
-        setTypingUsers((prev) => ({ ...prev, [key]: { username: data.username || "Кто-то", roomId: data.room_id } }));
+        setTypingUsers((prev) => ({
+          ...prev,
+          [key]: { username: data.username || "Кто-то", roomId: data.room_id },
+        }));
         typingTimersRef.current[key] = setTimeout(() => {
           delete typingTimersRef.current[key];
           setTypingUsers((prev) => {
@@ -328,77 +489,110 @@ export default function App() {
         });
       }
     }
+    if (data.type === 'call.created') { callIdRef.current = data.call_id; return; }
     if (data.type === "call.offer") {
+      if (data.call_id && (incomingCall?.callId === data.call_id || callIdRef.current === data.call_id)) return;
+      if (activeCallRef.current || incomingCall) { wsRef.current?.send(JSON.stringify({ type: "call.hangup", room_id: data.room_id, to_user_id: data.from_user_id, reason: "busy" })); return; }
+      callIdRef.current=data.call_id || null; callRoomRef.current=data.room_id;
+      pendingCallIce.current.push(...(data.candidates || []).map((candidate:any)=>({roomId:data.room_id,candidate})));
+      armCallTimeout();
       setIncomingCall({
+        callId: data.call_id,
         roomId: data.room_id,
         callerId: data.from_user_id,
-        callerName: data.from_username || "Unknown",
+        callerName: data.from_username || "Абонент",
         isVideo: data.is_video || false,
         offer: data.offer || data.sdp,
       });
       return;
     }
-    if (data.type === "call.answer" && activeCall) {
+    if (data.type === "call.answer" && activeCallRef.current && data.room_id === callRoomRef.current) {
       try {
-        await activeCall.handleAnswer(data.answer || data.sdp);
+        await activeCallRef.current.handleAnswer(data.answer || data.sdp);
       } catch (error) {
         console.error("Failed to handle answer:", error);
       }
       return;
     }
-    if ((data.type === "call.ice" || data.type === "call.ice_candidate") && activeCall) {
+    if (
+      (data.type === "call.ice" || data.type === "call.ice_candidate") &&
+      data.room_id
+    ) {
       try {
-        await activeCall.addIceCandidate(data.candidate || data.ice);
+        if (activeCallRef.current && callRoomRef.current === data.room_id) await activeCallRef.current.addIceCandidate(data.candidate || data.ice);
+        else { pendingCallIce.current.push({ roomId: data.room_id, candidate: data.candidate || data.ice }); if (pendingCallIce.current.length > 128) pendingCallIce.current.shift(); }
       } catch (error) {
         console.error("Failed to add ICE candidate:", error);
       }
       return;
     }
-    if (data.type === "call.hangup" || data.type === "call.end") {
-      endCall();
+    if ((data.type === "call.hangup" || data.type === "call.end") && (!data.room_id || data.room_id === callRoomRef.current || data.room_id === incomingCall?.roomId)) {
+      endCall(false);
       return;
     }
   }
 
   async function bootstrap(nextBaseUrl: string, nextToken: string) {
-    const [user, roomList] = await Promise.all([api.me(nextBaseUrl, nextToken), api.rooms(nextBaseUrl, nextToken)]);
+    const [user, roomList] = await Promise.all([
+      api.me(nextBaseUrl, nextToken),
+      api.rooms(nextBaseUrl, nextToken),
+    ]);
+    if(tokenRef.current!==nextToken)return;
+    await storage.set("mobile.user", JSON.stringify(user));
     setMe(user);
-    setRooms(await prepareRooms(roomList, nextBaseUrl, nextToken));
-    await replenishPrekeys(nextToken, user.id, nextBaseUrl);
-    try {
-      const fcmToken = await pushNotifications.initialize();
-      if (fcmToken) {
-        await api.registerFCMToken(nextBaseUrl, nextToken, fcmToken);
-      }
-      pushNotifications.onMessage((data: any) => {
-        if (data.room_id) {
-          openRoom(data.room_id);
-        }
-      });
-    } catch (error) {
-      console.error("Failed to initialize push notifications:", error);
-    }
+    setRooms(roomList);
+    // Initial navigation must not wait for every preview's key derivation or prekeys.
+    void prepareRooms(roomList, nextBaseUrl, nextToken).then(prepared => {
+      if (tokenRef.current === nextToken) setRooms(prepared);
+    }).catch(() => {});
+    void replenishPrekeys(nextToken, user.id, nextBaseUrl);
   }
 
   async function clearSession() {
+    endCall();
+    tokenRef.current = null;
+    local.outbox.current?.stop();
+    if (token) void pushNotifications.disconnect(baseUrl, token);
+    const socket = wsRef.current;
+    wsRef.current = null;
+    socket?.close();
+    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
+    Object.values(typingTimersRef.current).forEach(clearTimeout);
+    typingTimersRef.current = {};
+    setTypingUsers({});
+    roomSecretCache.current.clear();
+    clearDerivedRoomKeys();
     setToken(null);
     setMe(null);
     setRooms([]);
     setMessages([]);
     setActiveRoomId(null);
     setActiveRoomMembers([]);
-    await storage.del(STORAGE_KEYS.token);
+    await removeSessionTokens();
+    await storage.del("mobile.user");
   }
 
-  async function persistSession(nextBaseUrl: string, nextToken: string) {
+  async function persistSession(nextBaseUrl: string, nextToken: string, user?: User) {
     resetUnauthorizedGuard();
-    await storage.set(STORAGE_KEYS.token, nextToken);
+    tokenRef.current = nextToken;
     setBaseUrl(nextBaseUrl);
     setToken(nextToken);
-    await bootstrap(nextBaseUrl, nextToken);
+    try {await storage.set(STORAGE_KEYS.token,nextToken);}catch{setError('Вход выполнен. Не удалось сохранить сеанс на телефоне: после перезапуска потребуется войти снова.');}
+    if (user) {
+      setMe(user);
+      await storage.set("mobile.user", JSON.stringify(user)).catch(()=>{});
+    }
+    try {
+      await bootstrap(nextBaseUrl, nextToken);
+    } catch (e) {
+      // The account and session already exist. Keep the signed-in state and allow refresh.
+      setError(`Вход выполнен. Не удалось обновить данные: ${userError(e)}`);
+    }
   }
 
   async function submitAuth() {
+    if (authBusy) return;
     setAuthBusy(true);
     setError(null);
     const nextBaseUrl = normalizeBaseUrl(DEFAULT_BASE_URL);
@@ -408,7 +602,7 @@ export default function App() {
           ? await api.mobileRegister(nextBaseUrl, username.trim(), password)
           : await api.mobileLogin(nextBaseUrl, username.trim(), password);
       if (!result.token) throw new Error("Server did not return a token");
-      await persistSession(nextBaseUrl, result.token);
+      await persistSession(nextBaseUrl, result.token, result.user);
       setPassword("");
       setUsername("");
     } catch (e) {
@@ -423,7 +617,10 @@ export default function App() {
     setRefreshingRooms(true);
     setError(null);
     try {
-      const [roomList, user] = await Promise.all([api.rooms(baseUrl, token), api.me(baseUrl, token)]);
+      const [roomList, user] = await Promise.all([
+        api.rooms(baseUrl, token),
+        api.me(baseUrl, token),
+      ]);
       setRooms(await prepareRooms(roomList, baseUrl, token));
       setMe(user);
     } catch (e) {
@@ -434,41 +631,38 @@ export default function App() {
   }
 
   async function openRoom(room: Room) {
+    setSearchMatches(null);
+    setActiveRoomMembers([]);
     if (!token) return;
+    activeRoomIdRef.current = room.id;
     setActiveRoomId(room.id);
+    setMessages([]);
+    setComposer("");
+    setEditing(null);
+    setFocusId(null);
     setError(null);
+    setRooms((prev) =>
+      prev.some((r) => r.id === room.id) ? prev : [room, ...prev],
+    );
+    await local.open(room);
     try {
-      const [roomMessages, members] = await Promise.all([
-        api.roomMessages(baseUrl, token, room.id),
-        api.roomMembers(baseUrl, token, room.id).catch(() => []),
-      ]);
-      setMessages(await prepareMessages(roomMessages, baseUrl, token));
-      setActiveRoomMembers(members);
-      await api.markRead(baseUrl, token, room.id);
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "rooms.join", room_id: room.id }));
-      }
-      setRooms((prev) => prev.map((item) => (item.id === room.id ? { ...item, unread_count: 0 } : item)));
-    } catch (e) {
-      setError(errorText(e));
-    }
+      const members = await api.roomMembers(baseUrl, token, room.id);
+      if (activeRoomIdRef.current === room.id) setActiveRoomMembers(members);
+    } catch {}
+    if (wsRef.current?.readyState === WebSocket.OPEN)
+      wsRef.current.send(
+        JSON.stringify({ type: "rooms.join", room_id: room.id }),
+      );
   }
-
   async function refreshMessages() {
-    if (!token || !activeRoomId) return;
-    setRefreshingMessages(true);
-    try {
-      const roomMessages = await api.roomMessages(baseUrl, token, activeRoomId);
-      setMessages(await prepareMessages(roomMessages, baseUrl, token));
-      await api.markRead(baseUrl, token, activeRoomId);
-    } catch (e) {
-      setError(errorText(e));
-    } finally {
-      setRefreshingMessages(false);
-    }
+    if (activeRoom) await local.open(activeRoom);
   }
 
-  async function getRoomSecret(roomId: string, nextBaseUrl = baseUrl, nextToken = token) {
+  async function getRoomSecret(
+    roomId: string,
+    nextBaseUrl = baseUrl,
+    nextToken = token,
+  ) {
     if (!nextToken) return null;
     const cached = roomSecretCache.current.get(roomId);
     if (cached) return cached;
@@ -477,54 +671,149 @@ export default function App() {
     return data.key;
   }
 
-  async function prepareMessage(message: Message, nextBaseUrl = baseUrl, nextToken = token): Promise<Message> {
-    if (message.type !== "text") return message;
-    if (message.meta?.e2e_group)
-      return { ...message, text: "🔒 Сообщение в группе со сквозным шифрованием. Откройте веб-версию.", _decrypted: false };
-    if (message.meta?.encrypted && message.meta?.e2ee_v === 2 && message.text && typeof message.meta.iv === "string") {
+  async function prepareMessage(
+    message: Message,
+    nextBaseUrl = baseUrl,
+    nextToken = token,
+  ): Promise<Message> {
+    const preview = message.meta?.reply_preview as
+      | { text?: string; meta?: { iv?: string } }
+      | undefined;
+    if (preview?.text && preview.meta?.iv && message.reply_to) {
       try {
-        const secret = await getRoomSecret(message.room_id, nextBaseUrl, nextToken);
-        if (!secret) return { ...message, text: "Encrypted message" };
+        const secret = await getRoomSecret(
+          message.room_id,
+          nextBaseUrl,
+          nextToken,
+        );
+        if (secret)
+          message = {
+            ...message,
+            reply_to: {
+              ...message.reply_to,
+              text: await decryptRoomText(
+                message.room_id,
+                secret,
+                preview.text,
+                preview.meta.iv,
+              ),
+            },
+          };
+      } catch {}
+    }
+    const protectedPreview=message.meta?.reply_preview as Partial<Message> | undefined;
+    if(protectedPreview?.meta?.e2e_group && message.reply_to) {
+      const reply=await prepareMessage({...protectedPreview,id:message.id+'-reply',room_id:message.room_id,sender_id:message.sender_id,type:'text'} as Message,nextBaseUrl,nextToken);
+      message={...message,reply_to:{...message.reply_to,text:reply.text}};
+    }
+    const caption=message.meta?.caption_message as Partial<Message> | undefined;
+    if(message.type!=='text' && caption) {
+      const decoded=await prepareMessage({...caption,id:message.id+'-caption',room_id:message.room_id,sender_id:message.sender_id,type:'text'} as Message,nextBaseUrl,nextToken);
+      return {...message,text:decoded.text,_decrypted:decoded._decrypted};
+    }
+    if (message.type !== "text") return message;
+    if (message.meta?.e2e_group) {
+      try { if (!groupEncryption) throw Error('Ключи ещё загружаются'); return {...message, text: await groupEncryption.decrypt(message), _decrypted:true}; }
+      catch (error) { return {...message,text:errorText(error),_decrypted:false}; }
+    }
+    if (
+      message.meta?.encrypted &&
+      message.meta?.e2ee_v === 2 &&
+      message.text &&
+      typeof message.meta.iv === "string"
+    ) {
+      try {
+        const secret = await getRoomSecret(
+          message.room_id,
+          nextBaseUrl,
+          nextToken,
+        );
+        if (!secret)
+          return {
+            ...message,
+            text: "Не удалось расшифровать сообщение. Откройте веб-версию.",
+          };
         return {
           ...message,
-          text: await decryptRoomText(message.room_id, secret, message.text, message.meta.iv),
+          text: await decryptRoomText(
+            message.room_id,
+            secret,
+            message.text,
+            message.meta.iv,
+          ),
           _decrypted: true,
         };
       } catch {
-        return { ...message, text: "Encrypted message" };
+        return {
+          ...message,
+          text: "Не удалось расшифровать сообщение. Откройте веб-версию.",
+        };
       }
     }
     if (message.encrypted_content && message.sender_id !== me?.id) {
       try {
-        const decrypted = await e2e.decrypt(message.sender_id, JSON.parse(message.encrypted_content));
+        const decrypted = await e2e.decrypt(
+          message.sender_id,
+          JSON.parse(message.encrypted_content),
+        );
         return { ...message, text: decrypted, _decrypted: true };
       } catch {
-        return { ...message, text: "Encrypted message" };
+        return {
+          ...message,
+          text: "Не удалось расшифровать сообщение. Откройте веб-версию.",
+        };
       }
     }
+    if (message.encrypted_content && !message._decrypted)
+      return {
+        ...message,
+        text: "Сообщение со сквозным шифрованием. Откройте веб-версию.",
+      };
     return message;
   }
 
-  async function prepareMessages(items: Message[], nextBaseUrl = baseUrl, nextToken = token) {
-    return Promise.all(items.map((item) => prepareMessage(item, nextBaseUrl, nextToken)));
+  async function prepareMessages(
+    items: Message[],
+    nextBaseUrl = baseUrl,
+    nextToken = token,
+  ) {
+    return Promise.all(
+      items.map((item) => prepareMessage(item, nextBaseUrl, nextToken)),
+    );
   }
 
-  async function prepareRooms(items: Room[], nextBaseUrl = baseUrl, nextToken = token) {
+  async function prepareRooms(
+    items: Room[],
+    nextBaseUrl = baseUrl,
+    nextToken = token,
+  ) {
     return Promise.all(
       items.map(async (room) => {
         if (room.last_msg_type !== "text") return room;
-        if (!(room.last_msg_meta?.encrypted && room.last_msg_meta?.e2ee_v === 2 && room.last_msg_text && typeof room.last_msg_meta.iv === "string")) {
+        if (
+          !(
+            room.last_msg_meta?.encrypted &&
+            room.last_msg_meta?.e2ee_v === 2 &&
+            room.last_msg_text &&
+            typeof room.last_msg_meta.iv === "string"
+          )
+        ) {
           return room;
         }
         try {
           const secret = await getRoomSecret(room.id, nextBaseUrl, nextToken);
           if (!secret) return room;
-          const text = await decryptRoomText(room.id, secret, room.last_msg_text, room.last_msg_meta.iv);
+          const text = await decryptRoomText(
+            room.id,
+            secret,
+            room.last_msg_text,
+            room.last_msg_meta.iv,
+          );
           return { ...room, last_msg_text: text };
         } catch {
           return { ...room, last_msg_text: null };
         }
-      })
+      }),
     );
   }
 
@@ -532,7 +821,8 @@ export default function App() {
     if (!token || !me) return;
     try {
       await api.updateMe(baseUrl, token, profileName.trim() || null);
-      if (newPassword.trim()) await api.changePassword(baseUrl, token, newPassword);
+      if (newPassword.trim())
+        await api.changePassword(baseUrl, token, newPassword);
       const user = await api.me(baseUrl, token);
       setMe(user);
       setNewPassword("");
@@ -544,7 +834,10 @@ export default function App() {
 
   async function pickAvatar() {
     if (!token) return;
-    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], quality: 0.9 });
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      quality: 0.9,
+    });
     if (result.canceled || !result.assets?.[0]) return;
     try {
       setBusyUpload(true);
@@ -567,68 +860,90 @@ export default function App() {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== 1 || !activeRoomId) return;
     const now = Date.now();
-    if (isTyping && now - typingSentAtRef.current < TYPING_SEND_INTERVAL_MS) return;
+    if (isTyping && now - typingSentAtRef.current < TYPING_SEND_INTERVAL_MS)
+      return;
     typingSentAtRef.current = isTyping ? now : 0;
     try {
-      ws.send(JSON.stringify({ type: "typing", room_id: activeRoomId, is_typing: isTyping }));
+      ws.send(
+        JSON.stringify({
+          type: "typing",
+          room_id: activeRoomId,
+          is_typing: isTyping,
+        }),
+      );
     } catch {}
   }
 
   async function sendCurrentMessage() {
-    if (!token || !activeRoomId) return;
-    const text = composer.trim();
-    if (!text) return;
-    const groupE2e = activeRoom?.kind === "group" ? await api.roomE2e(baseUrl, token, activeRoomId).catch(() => null) : null;
-    if (groupE2e?.enabled) {
-      setError("В этой группе включено сквозное шифрование. Отправка с телефона пока не поддерживается, используйте веб-версию.");
-      return;
-    }
-    setComposer("");
-    notifyTyping(false);
-    setError(null);
+    if (!token || !activeRoomId || !composer.trim()) return;
+    const text = composer.trim(),
+      sendingRoomId = activeRoomId,
+      sendingReply = local.reply;
     try {
-      const secret = await getRoomSecret(activeRoomId);
-      const encrypted = secret ? await encryptRoomText(activeRoomId, secret, text) : null;
-      const sent = encrypted
-        ? await api.sendMediaMessage(baseUrl, token, activeRoomId, {
-            type: "text",
-            text: encrypted.text,
-            meta: encrypted.meta,
-          })
-        : await api.sendMessage(baseUrl, token, activeRoomId, text);
-      const display = { ...sent, text, _decrypted: !!encrypted };
-      setMessages((prev) => upsertMessage(prev, display));
-      setRooms((prev) => reorderRooms(updateRoomPreview(prev, display, me?.id || null), activeRoomId));
+      if (editing) {
+        const encrypted = await encodeText(activeRoomId, text);
+        const sent = await mobileApi(baseUrl, token).edit(
+          activeRoomId,
+          editing.id,
+          encrypted,
+        );
+        const message = { ...sent, text, _decrypted: true };
+        await local.repository.current?.saveMessages([message]);
+        if (activeRoomIdRef.current === sendingRoomId) {
+          setMessages((prev) => mergeMessages(prev, [message]));
+          setEditing(null);
+        }
+      } else await local.send(text, undefined, sendingRoomId, sendingReply);
+      if (activeRoomIdRef.current === sendingRoomId) {
+        setComposer("");
+        notifyTyping(false);
+        setError(null);
+      }
     } catch (e) {
-      setComposer(text);
       setError(errorText(e));
     }
   }
 
   async function sendPickedUpload(
     kind: "image" | "video" | "voice" | "video_note" | "media",
-    file: { uri: string; name: string; type: string }
+    file: { uri: string; name: string; type: string },
+    duration?: number,
   ) {
     if (!token || !activeRoomId) return;
+    const roomId=activeRoomId;
+    const sendingToken=token;
     try {
       setBusyUpload(true);
-      const uploaded = await api.upload(baseUrl, token, kind, file);
-      const sent = await api.sendMediaMessage(baseUrl, token, activeRoomId, {
-        type: kind === "voice" ? "voice" : kind === "video_note" ? "video_note" : "media",
-        text: "",
-        media_id: uploaded.id,
-      });
-      setMessages((prev) => upsertMessage(prev, sent));
-      setRooms((prev) => reorderRooms(updateRoomPreview(prev, sent, me?.id || null), activeRoomId));
+      const uploaded = await protectedUploader(baseUrl,token,encodeText)(roomId,{...file,mime:file.type},()=>{}).promise;
+      if(tokenRef.current!==sendingToken)throw Error('Сеанс изменился. Вложение сохранено для повторной отправки.');
+      await local.send(
+        "",
+        {
+          type:
+            kind === "voice"
+              ? "voice"
+              : kind === "video_note"
+                ? "video_note"
+                : "media",
+          media_id: uploaded.id,
+          text: "",
+          meta: {...uploaded.meta,...(duration ? {duration_ms:duration} : {})},
+        },
+        roomId,
+      );
     } catch (e) {
       setError(errorText(e));
+      throw e;
     } finally {
       setBusyUpload(false);
     }
   }
 
   async function pickImage() {
-    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], quality: 0.9 });
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      quality: 0.9,
+    });
     if (result.canceled || !result.assets?.[0]) return;
     const asset = result.assets[0];
     await sendPickedUpload("image", {
@@ -639,7 +954,10 @@ export default function App() {
   }
 
   async function pickVideo() {
-    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["videos"], quality: 0.9 });
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["videos"],
+      quality: 0.9,
+    });
     if (result.canceled || !result.assets?.[0]) return;
     const asset = result.assets[0];
     await sendPickedUpload("video", {
@@ -650,7 +968,11 @@ export default function App() {
   }
 
   async function pickVideoNote() {
-    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ["videos"], videoMaxDuration: 60, quality: 0.8 });
+    const result = await ImagePicker.launchCameraAsync({
+      mediaTypes: ["videos"],
+      videoMaxDuration: 60,
+      quality: 0.8,
+    });
     if (result.canceled || !result.assets?.[0]) return;
     const asset = result.assets[0];
     await sendPickedUpload("video_note", {
@@ -697,9 +1019,14 @@ export default function App() {
         Alert.alert("Microphone", "Microphone permission is required.");
         return;
       }
-      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
       const rec = new Audio.Recording();
-      await rec.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+      await rec.prepareToRecordAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY,
+      );
       await rec.startAsync();
       setRecording(rec);
     } catch (e) {
@@ -721,7 +1048,10 @@ export default function App() {
       }
       setPlayingId(message.id);
       await Audio.setAudioModeAsync({ playsInSilentModeIOS: true });
-      const { sound } = await Audio.Sound.createAsync({ uri: url }, { shouldPlay: true });
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: url, headers: { Authorization: `Bearer ${token}` } },
+        { shouldPlay: true },
+      );
       audioRef.current = sound;
       sound.setOnPlaybackStatusUpdate((status) => {
         if (!status.isLoaded || !status.didJustFinish) return;
@@ -749,12 +1079,20 @@ export default function App() {
       if (existing.includes(me?.id || "")) {
         await api.removeReaction(baseUrl, token, reactionTarget.id, emoji);
         setMessages((prev) =>
-          prev.map((item) => (item.id === reactionTarget.id ? withReaction(item, emoji, me?.id || "", false) : item))
+          prev.map((item) =>
+            item.id === reactionTarget.id
+              ? withReaction(item, emoji, me?.id || "", false)
+              : item,
+          ),
         );
       } else {
         await api.addReaction(baseUrl, token, reactionTarget.id, emoji);
         setMessages((prev) =>
-          prev.map((item) => (item.id === reactionTarget.id ? withReaction(item, emoji, me?.id || "", true) : item))
+          prev.map((item) =>
+            item.id === reactionTarget.id
+              ? withReaction(item, emoji, me?.id || "", true)
+              : item,
+          ),
         );
       }
       setReactionTarget(null);
@@ -764,17 +1102,47 @@ export default function App() {
   }
 
   async function logout() {
-    if (token) {
-      try {
-        await api.logout(baseUrl, token);
-      } catch {}
-    }
+    const previousToken = token;
     await clearSession();
+    if (previousToken) void api.logout(baseUrl, previousToken).catch(() => {});
   }
 
-  async function startCall(isVideo: boolean) {
-    if (!activeRoomId || !token) return;
+  const [folders, setFolders] = useState<{ id: string; title: string; room_ids: string[] }[]>([]);
+  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
+  useEffect(() => {
+    if (!token || !me) { setFolders([]); setSelectedFolder(null); return; }
+    let live = true;
+    const load = () => void mobileApi(baseUrl, token).folders().then(items => { if (live && tokenRef.current === token) { setFolders(items); void local.repository.current?.set("folders", items); } }).catch(async () => { const cached = await local.repository.current?.get<typeof folders>("folders", []); if (live && cached) setFolders(cached); });
+    load(); const sub = AppState.addEventListener("change", state => { if (state === "active") load(); });
+    return () => { live = false; sub.remove(); };
+  }, [token, me?.id, local.ready, refreshingRooms]);
+  const folderFilter = folders.find(folder => folder.id === selectedFolder);
 
+  const activeCallRef = useRef<WebRTCCall | null>(null);
+  const callRoomRef = useRef<string | null>(null);
+  const callIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!token || !me) return;
+    let live=true;
+    const check=async()=>{try {const pending=await nativeCalls.pending();if(!pending || !live)return;
+      const data=await request<any>(baseUrl,`/calls/${pending.call_id}`,{token}); if(!live)return;
+      await onWsMessageRef.current?.(data); if(pending.action==='answer')setAutoAnswerId(pending.call_id);
+    }catch(error){if(live)setError('Звонок уже завершён или соединение недоступно');}};
+    void check();const sub=AppState.addEventListener('change',state=>{if(state==='active')void check();});const action=nativeCalls.listen(()=>void check());
+    return ()=>{live=false;sub.remove();action?.remove();};
+  },[token,me?.id,baseUrl]);
+  useEffect(()=>{if(autoAnswerId && incomingCall?.callId===autoAnswerId && connection==='connected'){setAutoAnswerId(null);void answerCall();}},[autoAnswerId,incomingCall,connection]);
+  const pendingCallIce = useRef<{ roomId: string; candidate: any }[]>([]);
+  const callTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (callTimeout.current) clearTimeout(callTimeout.current); void activeCallRef.current?.end(); }, []);
+  function armCallTimeout() { if (callTimeout.current) clearTimeout(callTimeout.current); callTimeout.current = setTimeout(() => { setError("Абонент не ответил"); endCall(); }, 45000); }
+  function clearCallTimeout() { if (callTimeout.current) clearTimeout(callTimeout.current); callTimeout.current = null; }
+
+  async function startCall(isVideo: boolean) {
+    if (!activeRoomId || !token || activeCallRef.current || incomingCall) return;
+    if(connection!=="connected"){setError("Дождитесь подключения для звонка");return;}
+    const roomId = activeRoomId; callRoomRef.current = roomId; pendingCallIce.current = [];
+    setIsAudioEnabled(true);
     try {
       const ice = await api
         .iceServers(baseUrl, token)
@@ -789,13 +1157,13 @@ export default function App() {
             wsRef.current?.send(
               JSON.stringify({
                 type: "call.ice",
-                room_id: activeRoomId,
+                room_id: roomId,
                 candidate,
-              })
+              }),
             );
           },
           onConnectionStateChange: (state) => {
-            if (state === "connected") setCallState("connected");
+            if (state === "connected") { clearCallTimeout(); setCallState("connected"); }
             if (state === "failed" || state === "closed") endCall();
           },
           onError: (error) => {
@@ -805,10 +1173,14 @@ export default function App() {
           },
         },
         true,
-        ice
+        ice,
       );
 
+      activeCallRef.current = call;
       await call.start();
+      await nativeCalls.start(isVideo); setSpeakerEnabled(isVideo); await nativeCalls.speaker(isVideo);
+      for (const ice of pendingCallIce.current.splice(0)) if (ice.roomId === roomId) await call.addIceCandidate(ice.candidate);
+      armCallTimeout();
       setActiveCall(call);
       setCallState("calling");
       setIsVideoEnabled(isVideo);
@@ -817,21 +1189,25 @@ export default function App() {
       wsRef.current?.send(
         JSON.stringify({
           type: "call.offer",
-          room_id: activeRoomId,
+          room_id: roomId,
           offer,
+          sdp: offer,
           is_video: isVideo,
-        })
+        }),
       );
     } catch (error) {
       console.error("Failed to start call:", error);
-      setError("Failed to start call");
+      setError("Не удалось начать звонок. Проверьте разрешения микрофона и камеры.");
       endCall();
     }
   }
 
   async function answerCall() {
     if (!incomingCall || !token) return;
+    if(connection!=='connected'){setError('Подключаемся к звонку. Нажмите ответить после восстановления соединения.');return;}
 
+    const roomId = incomingCall.roomId; callRoomRef.current = roomId;
+    setIsAudioEnabled(true);
     try {
       const ice = await api
         .iceServers(baseUrl, token)
@@ -848,11 +1224,11 @@ export default function App() {
                 type: "call.ice",
                 room_id: incomingCall.roomId,
                 candidate,
-              })
+              }),
             );
           },
           onConnectionStateChange: (state) => {
-            if (state === "connected") setCallState("connected");
+            if (state === "connected") { clearCallTimeout(); setCallState("connected"); }
             if (state === "failed" || state === "closed") endCall();
           },
           onError: (error) => {
@@ -862,15 +1238,19 @@ export default function App() {
           },
         },
         false,
-        ice
+        ice,
       );
 
+      activeCallRef.current = call;
       await call.start();
+      await nativeCalls.start(incomingCall.isVideo); setSpeakerEnabled(incomingCall.isVideo); await nativeCalls.speaker(incomingCall.isVideo);
+      if(incomingCall.callId)await nativeCalls.clear(incomingCall.callId);
       const answer = await call.handleOffer(incomingCall.offer);
       setActiveCall(call);
-      setCallState("connected");
+      for (const ice of pendingCallIce.current.splice(0)) if (ice.roomId === roomId) await call.addIceCandidate(ice.candidate);
+      setCallState("calling"); armCallTimeout();
       setIsVideoEnabled(incomingCall.isVideo);
-      setActiveRoomId(incomingCall.roomId);
+      void mobileApi(baseUrl, token).room(incomingCall.roomId).then(openRoom).catch(() => {});
       setIncomingCall(null);
 
       wsRef.current?.send(
@@ -878,43 +1258,37 @@ export default function App() {
           type: "call.answer",
           room_id: incomingCall.roomId,
           answer,
-        })
+          sdp: answer,
+        }),
       );
     } catch (error) {
       console.error("Failed to answer call:", error);
-      setError("Failed to answer call");
+      setError("Не удалось ответить на звонок. Проверьте разрешения микрофона и камеры.");
+      void activeCallRef.current?.end(); activeCallRef.current = null;
       rejectCall();
     }
   }
 
   function rejectCall() {
     if (!incomingCall) return;
+    if(incomingCall.callId)void nativeCalls.clear(incomingCall.callId);
+    clearCallTimeout();callRoomRef.current=null;callIdRef.current=null;
     wsRef.current?.send(
       JSON.stringify({
         type: "call.hangup",
         room_id: incomingCall.roomId,
-      })
+      }),
     );
     setIncomingCall(null);
   }
 
-  function endCall() {
-    if (activeCall) {
-      activeCall.end();
-      if (activeRoomId) {
-        wsRef.current?.send(
-          JSON.stringify({
-            type: "call.hangup",
-            room_id: activeRoomId,
-          })
-        );
-      }
-    }
-    setActiveCall(null);
-    setLocalStream(null);
-    setRemoteStream(null);
-    setCallState("idle");
-    setIncomingCall(null);
+  function endCall(signal = true) {
+    const call = activeCallRef.current, roomId = callRoomRef.current;
+    activeCallRef.current = null; callRoomRef.current = null; pendingCallIce.current = []; clearCallTimeout();
+    if(callIdRef.current)void nativeCalls.clear(callIdRef.current);callIdRef.current=null;void nativeCalls.stop();
+    if (call) void call.end();
+    if(signal && roomId && wsRef.current?.readyState===WebSocket.OPEN)wsRef.current.send(JSON.stringify({type:'call.hangup',room_id:roomId}));
+    setActiveCall(null); setLocalStream(null); setRemoteStream(null); setCallState("idle"); setIncomingCall(null);
   }
 
   function toggleAudio() {
@@ -944,6 +1318,21 @@ export default function App() {
   }
 
   const activeRoom = rooms.find((room) => room.id === activeRoomId) || null;
+  const peer = useChatPresence(
+    baseUrl,
+    token,
+    activeRoom?.kind === "dm" ? activeRoom.other_user_id : null,
+  );
+  const participants: User[] = [...activeRoomMembers, ...(me ? [me] : [])];
+  if (activeRoom?.kind === "dm" && activeRoom.other_user_id)
+    participants.push(
+      peer || {
+        id: activeRoom.other_user_id,
+        username: activeRoom.other_username || "",
+        display_name: activeRoom.other_display_name,
+        avatar_id: activeRoom.other_avatar_id,
+      },
+    );
   const typingNames = Object.values(typingUsers)
     .filter((u) => u.roomId === activeRoomId)
     .map((u) => u.username);
@@ -951,7 +1340,7 @@ export default function App() {
   if (loading) {
     return (
       <SafeAreaView style={styles.center}>
-        <StatusBar style="light" />
+        <StatusBar style={theme.dark ? "light" : "dark"} />
         <ActivityIndicator size="large" color={telegramColors.misc.progress} />
       </SafeAreaView>
     );
@@ -960,7 +1349,7 @@ export default function App() {
   if (!token || !me) {
     return (
       <>
-        <StatusBar style="light" />
+        <StatusBar style={theme.dark ? "light" : "dark"} />
         <AuthScreen
           authMode={authMode}
           username={username}
@@ -976,156 +1365,536 @@ export default function App() {
     );
   }
 
+  const nativeWorkspace =
+    !!workspace &&
+    workspace !== "attachments" && workspace !== "circle" &&
+    !workspace.startsWith("room:");
+  const renderWorkspace = () => (
+    <Workspace
+      uploader={protectedUploader(baseUrl,token,encodeText)}
+      decode={prepareMessage}
+      embedded={nativeWorkspace}
+      onMode={setWorkspace}
+      mode={workspace}
+      onClose={() => setWorkspace(null)}
+      baseUrl={baseUrl}
+      token={token}
+      user={me}
+      rooms={rooms}
+      room={activeRoom}
+      repository={local.repository.current}
+      onOpenSearch={async (room, ids, index) => {
+        setWorkspace(null);
+        await openRoom(room);
+        await local.jump(ids[index]);
+        setFocusId(ids[index]);
+        setSearchMatches({ roomId: room.id, ids, index });
+      }}
+      onOpen={async (room, id) => {
+        setWorkspace(null);
+        await openRoom(room);
+        if (id) {
+          await local.jump(id);
+          setFocusId(id);
+        }
+      }}
+      onOpenMedia={(message) => {
+        setWorkspace(null);
+        openMedia(message);
+      }}
+      onClearData={async () => {
+        local.outbox.current?.stop();
+        await removePrivateMedia(
+          (await local.repository.current?.privateFiles()) || [],
+        );
+        await local.repository.current?.destroy();
+        setWorkspace(null);
+        await logout();
+      }}
+      onProfile={() => {
+        setWorkspace(null);
+        setProfileName(me.display_name || "");
+        setProfileOpen(true);
+      }}
+      onRefresh={refreshRooms}
+      onError={setError}
+      onLogout={logout}
+      onPickImage={pickImage}
+      onPickVideo={pickVideo}
+      onPickFile={pickFile}
+      onPickVideoNote={pickVideoNote}
+      forwarding={forwarding}
+      enqueueForward={async (room, message) => {
+        const sendingToken=token;
+        let body: Record<string, unknown>;
+        if (message.type === "text") {
+          body = await encodeText(room.id,message.text || "");
+        } else
+          body = {
+            type: message.type,
+            media_id: message.media_id,
+            text: message.text || "",
+            meta: { ...message.meta, caption_message: undefined, forwarded: true },
+          };
+        const protectedFile=message.meta?.media_encryption as {key_message:Partial<Message>} | undefined;
+        if(protectedFile && message.type!=='text') {
+          const key=await prepareMessage({...protectedFile.key_message,id:message.id+'-key',room_id:message.room_id,sender_id:message.sender_id,type:'text'} as Message);
+          if(!key._decrypted)throw Error('Не удалось получить ключ вложения');
+          body.meta={...(body.meta as any),caption_message:undefined,media_encryption:{...protectedFile,key_message:await encodeText(room.id,key.text || '')}};
+        }
+        if(tokenRef.current!==sendingToken)throw Error('Сеанс изменился');
+        await local.send(message.text || "", body, room.id, null);
+      }}
+      onForwarded={() => setForwarding([])}
+      onSendMedia={async (text, body, roomId) => {
+        if(tokenRef.current!==token)throw Error('Сеанс изменился. Вложения сохранены.');
+        await local.send(text, body, roomId);
+      }}
+    />
+  );
+  const renderProfile = () => (
+    <ProfileScreen
+      user={me}
+      baseUrl={baseUrl}
+      profileName={profileName}
+      newPassword={newPassword}
+      busyUpload={busyUpload}
+      onClose={() => setProfileOpen(false)}
+      onChangeName={setProfileName}
+      onChangePassword={setNewPassword}
+      onSave={saveProfile}
+      onPickAvatar={pickAvatar}
+      mediaUrl={mediaUrl}
+    />
+  );
+
   return (
-    <SafeAreaView style={styles.screen}>
-      <StatusBar style="light" />
-      <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === "ios" ? "padding" : undefined}>
-        {!activeRoom ? (
-          <ChatListScreen
-            user={me}
-            rooms={rooms}
-            baseUrl={baseUrl}
-            refreshing={refreshingRooms}
-            onRefresh={refreshRooms}
-            onProfilePress={() => {
-              setProfileName(me.display_name || "");
-              setProfileOpen(true);
-            }}
-            onRoomPress={openRoom}
-            mediaUrl={mediaUrl}
-          />
-        ) : (
-          <ChatScreen
-            room={activeRoom}
-            messages={messages}
-            meId={me.id}
-            baseUrl={baseUrl}
-            composer={composer}
-            typingNames={typingNames}
-            refreshing={refreshingMessages}
-            recording={!!recording}
-            playingId={playingId}
-            disabled={busyUpload}
-            onBack={() => setActiveRoomId(null)}
-            onRefresh={refreshMessages}
-            onChangeComposer={(text) => {
-              setComposer(text);
-              notifyTyping(text.length > 0);
-            }}
-            onSend={sendCurrentMessage}
-            onAttach={pickFile}
-            onVoice={toggleRecording}
-            onAudioCall={activeRoom.kind === "dm" ? () => startCall(false) : undefined}
-            onVideoCall={activeRoom.kind === "dm" ? () => startCall(true) : undefined}
-            onPlayVoice={playVoice}
-            onReact={(message) => setReactionTarget({ id: message.id, reactions: message.reactions || null })}
-            onOpenMedia={openMedia}
-            mediaUrl={mediaUrl}
-            mediaThumbUrl={mediaThumbUrl}
+    <MediaDecoder.Provider value={{baseUrl,userId:me.id,decode:prepareMessage}}><MediaSession.Provider value={{ Authorization: `Bearer ${token}` }}>
+      <SafeAreaView style={styles.screen}>
+        <StatusBar style={theme.dark ? "light" : "dark"} />
+        <ConnectionBanner
+          status={connection}
+          error={error}
+          onDismiss={() => setError(null)}
+        />
+        {appUpdate.visible && (
+          <UpdateBanner
+            state={appUpdate.state}
+            onUpdate={appUpdate.start}
+            onDismiss={appUpdate.dismiss}
+            onRetryInstall={appUpdate.retryInstall}
+            onOpenPermissionSettings={appUpdate.openPermissionSettings}
           />
         )}
-      </KeyboardAvoidingView>
-
-      <ProfileScreen
-        visible={profileOpen}
-        user={me}
-        baseUrl={baseUrl}
-        profileName={profileName}
-        newPassword={newPassword}
-        busyUpload={busyUpload}
-        onClose={() => setProfileOpen(false)}
-        onChangeName={setProfileName}
-        onChangePassword={setNewPassword}
-        onSave={saveProfile}
-        onPickAvatar={pickAvatar}
-        mediaUrl={mediaUrl}
-      />
-
-      <ReactionModal
-        open={!!reactionTarget}
-        onClose={() => setReactionTarget(null)}
-        onPick={toggleReaction}
-      />
-
-      <MediaViewerModal
-        open={!!viewerMessage}
-        message={viewerMessage}
-        baseUrl={baseUrl}
-        onClose={closeMedia}
-        onPlayVoice={playVoice}
-      />
-
-      {incomingCall && (
-        <Modal visible transparent animationType="fade">
-          <View style={styles.callModalOverlay}>
-            <View style={styles.callModalCard}>
-              <Text style={styles.callModalTitle}>Входящий вызов</Text>
-              <Text style={styles.callModalName}>{incomingCall.callerName}</Text>
-              <Text style={styles.callModalType}>{incomingCall.isVideo ? "Видеовызов" : "Аудиовызов"}</Text>
-              <View style={styles.callModalButtons}>
-                <Pressable style={[styles.callButton, styles.callButtonAccept]} onPress={answerCall}>
-                  <Text style={styles.callButtonText}>✓ Ответить</Text>
-                </Pressable>
-                <Pressable style={[styles.callButton, styles.callButtonReject]} onPress={rejectCall}>
-                  <Text style={styles.callButtonText}>✕ Отклонить</Text>
-                </Pressable>
-              </View>
-            </View>
-          </View>
-        </Modal>
-      )}
-
-      {callState !== "idle" && (
-        <Modal visible animationType="slide">
-          <View style={styles.callScreen}>
-            {remoteStream && (
-              <RTCView streamURL={remoteStream.toURL()} style={styles.remoteVideo} objectFit="cover" />
-            )}
-            {localStream && isVideoEnabled && (
-              <RTCView
-                streamURL={localStream.toURL()}
-                style={styles.localVideo}
-                objectFit="cover"
-                mirror
+        <KeyboardAvoidingView
+          style={styles.flex}
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+        >
+          <AppNavigation
+            roomId={activeRoomId}
+            workspace={nativeWorkspace ? renderWorkspace : undefined}
+            profile={profileOpen ? renderProfile : undefined}
+            onCloseWorkspace={() => setWorkspace(null)}
+            onCloseProfile={() => setProfileOpen(false)}
+            onBack={() => setActiveRoomId(null)}
+            list={() => (
+              <ChatListScreen
+                user={me}
+                folders={folders}
+                selectedFolder={selectedFolder}
+                onFolder={setSelectedFolder}
+                onFolders={() => setWorkspace("folders")}
+                onSaved={() => { void mobileApi(baseUrl, token).saved().then(async ({ id }) => { await refreshRooms(); await openRoom(await mobileApi(baseUrl, token).room(id)); }).catch(e => setError(userError(e))); }}
+                rooms={rooms
+                  .filter(
+                    (r) => !r.preferences?.hidden && !r.preferences?.archived && (!folderFilter || folderFilter.room_ids.includes(r.id)),
+                  )
+                  .sort(
+                    (a, b) =>
+                      Number(!!b.preferences?.pinned) -
+                      Number(!!a.preferences?.pinned),
+                  )}
+                baseUrl={baseUrl}
+                refreshing={refreshingRooms}
+                onRefresh={refreshRooms}
+                onProfilePress={() => {
+                  setWorkspace("settings");
+                }}
+                onRoomPress={openRoom}
+                onLogout={logout}
+                archivedCount={
+                  rooms.filter(
+                    (room) =>
+                      room.preferences?.archived && !room.preferences?.hidden,
+                  ).length
+                }
+                onCompose={() => setWorkspace("new")}
+                onArchive={() => setWorkspace("archive")}
+                onSearch={() => setWorkspace("search")}
+                onRoomMenu={(room) => {
+                  setRooms((prev) => prev);
+                  setWorkspace(`room:${room.id}`);
+                }}
+                mediaUrl={mediaUrl}
               />
             )}
-            <View style={styles.callOverlay}>
-              <Text style={styles.callStatus}>
-                {callState === "calling" ? "Звоним..." : callState === "ringing" ? "Звонит..." : "Подключено"}
-              </Text>
-              <View style={styles.callControls}>
-                <Pressable style={styles.callControlButton} onPress={toggleAudio}>
-                  <Text style={styles.callControlIcon}>{isAudioEnabled ? "🔊" : "🔇"}</Text>
-                </Pressable>
-                {isVideoEnabled && (
-                  <>
-                    <Pressable style={styles.callControlButton} onPress={toggleVideo}>
-                      <Text style={styles.callControlIcon}>📹</Text>
-                    </Pressable>
-                    <Pressable style={styles.callControlButton} onPress={switchCamera}>
-                      <Text style={styles.callControlIcon}>🔄</Text>
-                    </Pressable>
-                  </>
-                )}
-                <Pressable style={[styles.callControlButton, styles.callEndButton]} onPress={endCall}>
-                  <Text style={styles.callControlIcon}>✕</Text>
-                </Pressable>
+            chat={() =>
+              activeRoom ? (
+                <ChatScreen
+                  room={activeRoom}
+                  messages={messages}
+                  meId={me.id}
+                  baseUrl={baseUrl}
+                  composer={composer}
+                  typingNames={typingNames}
+                  participants={[
+                    ...new Map(
+                      participants.map((user) => [user.id, user]),
+                    ).values(),
+                  ]}
+                  peer={peer}
+                  connection={connection}
+                  refreshing={refreshingMessages}
+                  recording={!!recording}
+                  playingId={playingId}
+                  disabled={
+                    busyUpload ||
+                    (activeRoom.kind === "channel" &&
+                      !(
+                        ["owner", "admin"].includes(activeRoom.my_role || "") ||
+                        activeRoom.created_by === me.id
+                      ))
+                  }
+                  onBack={() => setActiveRoomId(null)}
+                  onRefresh={refreshMessages}
+                  onChangeComposer={changeComposer}
+                  onSend={sendCurrentMessage}
+                  onAttach={() => setWorkspace("attachments")}
+                  onVideoNote={() => setWorkspace("circle")}
+                  onVoice={toggleRecording}
+                  onVoiceRecorded={async (uri, duration) => {
+                    await sendPickedUpload("voice", {
+                      uri,
+                      name: "voice.m4a",
+                      type: "audio/mp4",
+                    }, duration);
+                  }}
+                  onAudioCall={
+                    activeRoom.kind === "dm" && !activeRoom.is_saved
+                      ? () => startCall(false)
+                      : undefined
+                  }
+                  onVideoCall={
+                    activeRoom.kind === "dm" && !activeRoom.is_saved ? () => startCall(true) : undefined
+                  }
+                  onPlayVoice={playVoice}
+                  onReact={(message) =>
+                    setReactionTarget({
+                      id: message.id,
+                      reactions: message.reactions || null,
+                    })
+                  }
+                  onOpenMedia={openMedia}
+                  mediaUrl={mediaUrl}
+                  mediaThumbUrl={mediaThumbUrl}
+                  loading={local.loading}
+                  loadingOlder={local.loadingOlder}
+                  hasOlder={!!local.history?.has_older}
+                  hasNewer={!!local.history?.has_newer}
+                  onNewer={() => {
+                    const last = messages.filter((m) => !m.delivery).at(-1);
+                    if (last)
+                      void local
+                        .newer(last.id)
+                        .catch((e) => setError(String(e)));
+                  }}
+                  firstUnreadId={local.history?.first_unread_id || null}
+                  focusId={focusId}
+                  repository={local.repository.current}
+                  onOlder={() => {
+                    const first = messages.find((m) => !m.delivery);
+                    if (first) void local.older(first.id);
+                  }}
+                  onVisible={(id) => {
+                    void mobileApi(baseUrl, token)
+                      .read(activeRoomId!, id)
+                      .catch(() => {});
+                  }}
+                  onUsername={(username) => {
+                    void mobileApi(baseUrl, token)
+                      .users(username)
+                      .then((users) => {
+                        const user = users.find(
+                          (u) =>
+                            u.username.toLowerCase() === username.toLowerCase(),
+                        );
+                        if (user)
+                          return mobileApi(baseUrl, token)
+                            .createRoom("dm", [user.username])
+                            .then(({ id }) =>
+                              mobileApi(baseUrl, token).room(id),
+                            )
+                            .then(openRoom);
+                        setError("Пользователь не найден");
+                      })
+                      .catch((e) => setError(String(e)));
+                  }}
+                  onDetails={() => setWorkspace("details")}
+                  onSearch={() => setWorkspace("search-room")}
+                  searchMatches={
+                    searchMatches?.roomId === activeRoomId
+                      ? {
+                          index: searchMatches.index,
+                          total: searchMatches.ids.length,
+                        }
+                      : undefined
+                  }
+                  onCloseSearch={() => setSearchMatches(null)}
+                  onSearchNavigate={(delta) => {
+                    if (!searchMatches) return;
+                    const next = Math.max(
+                      0,
+                      Math.min(
+                        searchMatches.ids.length - 1,
+                        searchMatches.index + delta,
+                      ),
+                    );
+                    const id = searchMatches.ids[next];
+                    void local
+                      .jump(id)
+                      .then(() => {
+                        if (activeRoomIdRef.current === searchMatches.roomId) {
+                          setFocusId(id);
+                          setSearchMatches({ ...searchMatches, index: next });
+                        }
+                      })
+                      .catch((e) => setError(String(e)));
+                  }}
+                  selectionReset={selectionReset}
+                  onActions={(items) => setActionMessages(items)}
+                  onReply={(message) => {
+                    local.setReply(message);
+                    void local.repository.current?.set(
+                      `draft:${activeRoomId}`,
+                      { text: composer, reply: message },
+                    );
+                  }}
+                  reply={editing || local.reply}
+                  editing={!!editing}
+                  onCancelReply={() => {
+                    local.setReply(null);
+                    setEditing(null);
+                    void local.repository.current?.set(
+                      `draft:${activeRoomId}`,
+                      { text: composer },
+                    );
+                  }}
+                  onJump={(id) => {
+                    void local
+                      .jump(id)
+                      .then(() => setFocusId(id))
+                      .catch((e) => setError(String(e)));
+                  }}
+                  onRetry={(id) => {
+                    void local.retry(id);
+                  }}
+                  onCancelSend={(id) => {
+                    void local.cancel(id);
+                  }}
+                />
+              ) : null
+            }
+          />
+        </KeyboardAvoidingView>
+
+        {!nativeWorkspace && renderWorkspace()}
+
+        <MessageActions
+          messages={actionMessages}
+          meId={me.id}
+          onSelectMore={() => setActionMessages([])}
+          onClose={() => {
+            setActionMessages([]);
+            setSelectionReset((n) => n + 1);
+          }}
+          onReply={(m) => {
+            local.setReply(m);
+            void local.repository.current?.set(`draft:${activeRoomId}`, {
+              text: composer,
+              reply: m,
+            });
+          }}
+          onReact={(m) =>
+            setReactionTarget({ id: m.id, reactions: m.reactions || null })
+          }
+          onEdit={(m) => {
+            setEditing(m);
+            setComposer(m.text || "");
+          }}
+          onForward={(items) => {
+            setForwarding(items);
+            setWorkspace("forward");
+          }}
+          onDelete={async (items) => {
+            for (const m of items) {
+              await mobileApi(baseUrl, token).remove(m.room_id, m.id);
+              await local.repository.current?.removeMessage(m.id);
+            }
+            setMessages((prev) =>
+              prev.filter((m) => !items.some((x) => x.id === m.id)),
+            );
+          }}
+          onError={setError}
+        />
+
+        <ReactionModal
+          open={!!reactionTarget}
+          onClose={() => setReactionTarget(null)}
+          onPick={toggleReaction}
+        />
+
+        <MediaViewer
+          messages={messages.some(m => m.id === viewerMessage?.id) ? messages : viewerMessage ? [viewerMessage] : []}
+          userId={me.id}
+          decode={prepareMessage}
+          onChange={setViewerMessage}
+          message={viewerMessage}
+          baseUrl={baseUrl}
+          onClose={closeMedia}
+        />
+
+        {incomingCall && (
+          <Modal visible transparent animationType="fade">
+            <View style={styles.callModalOverlay}>
+              <View style={styles.callModalCard}>
+                <Text style={styles.callModalTitle}>Входящий вызов</Text>
+                <Text style={styles.callModalName}>
+                  {incomingCall.callerName}
+                </Text>
+                <Text style={styles.callModalType}>
+                  {incomingCall.isVideo ? "Видеовызов" : "Аудиовызов"}
+                </Text>
+                <View style={styles.callModalButtons}>
+                  <Pressable
+                    style={[styles.callButton, styles.callButtonAccept]}
+                    onPress={answerCall}
+                  >
+                    <Text style={styles.callButtonText}>✓ Ответить</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.callButton, styles.callButtonReject]}
+                    onPress={rejectCall}
+                  >
+                    <Text style={styles.callButtonText}>✕ Отклонить</Text>
+                  </Pressable>
+                </View>
               </View>
             </View>
-          </View>
-        </Modal>
-      )}
-    </SafeAreaView>
+          </Modal>
+        )}
+
+        {callState !== "idle" && (
+          <Modal visible animationType="slide">
+            <View style={styles.callScreen}>
+              {remoteStream && (
+                <RTCView
+                  streamURL={remoteStream.toURL()}
+                  style={styles.remoteVideo}
+                  objectFit="cover"
+                />
+              )}
+              {localStream && isVideoEnabled && (
+                <RTCView
+                  streamURL={localStream.toURL()}
+                  style={styles.localVideo}
+                  objectFit="cover"
+                  mirror
+                />
+              )}
+              <View style={styles.callOverlay}>
+                <Text style={styles.callStatus}>
+                  {callState === "calling"
+                    ? "Звоним..."
+                    : callState === "ringing"
+                      ? "Звонит..."
+                      : "Подключено"}
+                </Text>
+                <View style={styles.callControls}>
+                  <Pressable
+                    style={styles.callControlButton}
+                    onPress={toggleAudio}
+                  >
+                    <Icon
+                      name="mic"
+                      color={
+                        isAudioEnabled
+                          ? telegramColors.text.primary
+                          : telegramColors.misc.error
+                      }
+                    />
+                  </Pressable>
+                  <Pressable style={styles.callControlButton} accessibilityLabel={speakerEnabled ? 'Выключить громкую связь' : 'Громкая связь'} onPress={()=>{const value=!speakerEnabled;setSpeakerEnabled(value);void nativeCalls.speaker(value)?.catch(()=>setError('Не удалось переключить звук'));}}>
+                    <Icon name="speaker" color={speakerEnabled ? telegramColors.text.blue : telegramColors.text.primary} />
+                  </Pressable>
+                  {!!localStream?.getVideoTracks().length && (
+                    <>
+                      <Pressable
+                        style={styles.callControlButton}
+                        onPress={toggleVideo}
+                      >
+                        <Icon name="video" />
+                      </Pressable>
+                      <Pressable
+                        style={styles.callControlButton}
+                        onPress={switchCamera}
+                      >
+                        <Icon name="camera-flip" />
+                      </Pressable>
+                    </>
+                  )}
+                  <Pressable
+                    style={[styles.callControlButton, styles.callEndButton]}
+                    onPress={() => endCall()}
+                  >
+                    <Text style={styles.callControlIcon}>✕</Text>
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+          </Modal>
+        )}
+      </SafeAreaView>
+    </MediaSession.Provider></MediaDecoder.Provider>
   );
 }
 
-function ReactionModal({ open, onClose, onPick }: { open: boolean; onClose: () => void; onPick: (emoji: string) => void }) {
+function ReactionModal({
+  open,
+  onClose,
+  onPick,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onPick: (emoji: string) => void;
+}) {
+  const styles = useStyles();
+  const { colors: telegramColors } = useTheme();
+
   return (
-    <Modal transparent visible={open} animationType="fade" onRequestClose={onClose}>
+    <Modal
+      transparent
+      visible={open}
+      animationType="fade"
+      onRequestClose={onClose}
+    >
       <Pressable style={styles.modalBackdrop} onPress={onClose}>
         <View style={styles.reactionModal}>
           {REACTION_SET.map((emoji) => (
-            <Pressable key={emoji} style={styles.reactionPick} onPress={() => onPick(emoji)}>
+            <Pressable
+              key={emoji}
+              style={styles.reactionPick}
+              onPress={() => onPick(emoji)}
+            >
               <Text style={styles.reactionPickText}>{emoji}</Text>
             </Pressable>
           ))}
@@ -1148,10 +1917,16 @@ function MediaViewerModal({
   onClose: () => void;
   onPlayVoice: (message: Message) => void;
 }) {
+  const headers = useMediaHeaders();
+  const styles = useStyles();
+  const { colors: telegramColors } = useTheme();
+
   const url = message ? mediaUrl(baseUrl, message.media_id) : null;
   const mime = message?.media_mime || "";
-  const isImage = !!message && message.type === "media" && mime.startsWith("image/");
-  const isVideo = !!message && message.type === "media" && mime.startsWith("video/");
+  const isImage =
+    !!message && message.type === "media" && mime.startsWith("image/");
+  const isVideo =
+    !!message && message.type === "media" && mime.startsWith("video/");
   const isVoice = !!message && message.type === "voice";
   const isVideoNote = !!message && message.type === "video_note";
   const isFile = !!message && !isImage && !isVideo && !isVoice && !isVideoNote;
@@ -1174,20 +1949,37 @@ function MediaViewerModal({
           <Text style={styles.viewerCloseText}>Закрыть</Text>
         </Pressable>
         <View style={styles.viewerBody}>
-          {isImage && url ? <Image source={{ uri: url }} style={styles.viewerImage} resizeMode="contain" /> : null}
+          {isImage && url ? (
+            <Image
+              source={{ uri: url, headers }}
+              style={styles.viewerImage}
+              resizeMode="contain"
+            />
+          ) : null}
           {isVideo && url ? (
-            <Video source={{ uri: url }} style={styles.viewerVideo} useNativeControls resizeMode={ResizeMode.CONTAIN} />
+            <Video
+              source={{ uri: url, headers }}
+              style={styles.viewerVideo}
+              useNativeControls
+              resizeMode={ResizeMode.CONTAIN}
+            />
           ) : null}
           {isVoice && url ? (
-            <Pressable style={styles.viewerVoice} onPress={() => onPlayVoice(message)}>
+            <Pressable
+              style={styles.viewerVoice}
+              onPress={() => onPlayVoice(message)}
+            >
               <Text style={styles.viewerVoiceText}>
-                Воспроизвести{message.duration_sec ? ` (${Math.round(message.duration_sec)}с)` : ""}
+                Воспроизвести
+                {message.duration_sec
+                  ? ` (${Math.round(message.duration_sec)}с)`
+                  : ""}
               </Text>
             </Pressable>
           ) : null}
           {isVideoNote && url ? (
             <Video
-              source={{ uri: url }}
+              source={{ uri: url, headers }}
               style={styles.viewerVideoNote}
               useNativeControls
               resizeMode={ResizeMode.CONTAIN}
@@ -1195,8 +1987,19 @@ function MediaViewerModal({
             />
           ) : null}
           {isFile && url ? (
-            <Pressable style={styles.viewerFile} onPress={() => Linking.openURL(url)}>
-              <Text style={styles.viewerFileTitle}>{message.text || "Открыть файл"}</Text>
+            <Pressable
+              style={styles.viewerFile}
+              onPress={() => {
+                void openMediaFile(
+                  url,
+                  headers,
+                  message?.media_mime || "application/octet-stream",
+                ).catch((e) => Alert.alert("Файл", String(e.message || e)));
+              }}
+            >
+              <Text style={styles.viewerFileTitle}>
+                {message.text || "Открыть файл"}
+              </Text>
               <Text style={styles.viewerFileSubtitle}>{mime || "file"}</Text>
             </Pressable>
           ) : null}
@@ -1206,14 +2009,6 @@ function MediaViewerModal({
   );
 }
 
-async function getMobileDeviceId(userId: string) {
-  const key = `mobile.e2eDeviceId.${userId}`;
-  const existing = await storage.get(key);
-  if (existing) return existing;
-  const generated = `mobile-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  await storage.set(key, generated);
-  return generated;
-}
 
 function reorderRooms(rooms: Room[], roomId: string) {
   const idx = rooms.findIndex((room) => room.id === roomId);
@@ -1224,7 +2019,11 @@ function reorderRooms(rooms: Room[], roomId: string) {
   return next;
 }
 
-function updateRoomPreview(rooms: Room[], message: Message, meId: string | null) {
+function updateRoomPreview(
+  rooms: Room[],
+  message: Message,
+  meId: string | null,
+) {
   return rooms.map((room) =>
     room.id !== message.room_id
       ? room
@@ -1236,8 +2035,11 @@ function updateRoomPreview(rooms: Room[], message: Message, meId: string | null)
           last_msg_sender_username: message.sender_username || null,
           last_msg_sender_name: message.sender_display_name || null,
           last_msg_at: message.created_at,
-          unread_count: message.sender_id === meId ? 0 : Math.max(1, Number(room.unread_count || 0)),
-        }
+          unread_count:
+            message.sender_id === meId
+              ? 0
+              : Math.max(1, Number(room.unread_count || 0)),
+        },
   );
 }
 
@@ -1249,7 +2051,12 @@ function upsertMessage(messages: Message[], incoming: Message) {
   return next;
 }
 
-function withReaction(message: Message, emoji: string, userId: string, add: boolean): Message {
+function withReaction(
+  message: Message,
+  emoji: string,
+  userId: string,
+  add: boolean,
+): Message {
   const prev = { ...(message.reactions || {}) };
   const users = new Set(prev[emoji] || []);
   if (add) users.add(userId);
@@ -1265,160 +2072,194 @@ function withRead(message: Message, userId: string): Message {
   return { ...message, read_by: [...users] };
 }
 
-function errorText(value: unknown) {
-  const text = value instanceof Error ? value.message : "Unknown error";
-  switch (text) {
-    case "bad_credentials":
-      return "Неверное имя пользователя или пароль";
-    case "username_taken":
-      return "Имя пользователя уже занято";
-    case "username_too_short":
-      return "Слишком короткое имя";
-    case "username_too_long":
-      return "Слишком длинное имя";
-    case "username_invalid":
-      return "Имя может содержать только латинские буквы, цифры и подчёркивание";
-    case "password_too_short":
-      return "Слишком короткий пароль";
-    case "captcha_failed":
-      return "Регистрация на этом сервере требует captcha";
-    case "account_banned":
-      return "Аккаунт заблокирован";
-    default:
-      return text;
-  }
-}
+function errorText(value: unknown) { return userError(value); }
 
-const styles = StyleSheet.create({
-  flex: { flex: 1 },
-  screen: { flex: 1, backgroundColor: telegramColors.windowBackground },
-  center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: telegramColors.windowBackground },
+const useStyles = () => {
+  const { colors: telegramColors } = useTheme();
+  return StyleSheet.create({
+    flex: { flex: 1 },
+    screen: { flex: 1, backgroundColor: telegramColors.windowBackground },
+    center: {
+      flex: 1,
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: telegramColors.windowBackground,
+    },
 
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.5)",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  reactionModal: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 10,
-    padding: 18,
-    backgroundColor: telegramColors.composer.background,
-    borderRadius: 20,
-  },
-  reactionPick: {
-    width: 52,
-    height: 52,
-    borderRadius: 16,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(255,255,255,0.05)",
-  },
-  reactionPickText: { fontSize: 24 },
+    modalBackdrop: {
+      flex: 1,
+      backgroundColor: telegramColors.misc.backdrop,
+      justifyContent: "center",
+      alignItems: "center",
+    },
+    reactionModal: {
+      flexDirection: "row",
+      flexWrap: "wrap",
+      gap: 10,
+      padding: 18,
+      backgroundColor: telegramColors.composer.background,
+      borderRadius: 20,
+    },
+    reactionPick: {
+      width: 52,
+      height: 52,
+      borderRadius: 16,
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: telegramColors.windowBackgroundGray,
+    },
+    reactionPickText: { fontSize: 24 },
 
-  viewerScreen: { flex: 1, backgroundColor: telegramColors.windowBackground, paddingTop: 20 },
-  viewerClose: {
-    alignSelf: "flex-end",
-    marginHorizontal: 16,
-    marginBottom: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 12,
-    backgroundColor: "rgba(255,255,255,0.08)",
-  },
-  viewerCloseText: { color: telegramColors.text.primary, fontWeight: "700" },
-  viewerBody: { flex: 1, alignItems: "center", justifyContent: "center", padding: 18 },
-  viewerImage: { flex: 1, width: "100%", height: "100%", backgroundColor: telegramColors.windowBackground },
-  viewerVideo: { width: "100%", height: "100%", backgroundColor: telegramColors.windowBackground },
-  viewerVideoNote: {
-    width: 240,
-    height: 240,
-    borderRadius: 120,
-    overflow: "hidden",
-    backgroundColor: telegramColors.windowBackground,
-  },
-  viewerVoice: { paddingHorizontal: 18, paddingVertical: 14, borderRadius: 14, backgroundColor: "rgba(255,255,255,0.08)" },
-  viewerVoiceText: { color: telegramColors.text.primary, fontWeight: "700" },
-  viewerFile: {
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.08)",
-    backgroundColor: "rgba(255,255,255,0.04)",
-    borderRadius: 16,
-    padding: 16,
-    width: "100%",
-  },
-  viewerFileTitle: { color: telegramColors.text.primary, fontWeight: "700", fontSize: 16 },
-  viewerFileSubtitle: { color: telegramColors.text.gray5, marginTop: 4 },
+    viewerScreen: {
+      flex: 1,
+      backgroundColor: telegramColors.misc.mediaOverlay,
+      paddingTop: 20,
+    },
+    viewerClose: {
+      alignSelf: "flex-end",
+      marginHorizontal: 16,
+      marginBottom: 12,
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+      borderRadius: 12,
+      backgroundColor: telegramColors.misc.mediaOverlayControl,
+    },
+    viewerCloseText: {
+      color: telegramColors.misc.mediaOverlayText,
+      fontWeight: "700",
+    },
+    viewerBody: {
+      flex: 1,
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 18,
+    },
+    viewerImage: { flex: 1, width: "100%", height: "100%" },
+    viewerVideo: { width: "100%", height: "100%" },
+    viewerVideoNote: {
+      width: 240,
+      height: 240,
+      borderRadius: 120,
+      overflow: "hidden",
+    },
+    viewerVoice: {
+      paddingHorizontal: 18,
+      paddingVertical: 14,
+      borderRadius: 14,
+      backgroundColor: telegramColors.misc.mediaOverlayControl,
+    },
+    viewerVoiceText: {
+      color: telegramColors.misc.mediaOverlayText,
+      fontWeight: "700",
+    },
+    viewerFile: {
+      borderWidth: 1,
+      borderColor: telegramColors.misc.mediaOverlayControlBorder,
+      backgroundColor: telegramColors.misc.mediaOverlayControl,
+      borderRadius: 16,
+      padding: 16,
+      width: "100%",
+    },
+    viewerFileTitle: {
+      color: telegramColors.misc.mediaOverlayText,
+      fontWeight: "700",
+      fontSize: 16,
+    },
+    viewerFileSubtitle: { color: telegramColors.text.gray2, marginTop: 4 },
 
-  callModalOverlay: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.85)",
-    justifyContent: "center",
-    alignItems: "center",
-    padding: 20,
-  },
-  callModalCard: {
-    width: "100%",
-    maxWidth: 320,
-    backgroundColor: telegramColors.composer.background,
-    borderRadius: 24,
-    padding: 24,
-    alignItems: "center",
-    gap: 16,
-  },
-  callModalTitle: { fontSize: 18, fontWeight: "700", color: telegramColors.text.gray5 },
-  callModalName: { fontSize: 24, fontWeight: "800", color: telegramColors.text.primary },
-  callModalType: { fontSize: 16, color: telegramColors.text.blue },
-  callModalButtons: { flexDirection: "row", gap: 12, marginTop: 8 },
-  callButton: {
-    flex: 1,
-    paddingVertical: 14,
-    borderRadius: 14,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  callButtonAccept: { backgroundColor: "rgba(76,217,100,0.2)" },
-  callButtonReject: { backgroundColor: "rgba(255,77,109,0.2)" },
-  callButtonText: { color: telegramColors.text.primary, fontWeight: "700", fontSize: 16 },
+    callModalOverlay: {
+      flex: 1,
+      backgroundColor: telegramColors.misc.mediaOverlay,
+      justifyContent: "center",
+      alignItems: "center",
+      padding: 20,
+    },
+    callModalCard: {
+      width: "100%",
+      maxWidth: 320,
+      backgroundColor: telegramColors.composer.background,
+      borderRadius: 24,
+      padding: 24,
+      alignItems: "center",
+      gap: 16,
+    },
+    callModalTitle: {
+      fontSize: 18,
+      fontWeight: "700",
+      color: telegramColors.text.gray5,
+    },
+    callModalName: {
+      fontSize: 24,
+      fontWeight: "800",
+      color: telegramColors.text.primary,
+    },
+    callModalType: { fontSize: 16, color: telegramColors.text.blue },
+    callModalButtons: { flexDirection: "row", gap: 12, marginTop: 8 },
+    callButton: {
+      flex: 1,
+      paddingVertical: 14,
+      borderRadius: 14,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    callButtonAccept: { backgroundColor: telegramColors.misc.callAccept },
+    callButtonReject: { backgroundColor: telegramColors.misc.callReject },
+    callButtonText: {
+      color: telegramColors.text.primary,
+      fontWeight: "700",
+      fontSize: 16,
+    },
 
-  callScreen: { flex: 1, backgroundColor: "#000" },
-  remoteVideo: { flex: 1, width: "100%", height: "100%", backgroundColor: "#000" },
-  localVideo: {
-    position: "absolute",
-    top: 60,
-    right: 20,
-    width: 120,
-    height: 160,
-    borderRadius: 12,
-    backgroundColor: "#1a1a1a",
-  },
-  callOverlay: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    justifyContent: "space-between",
-    padding: 20,
-  },
-  callStatus: {
-    fontSize: 18,
-    fontWeight: "700",
-    color: "#fff",
-    textAlign: "center",
-    marginTop: 40,
-  },
-  callControls: { flexDirection: "row", justifyContent: "center", gap: 16, marginBottom: 40 },
-  callControlButton: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: "rgba(255,255,255,0.2)",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  callEndButton: { backgroundColor: "rgba(255,77,109,0.8)" },
-  callControlIcon: { fontSize: 24 },
-});
+    callScreen: {
+      flex: 1,
+      backgroundColor: telegramColors.misc.callBackground,
+    },
+    remoteVideo: {
+      flex: 1,
+      width: "100%",
+      height: "100%",
+      backgroundColor: telegramColors.misc.callBackground,
+    },
+    localVideo: {
+      position: "absolute",
+      top: 60,
+      right: 20,
+      width: 120,
+      height: 160,
+      borderRadius: 12,
+      backgroundColor: telegramColors.misc.callLocalVideo,
+    },
+    callOverlay: {
+      position: "absolute",
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      justifyContent: "space-between",
+      padding: 20,
+    },
+    callStatus: {
+      fontSize: 18,
+      fontWeight: "700",
+      color: telegramColors.misc.mediaOverlayText,
+      textAlign: "center",
+      marginTop: 40,
+    },
+    callControls: {
+      flexDirection: "row",
+      justifyContent: "center",
+      gap: 16,
+      marginBottom: 40,
+    },
+    callControlButton: {
+      width: 60,
+      height: 60,
+      borderRadius: 30,
+      backgroundColor: telegramColors.misc.callControl,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    callEndButton: { backgroundColor: telegramColors.misc.callEnd },
+    callControlIcon: { fontSize: 24 },
+  });
+};
