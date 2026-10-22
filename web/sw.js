@@ -1,7 +1,7 @@
 // Service Worker for Push Notifications and PWA
-const CACHE_NAME = 'messenger67-v20261012c';
+const CACHE_NAME = '67chat-v20261022-101';
 const urlsToCache = [
-  '/manifest.webmanifest'
+  '/manifest.webmanifest', '/icons/app-192.png', '/icons/notification-96.png'
 ];
 
 // Install event - cache static assets
@@ -28,7 +28,7 @@ self.addEventListener('activate', event => {
       return self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     }).then(clients => {
       clients.forEach(client => {
-        if (client.url && 'navigate' in client) client.navigate(client.url);
+        client.postMessage({ type: 'UPDATE_AVAILABLE' });
       });
     })
   );
@@ -61,64 +61,37 @@ self.addEventListener('fetch', event => {
   );
 });
 
-// Push event - show notification
+// Push payloads deliberately contain no message text or sender name.
 self.addEventListener('push', event => {
-
   let data = {};
-  try {
-    data = event.data ? event.data.json() : {};
-  } catch (e) {
-    console.error('Failed to parse push data:', e);
-  }
-
-  const title = data.title || 'Новое сообщение';
-  const options = {
-    body: data.body || 'У вас новое сообщение',
-    icon: data.icon || '/favicon.png',
-    badge: '/favicon.png',
-    tag: data.tag || 'message',
-    data: {
-      url: data.url || '/',
-      roomId: data.roomId,
-      messageId: data.messageId
-    },
-    requireInteraction: false,
-    silent: false
-  };
-
-  event.waitUntil(
-    self.registration.showNotification(title, options)
-  );
+  try { data = event.data ? event.data.json() : {}; } catch {}
+  event.waitUntil(self.registration.showNotification(data.title || '67chat', {
+    body: data.body || 'Новое сообщение', icon: '/icons/app-192.png', badge: '/icons/notification-96.png',
+    tag: data.roomId ? 'room-' + data.roomId : data.tag || '67chat-test',
+    renotify: true, vibrate: [120,60,120], silent: false,
+    data: { url: data.url || '/', roomId: data.roomId, messageId: data.messageId },
+  }));
 });
-
-// Notification click event
 self.addEventListener('notificationclick', event => {
-
   event.notification.close();
-
-  const urlToOpen = event.notification.data?.url || '/';
-
-  event.waitUntil(
-    clients.matchAll({ type: 'window', includeUncontrolled: true })
-      .then(windowClients => {
-        // Check if there's already a window open
-        for (let client of windowClients) {
-          if (client.url === urlToOpen && 'focus' in client) {
-            return client.focus();
-          }
-        }
-
-        // Open new window
-        if (clients.openWindow) {
-          return clients.openWindow(urlToOpen);
-        }
-      })
-  );
+  let target = new URL(event.notification.data?.url || '/', self.location.origin);
+  if (target.origin !== self.location.origin) target = new URL('/', self.location.origin);
+  event.waitUntil((async () => {
+    const windows = await clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const client = windows.find(item => new URL(item.url).origin === self.location.origin);
+    if (client) {
+      await client.focus();
+      client.postMessage({ type: 'OPEN_ROOM', roomId: event.notification.data?.roomId });
+      return;
+    }
+    return clients.openWindow(target.href);
+  })());
 });
-
-// Message event - communication with main app
+self.addEventListener('pushsubscriptionchange', event => {
+  event.waitUntil(clients.matchAll({ type: 'window' }).then(windows => {
+    windows.forEach(client => client.postMessage({ type: 'PUSH_SUBSCRIPTION_CHANGED' }));
+  }));
+});
 self.addEventListener('message', event => {
-  if (event.data && event.data.type === 'SKIP_WAITING') {
-    self.skipWaiting();
-  }
+  if (event.data?.type === 'SKIP_WAITING') self.skipWaiting();
 });

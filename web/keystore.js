@@ -121,4 +121,13 @@ export const SigStore = {
   put: recordPut,
   remove: recordRemove,
   keys: recordKeys,
+  forAccount(userId) {
+    const prefix = `signal:${userId}:`;
+    return {
+      get: (key, fallback) => recordGet(prefix + key, fallback),
+      put: (key, value) => recordPut(prefix + key, value),
+      remove: key => recordRemove(prefix + key),
+      keys: async () => (await recordKeys()).filter(key => key.startsWith(prefix)).map(key => key.slice(prefix.length)),
+    };
+  },
 };

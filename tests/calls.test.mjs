@@ -1,0 +1,22 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+import {installCalls} from '../api/calls.js';
+const require=createRequire(import.meta.url),Fastify=require('../api/node_modules/fastify');
+test('background calls expose SDP only to the callee, retain ICE, and invalidate decline capability',async()=>{
+ const app=Fastify(),events=[],pushes=[];let time=1000;
+ const relay=installCalls(app,{pool:{query:async()=>({rows:[{kind:'dm',user_id:'alice'},{kind:'dm',user_id:'bob'}]})},requireAuth:async req=>({id:req.headers['x-user']}),sendToUser:(user,data)=>events.push({user,...data}),push:async(user,a,b,data)=>pushes.push({user,...data}),now:()=>time});
+ await app.ready();
+ await relay({type:'call.offer',room_id:'room',offer:{type:'offer',sdp:'synthetic-sdp'},is_video:true},{id:'outsider'});assert.equal(events.length,0);
+ await relay({type:'call.offer',room_id:'room',offer:{type:'offer',sdp:'synthetic-sdp'},is_video:true},{id:'alice',username:'Alice'});
+ const incoming=events.find(e=>e.type==='call.offer'),push=pushes.find(e=>e.call_event==='ring');assert.ok(incoming.call_id);assert.equal(push.offer,undefined);assert.equal(push.sdp,undefined);
+ assert.equal((await app.inject({url:'/calls/'+incoming.call_id,headers:{'x-user':'outsider'}})).statusCode,404);
+ await relay({type:'call.ice',room_id:'room',candidate:{candidate:'ice'}},{id:'alice'});
+ const response=await app.inject({url:'/calls/'+incoming.call_id,headers:{'x-user':'bob'}});assert.equal(response.json().offer.sdp,'synthetic-sdp');assert.equal(response.json().candidates.length,1);
+ assert.equal((await app.inject({method:'POST',url:`/calls/${incoming.call_id}/decline`,payload:{nonce:'wrong'}})).statusCode,404);
+ assert.equal((await app.inject({method:'POST',url:`/calls/${incoming.call_id}/decline`,payload:{nonce:push.decline_nonce}})).statusCode,200);
+ assert.equal((await app.inject({url:'/calls/'+incoming.call_id,headers:{'x-user':'bob'}})).statusCode,404);
+ await relay({type:'call.offer',room_id:'room',offer:{type:'offer',sdp:'next'}},{id:'alice'});time+=46000;
+ const last=events.filter(e=>e.type==='call.offer').at(-1);assert.equal((await app.inject({url:'/calls/'+last.call_id,headers:{'x-user':'bob'}})).statusCode,404);
+ await app.close();
+});

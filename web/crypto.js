@@ -9,6 +9,11 @@ class E2EManager {
     this._curveWrapper = null;
   }
 
+  useStore(userId, deviceId, backend) {
+    this.store = new SignalProtocolStore(backend);
+    this.address = new libsignal.SignalProtocolAddress(userId, parseInt(deviceId));
+  }
+
   async init(userId, deviceId = '1', persistentStore) {
     // Initialize Signal Protocol Store (IndexedDB-backed when provided)
     this.store = new SignalProtocolStore(persistentStore);
@@ -115,7 +120,7 @@ class E2EManager {
   async encryptMessage(recipientId, recipientDeviceId, plaintext) {
     if (!this.ready) throw new Error('E2E not initialized');
 
-    const recipientAddress = new libsignal.SignalProtocolAddress(recipientId, parseInt(recipientDeviceId));
+    const recipientAddress = new libsignal.SignalProtocolAddress(recipientId + ':' + recipientDeviceId, parseInt(recipientDeviceId));
     const sessionCipher = new libsignal.SessionCipher(this.store, recipientAddress);
 
     const ciphertext = await sessionCipher.encrypt(this.stringToArrayBuffer(plaintext));
@@ -130,14 +135,14 @@ class E2EManager {
   async decryptMessage(senderId, senderDeviceId, ciphertext) {
     if (!this.ready) throw new Error('E2E not initialized');
 
-    const senderAddress = new libsignal.SignalProtocolAddress(senderId, parseInt(senderDeviceId));
+    const senderAddress = new libsignal.SignalProtocolAddress(senderId + ':' + senderDeviceId, parseInt(senderDeviceId));
     const sessionCipher = new libsignal.SessionCipher(this.store, senderAddress);
 
     let plaintext;
-    if (ciphertext.type === 3) {
+    if (ciphertext.type === 1) {
       // WhisperMessage (normal message)
       plaintext = await sessionCipher.decryptWhisperMessage(this.base64ToArrayBuffer(ciphertext.body), 'binary');
-    } else if (ciphertext.type === 1) {
+    } else if (ciphertext.type === 3) {
       // PreKeyWhisperMessage (initial message)
       plaintext = await sessionCipher.decryptPreKeyWhisperMessage(this.base64ToArrayBuffer(ciphertext.body), 'binary');
     } else {
@@ -149,7 +154,7 @@ class E2EManager {
 
   async buildSession(recipientId, recipientDeviceId, recipientBundle) {
     // Build session from recipient's bundle (identity key, signed pre-key, one-time pre-key)
-    const recipientAddress = new libsignal.SignalProtocolAddress(recipientId, parseInt(recipientDeviceId));
+    const recipientAddress = new libsignal.SignalProtocolAddress(recipientId + ':' + recipientDeviceId, parseInt(recipientDeviceId));
     const sessionBuilder = new libsignal.SessionBuilder(this.store, recipientAddress);
 
     // CRITICAL: verify the signed pre-key signature against the claimed identity
@@ -173,7 +178,7 @@ class E2EManager {
     // The identity key must also be the one we already pinned for this peer.
     // First contact pins it; any later change of key is surfaced as untrusted.
     let firstContact = false;
-    const known = await this.store.get('identityKey' + recipientId);
+    const known = await this.store.get('identityKey' + recipientId + ':' + recipientDeviceId);
     if (!known) {
       firstContact = true;
     } else if (!this.store.arrayBufferEquals(identityKey, known)) {
@@ -197,7 +202,7 @@ class E2EManager {
     });
 
     // Pin the verified identity key for future change detection.
-    await this.store.saveIdentity(recipientId, identityKey);
+    await this.store.saveIdentity(recipientId + ':' + recipientDeviceId, identityKey);
 
     return { firstContact };
   }
@@ -251,7 +256,8 @@ class E2EManager {
 
   // Helper functions
   arrayBufferToBase64(buffer) {
-    const bytes = new Uint8Array(buffer);
+    if (typeof buffer === 'string') return btoa(buffer);
+    const bytes = ArrayBuffer.isView(buffer) ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength) : new Uint8Array(buffer);
     let binary = '';
     for (let i = 0; i < bytes.byteLength; i++) {
       binary += String.fromCharCode(bytes[i]);
@@ -609,6 +615,12 @@ class E2EManager {
   }
 
   async loadFromIndexedDB(userId) {
+    // Live sessions are persisted after every ratchet operation. A backup can be older.
+    if (this.store && await this.store.getIdentityKeyPair()) {
+      this._signedPreKeySignature = await this.store.get('signedPreKeySignature1', '');
+      this.ready = true;
+      return true;
+    }
     if (!window.SigStore || typeof window.SigStore.get !== 'function') return false;
     const backup = await window.SigStore.get('backup:' + userId, undefined);
     if (!backup) return false;
@@ -701,7 +713,7 @@ class E2EManager {
 class SignalProtocolStore {
   constructor(persistent) {
     this.mem = {};
-    this.persistent = typeof persistent === 'function' ? persistent : null;
+    this.persistent = persistent && typeof persistent.get === 'function' ? persistent : null;
   }
 
   // Resolve the active backing functions (IndexedDB when available).
@@ -795,7 +807,7 @@ class SignalProtocolStore {
   // Session Store
   async loadSession(identifier) {
     const session = await this.get('session' + identifier);
-    return session || null;
+    return session || undefined;
   }
 
   async storeSession(identifier, record) {

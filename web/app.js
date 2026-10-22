@@ -1,3 +1,14 @@
+import { createFolderManager } from './folders.js';
+import { createChatActions } from './chat-actions.js';
+import { createMediaController } from './media.js';
+import { createChatRuntime } from './chat-runtime.js';
+import { mergeMessages, createAccountStore } from './local-data.js';
+import { reconcileMessages } from './message-list.js';
+import { createAuthFlow } from './auth-flow.js';
+import { userError, toast } from './errors.js';
+import { icon, avatar, groupWith, presenceLabel, reactionPeople, plural } from './ui.js';
+import { renderMessengerShell, renderLogin, renderRoomRow, iconButton } from './views.js';
+import { createWebNotifications } from './notifications.js';
 const $ = (q, el=document) => el.querySelector(q);
 const $$ = (q, el=document) => Array.from(el.querySelectorAll(q));
 const API = window.__APP_CONFIG__?.apiBaseUrl || "/api";
@@ -27,7 +38,18 @@ let state = {
   recordingVideoNote: false,
   adminPanel: false,
   adminUsers: [],
-  darkTheme: localStorage.getItem("theme") !== "light",
+  themeMode: localStorage.getItem("themeMode") || localStorage.getItem("theme") || "light",
+  darkTheme: localStorage.getItem("theme") === "dark",
+  fontSize: Number(localStorage.getItem("messageFontSize")) || 15,
+  autoDownload: localStorage.getItem("autoDownload") === "yes",
+  archiveOpen: false,
+  selectedMessages: new Set(),
+  composeOpen: false,
+  settingsOpen: false,
+  uiMenu: null,
+  peopleResults: [],
+  roomLoading: false,
+  roomLoadError: false,
   backupPanel: false,
   recoveryPhrase: null,
   showRecoveryPhrase: false,
@@ -69,20 +91,32 @@ let state = {
 let touchStartX = 0;
 let touchStartY = 0;
 let touchMsgId = null;
+let messagePressTimer = null;
+let didLongPress = false;
+window.cancelMessagePress = () => { clearTimeout(messagePressTimer); messagePressTimer = null; };
 
 window.handleTouchStart = (e, msgId) => {
   touchStartX = e.touches[0].clientX;
   touchStartY = e.touches[0].clientY;
   touchMsgId = msgId;
+  didLongPress = false;
+  window.cancelMessagePress();
+  const target = e.currentTarget;
+  messagePressTimer = setTimeout(() => {
+    didLongPress = true;
+    window.openMessageMenu(msgId, { target, currentTarget: target, preventDefault() {}, stopPropagation() {} });
+  }, 450);
 };
 
 window.handleTouchEnd = (e) => {
+  window.cancelMessagePress();
+  if (didLongPress) { touchMsgId = null; return; }
   if (!touchMsgId) return;
   const touchEndX = e.changedTouches[0].clientX;
   const touchEndY = e.changedTouches[0].clientY;
   const deltaX = touchStartX - touchEndX;
   const deltaY = Math.abs(touchStartY - touchEndY);
-  
+
   // Swipe left (deltaX > 50) and not vertical swipe
   if (deltaX > 50 && deltaY < 100) {
     replyToMessage(touchMsgId);
@@ -110,15 +144,7 @@ window.cancelReply = () => {
   mountPreservingInput();
 };
 
-window.scrollToMessage = (msgId, event) => {
-  if (event) event.stopPropagation();
-  const msgEl = $(`#msg-${msgId}`);
-  if (msgEl) {
-    msgEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    msgEl.style.background = 'var(--accent)';
-    setTimeout(() => { msgEl.style.background = ''; }, 1000);
-  }
-};
+window.scrollToMessage = (id, event) => { event?.stopPropagation(); void chatRuntime.jump(id).catch(e => toast(userError(e))); };
 
 // Create room (group/channel) with user search
 window.openCreateRoom = (mode) => {
@@ -159,7 +185,7 @@ window.onCreateRoomQueryChange = (query) => {
 function updateCreateRoomResults() {
   const resultsEl = document.getElementById('createRoomResults');
   if (!resultsEl) return;
-  
+
   if (state.createRoomResults.length) {
     resultsEl.innerHTML = state.createRoomResults.map(u => `
       <div class="search-item" onclick='toggleSelectUser(${safeUserJson(u)})'>
@@ -176,7 +202,7 @@ function updateCreateRoomResults() {
     resultsEl.innerHTML = '';
     resultsEl.style.display = 'none';
   }
-  
+
   // Update selected chips
   const selectedEl = document.getElementById('createRoomSelected');
   if (selectedEl) {
@@ -239,17 +265,17 @@ const COMMON_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '👏', '🔥',
 
 window.showReactionPicker = (msgId, event) => {
   if (event) event.stopPropagation();
-  
+
   // Remove existing picker
   const existing = $("#reactionPicker");
   if (existing) existing.remove();
-  
+
   const picker = document.createElement("div");
   picker.id = "reactionPicker";
-  picker.innerHTML = COMMON_EMOJIS.map(emoji => 
+  picker.innerHTML = COMMON_EMOJIS.map(emoji =>
     `<button class="reaction-btn" onclick="addReaction('${msgId}', '${emoji}')">${emoji}</button>`
   ).join('');
-  
+
   // Position near click but keep in viewport
   const rect = event?.target?.getBoundingClientRect();
   if (rect) {
@@ -258,12 +284,12 @@ window.showReactionPicker = (msgId, event) => {
     let left = rect.left + rect.width / 2 - 140; // 140 = half of picker width (~280px)
     left = Math.max(10, Math.min(left, window.innerWidth - 290));
     picker.style.left = `${left}px`;
-    picker.style.top = `${rect.top - 55}px`; // Above the message
+    picker.style.top = `${Math.max(8, Math.min(innerHeight - 65, rect.top - 55))}px`;
     picker.style.zIndex = '1000';
   }
-  
+
   document.body.appendChild(picker);
-  
+
   // Close on click outside
   setTimeout(() => {
     document.addEventListener('click', function closePicker(e) {
@@ -278,7 +304,7 @@ window.showReactionPicker = (msgId, event) => {
 window.addReaction = (msgId, emoji) => {
   const picker = $("#reactionPicker");
   if (picker) picker.remove();
-  
+
   state.ws?.send(JSON.stringify({ type: "reaction.add", message_id: msgId, emoji }));
 };
 
@@ -290,28 +316,32 @@ window.removeReaction = (msgId, emoji, event) => {
 // Theme toggle
 window.toggleTheme = () => {
   state.darkTheme = !state.darkTheme;
+  state.themeMode = state.darkTheme ? "dark" : "light"; localStorage.setItem("themeMode", state.themeMode);
   localStorage.setItem("theme", state.darkTheme ? "dark" : "light");
   applyTheme();
-  mount();
+  mountPreservingInput();
 };
 
 function applyTheme() {
+  if (state.themeMode === "system") state.darkTheme = matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.style.colorScheme = state.darkTheme ? "dark" : "light";
+  document.documentElement.style.setProperty("--message-font", state.fontSize + "px");
+  document.body.classList.toggle("message-selection", !!state.selectedMessages?.size);
   document.body.classList.toggle("light-theme", !state.darkTheme);
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', state.darkTheme ? '#181819' : '#14B88F');
 }
 
 // --- Utils ---
 async function api(path, opts={}) {
-  const r = await fetch(API + path, {
-    ...opts,
-    headers: { ...(opts.body instanceof FormData ? {} : { "Content-Type":"application/json" }), ...(opts.headers||{}) },
-    credentials: "include"
-  });
-  const ct = r.headers.get("content-type") || "";
-  const isJson = ct.includes("application/json");
-  const body = isJson ? await r.json().catch(() => null) : await r.text().catch(() => "");
-  if (r.status === 401 && !isAuthEntryPath(path)) handleUnauthorized();
-  if (!r.ok) return null;
-  return body;
+  const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const r = await fetch(API + path, { ...opts, signal: opts.signal || controller.signal,
+      headers: { ...(opts.body === undefined || opts.body instanceof FormData ? {} : { "Content-Type":"application/json" }), ...(opts.headers||{}) }, credentials: "include" });
+    const body = await r.json().catch(() => null);
+    if (r.status === 401 && !isAuthEntryPath(path)) handleUnauthorized();
+    if (!r.ok) throw Object.assign(new Error(body?.error || `HTTP ${r.status}`), { code: body?.error, status: r.status });
+    return body;
+  } finally { clearTimeout(timeout); }
 }
 
 // Login/register/logout legitimately answer 401 (bad credentials etc.) and must
@@ -327,6 +357,10 @@ function resetClientSession() {
     clearInterval(state.autoBackupInterval);
     state.autoBackupInterval = null;
   }
+  webMedia.stop();
+  for (const value of webMediaUrls.values()) URL.revokeObjectURL(value.url); webMediaUrls.clear();
+  chatRuntime.stop();
+  localStorage.removeItem("67chat-profile");
   stopPreKeyMonitor();
   e2eSessionInflight.clear();
   e2ePeerDeviceIds.clear();
@@ -337,6 +371,11 @@ function resetClientSession() {
   clearAllTyping();
 
   state.me = null;
+  webDrafts.clear();
+  state.settingsOpen = false;
+  state.composeOpen = false;
+  state.uiMenu = null;
+  state.peopleResults = [];
   state.rooms = [];
   state.activeRoomId = null;
   state.messages = [];
@@ -796,7 +835,7 @@ function restoreInputState(snapshot) {
 
 async function mountPreservingInput() {
   const snapshot = captureInputState();
-  if (snapshot) state.composerText = snapshot.value;
+  if (snapshot?.id === "inp") state.composerText = snapshot.value;
   await mount();
   restoreInputState(snapshot);
 }
@@ -967,76 +1006,27 @@ async function decryptMsg(roomId, msg) {
 
 // --- E2E Encryption (Signal Protocol) ---
 // Работает прозрачно в фоне, пользователь не видит
-async function initE2E() {
-  // libsignal + Curve25519Wrapper load as ES modules (see index.html). Wait for
-  // them if the module script hasn't finished yet.
-  if (!window.E2EManager) return;
-  if (!window.libsignal) {
-    await new Promise((resolve) => {
-      if (window.libsignal) return resolve();
-      const onReady = () => { window.removeEventListener('libsignal-ready', onReady); resolve(); };
-      window.addEventListener('libsignal-ready', onReady);
-      setTimeout(onReady, 5000);
-    });
-  }
-  if (!window.libsignal) return;
-
-  try {
-    state.e2eManager = new window.E2EManager();
-    const deviceId = getE2EDeviceId();
-
-    // Persistent backend: IndexedDB through the keystore module.
-    const persistentStore = window.SigStore || null;
-
-    // Try to restore previously generated keys first.
-    const loaded = await state.e2eManager.loadFromIndexedDB(state.me.id);
-
+let e2eInitTask = null;
+function initE2E() {
+  if (state.e2eReady && state.e2eManager?.ready) return Promise.resolve();
+  if (e2eInitTask) return e2eInitTask;
+  const userId=state.me?.id;
+  if (!userId) return Promise.resolve();
+  e2eInitTask=(async()=>{
+    if (!window.libsignal) await new Promise(resolve=>{ const done=()=>{window.removeEventListener('libsignal-ready',done);resolve();};window.addEventListener('libsignal-ready',done);setTimeout(done,5000); });
+    if (!window.libsignal || !window.SigStore || state.me?.id!==userId) return;
+    const manager=new window.E2EManager(), deviceId=getE2EDeviceId(), backend=window.SigStore.forAccount(userId);
+    manager.useStore(userId,deviceId,backend);
+    const loaded=await manager.loadFromIndexedDB(userId);
     if (!loaded) {
-      // Initialize and generate a fresh key bundle.
-      const bundle = await state.e2eManager.init(state.me.id, deviceId, persistentStore);
-
-      // Upload the public bundle (identity, signed pre-key + signature, pre-keys).
-      const uploadRes = await api("/e2e/keys", {
-        method: "POST",
-        body: JSON.stringify({
-          device_id: deviceId,
-          identity_key: bundle.identityKey,
-          registration_id: bundle.registrationId,
-          signed_pre_key: {
-            key_id: bundle.signedPreKey.keyId,
-            public_key: bundle.signedPreKey.publicKey,
-            signature: bundle.signedPreKey.signature
-          },
-          pre_keys: bundle.preKeys.map(pk => ({
-            key_id: pk.keyId,
-            public_key: pk.publicKey
-          }))
-        })
-      });
-
-      if (uploadRes?.ok) {
-        state.e2eReady = true;
-        // Persist locally only AFTER the server accepted the bundle, so a failed
-        // upload doesn't leave us with keys nobody else can fetch.
-        await state.e2eManager.saveToIndexedDB(state.me.id);
-      } else {
-        // Keys generated but not published — do not claim E2E is ready.
-        state.e2eReady = false;
-        console.warn('E2E key upload failed; staying on room-key fallback');
-      }
-    } else {
-      state.e2eReady = true;
+      const bundle=await manager.init(userId,deviceId,backend);await manager.saveToIndexedDB(userId);
+      await api('/e2e/keys',{method:'POST',body:JSON.stringify({device_id:deviceId,identity_key:bundle.identityKey,registration_id:bundle.registrationId,signed_pre_key:{key_id:bundle.signedPreKey.keyId,public_key:bundle.signedPreKey.publicKey,signature:bundle.signedPreKey.signature},pre_keys:bundle.preKeys.map(pk=>({key_id:pk.keyId,public_key:pk.publicKey}))})});
     }
-
-    // Keep an eye on remaining one-time pre-keys; refill before running dry.
-    if (state.e2eReady) {
-      maybeReplenishPreKeys(deviceId, { force: true });
-      startPreKeyMonitor();
-    }
-  } catch (e) {
-    // Non-fatal: the app still works with room-key encryption for groups.
-    console.error("E2E not available, using fallback encryption:", e?.message || e);
-  }
+    if(state.me?.id!==userId)return;
+    state.e2eManager=manager; state.e2eReady=true;
+    await maybeReplenishPreKeys(deviceId,{force:true});startPreKeyMonitor();
+  })().catch(error=>{console.warn('Ключи шифрования пока недоступны:',error.message);}).finally(()=>{e2eInitTask=null;});
+  return e2eInitTask;
 }
 
 // If the server reports fewer than 10 unused one-time pre-keys, generate a fresh
@@ -1107,87 +1097,35 @@ function getE2EDeviceId() {
   return deviceId;
 }
 
-// Single-flight: concurrent callers for the same peer share one in-flight session
-// creation, so we never fetch a bundle / burn a pre-key / build a session twice.
 const e2eSessionInflight = new Map();
-
-function getE2ESessionForUser(userId) {
-  if (!state.e2eReady || !state.e2eManager) return Promise.resolve(false);
-  const key = String(userId);
-  const pending = e2eSessionInflight.get(key);
-  if (pending) return pending;
-  const p = createE2ESessionForUser(userId).finally(() => {
-    // Always release the lock (success or failure) so a later call can retry.
-    if (e2eSessionInflight.get(key) === p) e2eSessionInflight.delete(key);
-  });
-  e2eSessionInflight.set(key, p);
-  return p;
-}
-
-async function createE2ESessionForUser(userId) {
-  try {
-    // Check if session already exists
-    const sessionExists = await state.e2eManager.store.loadSession(userId + '.1');
-    if (sessionExists) return true;
-
-    // Fetch user's key bundle from server
-    const bundle = await api(`/e2e/keys/${userId}`);
-    if (!bundle || !bundle.identity_key) return false;
-    const peerDeviceId = bundle.device_id || '1';
-    e2ePeerDeviceIds.set(String(userId), peerDeviceId);
-
-    // Build session with user
-    await state.e2eManager.buildSession(userId, peerDeviceId, {
-      registrationId: bundle.registration_id || 0,
-      identityKey: bundle.identity_key,
-      signedPreKey: bundle.signed_pre_key,
-      preKey: bundle.pre_key
-    });
-
-    return true;
-
-    return true;
-  } catch (e) {
-    // Тихо игнорируем - будет работать без E2E
-    return null;
+async function encryptMessageE2E(recipientId, plaintext, targetDevice) {
+  const owner=state.me?.id,ownDevice=getE2EDeviceId();
+  await initE2E(); if(!state.e2eReady || !state.e2eManager) throw Error('Ключи ещё загружаются');
+  if(state.me?.id!==owner)throw Error('Сеанс изменился');
+  const manager=state.e2eManager;
+  let device=targetDevice;
+  if(!device) device=(await api(`/e2e/devices/${recipientId}`))[0]?.device_id;
+  if(!device) throw Error('Участнику нужно обновить приложение для шифрованной группы');
+  const key=`${recipientId}:${device}.${device}`;
+  if (!await manager.store.loadSession(key)) {
+    let task=e2eSessionInflight.get(key);
+    if(!task) {task=(async()=>{ const bundle=await api(`/e2e/keys/${recipientId}?device_id=${encodeURIComponent(device)}`);
+      await manager.buildSession(recipientId,device,{registrationId:bundle.registration_id,identityKey:bundle.identity_key,signedPreKey:bundle.signed_pre_key,preKey:bundle.pre_key});
+    })();e2eSessionInflight.set(key,task);task.finally(()=>e2eSessionInflight.delete(key)).catch(()=>{});}
+    await task;
   }
+  if(state.me?.id!==owner)throw Error('Сеанс изменился');
+  return {...await manager.encryptMessage(recipientId,device,plaintext),sender_device_id:ownDevice,recipient_device_id:device};
 }
-
-async function encryptMessageE2E(recipientId, plaintext) {
-  if (!state.e2eReady || !state.e2eManager) return null;
-
-  try {
-    // Ensure session exists
-    const hasSession = await getE2ESessionForUser(recipientId);
-    if (!hasSession) {
-      console.error('E2E session not available for user:', recipientId);
-      return null;
-    }
-
-    // Encrypt message
-    const ciphertext = await state.e2eManager.encryptMessage(recipientId, e2ePeerDeviceIds.get(String(recipientId)) || '1', plaintext);
-    return ciphertext;
-  } catch (e) {
-    console.error('E2E encryption failed:', e);
-    return null;
-  }
-}
-
-async function decryptMessageE2E(senderId, ciphertext) {
-  if (!state.e2eReady || !state.e2eManager) return null;
-
-  try {
-    // Ensure session exists (will be created on first message)
-    await getE2ESessionForUser(senderId);
-
-    const plaintext = await state.e2eManager.decryptMessage(senderId, e2ePeerDeviceIds.get(String(senderId)) || '1', ciphertext);
-    // A PreKeyWhisperMessage (type 1) consumed one of our one-time pre-keys.
-    if (ciphertext?.type === 1) maybeReplenishPreKeys();
-    return plaintext;
-  } catch (e) {
-    console.error('E2E decryption failed:', e);
-    return null;
-  }
+async function decryptMessageE2E(senderId,ciphertext) {
+  const owner=state.me?.id;
+  await initE2E(); if(!state.e2eReady || !state.e2eManager)throw Error('Ключи ещё загружаются');
+  if(state.me?.id!==owner)throw Error('Сеанс изменился');const manager=state.e2eManager;
+  const device=ciphertext.sender_device_id || (await api(`/e2e/devices/${senderId}`))[0]?.device_id || '1';
+  if(state.me?.id!==owner)throw Error('Сеанс изменился');
+  const plain=await manager.decryptMessage(senderId,device,ciphertext);
+  if(ciphertext.type===3)void maybeReplenishPreKeys();
+  return plain;
 }
 
 // --- Group E2E (Sender Keys) ---
@@ -1198,8 +1136,8 @@ const groupE2eRooms = new Map(); // roomId -> boolean, from GET /rooms/:id/e2e
 const groupPlainCache = new Map(); // envelope JSON -> plaintext (own messages this session)
 const groupInboxInflight = new Map();
 
-function groupKey(roomId, suffix) {
-  return `gk:${state.me?.id}:${roomId}:${suffix}`;
+function groupKey(roomId, suffix, owner=state.me?.id) {
+  return `gk:${owner}:${roomId}:${suffix}`;
 }
 
 async function roomE2eEnabled(roomId) {
@@ -1223,56 +1161,45 @@ async function fetchAllMemberIds(roomId) {
 
 // Keeps: own current key under "own", every own key under "own:<keyId>" (old
 // messages stay readable after rotation), and inbound keys under "in:<senderId>".
-async function saveOwnSenderKey(roomId, rec) {
-  await window.SigStore.put(groupKey(roomId, 'own'), rec);
-  await window.SigStore.put(groupKey(roomId, `own:${rec.keyId}`), rec);
+async function saveOwnSenderKey(roomId, rec,owner=state.me?.id) {
+  await window.SigStore.put(groupKey(roomId, 'own',owner), rec);
+  await window.SigStore.put(groupKey(roomId, `own:${rec.keyId}`,owner), rec);
 }
 
-async function distributeOwnSenderKey(roomId, members, { rotate = false } = {}) {
-  const myId = String(state.me.id);
-  let rec = await window.SigStore.get(groupKey(roomId, 'own'), null);
-  // A recipient has left (or a rekey was requested): a new key goes to current members only.
-  const plan = window.GroupCrypto.planSend(rotate ? null : rec, members, myId);
-  if (plan.rotate) rec = await window.GroupCrypto.createSenderKey();
-
-  const pending = plan.pending;
-  if (pending.length) {
-    const dist = window.GroupCrypto.distributionFor(rec);
-    const recipients = [];
-    const unreachable = [];
-    for (const uid of pending) {
-      const ct = await encryptMessageE2E(uid, JSON.stringify({ ...dist, room_id: roomId }));
-      if (!ct) { unreachable.push(uid); continue; }
-      recipients.push({ user_id: uid, payload: JSON.stringify(ct) });
-    }
-    if (recipients.length) {
-      const res = await api(`/rooms/${roomId}/sender-keys`, {
-        method: 'POST',
-        body: JSON.stringify({ key_id: rec.keyId, recipients })
-      });
-      if (!res) throw new Error('sender_key_upload_failed');
-      rec.distributedTo = [...rec.distributedTo, ...recipients.map(r => r.user_id)];
-    }
-    // Warn once per change in the unreachable set, not on every message.
-    const prev = (rec.unreachable || []).join(',');
-    rec.unreachable = unreachable;
-    if (unreachable.length && unreachable.join(',') !== prev) {
-      alert(`Ключ не передан ${unreachable.length} участн. (нет E2E-ключей на устройстве). Они не смогут читать сообщения в этой группе.`);
-    }
+async function distributeOwnSenderKey(roomId,members,{rotate=false}={}) {
+  const owner=state.me?.id,ownDevice=getE2EDeviceId();
+  const targets=[];
+  for (const user of members) {
+    const devices=await api(`/e2e/devices/${user}`);
+    if(state.me?.id!==owner)throw Error('Сеанс изменился');
+    if(!devices.length)throw Error('Участнику нужно обновить приложение для шифрованной группы');
+    for(const device of devices)if(String(user)!==String(owner) || device.device_id!==ownDevice) targets.push({user:String(user),device:device.device_id});
   }
-  await saveOwnSenderKey(roomId, rec);
-  return rec;
+  const tokens=targets.map(t=>t.user+'|'+t.device);
+  let rec=await window.SigStore.get(groupKey(roomId,'own',owner),null);
+  if(rotate || !rec || rec.n>=1000 || rec.distributedTo.some(token=>!tokens.includes(token)))rec=await window.GroupCrypto.createSenderKey();
+  const recipients=[];
+  for(const target of targets.filter(t=>!rec.distributedTo.includes(t.user+'|'+t.device))) recipients.push({user_id:target.user,device_id:target.device,payload:JSON.stringify(await encryptMessageE2E(target.user,JSON.stringify({...window.GroupCrypto.distributionFor(rec),room_id:roomId}),target.device))});
+  if(state.me?.id!==owner)throw Error('Сеанс изменился');
+  if(recipients.length)await api(`/rooms/${roomId}/sender-keys`,{method:'POST',body:JSON.stringify({key_id:rec.keyId,recipients})});
+  rec.distributedTo=tokens;await saveOwnSenderKey(roomId,rec,owner);return rec;
 }
-
-async function encryptGroupText(roomId, text) {
+let groupSequence=Promise.resolve();
+function groupSerial(fn) {const owner=state.me?.id;const task=groupSequence.then(()=>{if(state.me?.id!==owner)throw Error('Сеанс изменился');return fn(owner);});groupSequence=task.catch(()=>{});return task;}
+function encryptGroupText(roomId,text) { return groupSerial(owner=>encryptGroupTextUnlocked(roomId,text,owner)); }
+async function encryptGroupTextUnlocked(roomId, text,owner) {
+  await initE2E();
   if (!state.e2eReady || !state.e2eManager) throw new Error('E2E не готово на этом устройстве');
   const members = await fetchAllMemberIds(roomId);
+  if(state.me?.id!==owner)throw Error('Сеанс изменился');
   if (members.length > GROUP_E2E_MAX_MEMBERS) throw new Error(`В группе с E2E не более ${GROUP_E2E_MAX_MEMBERS} участников`);
   const rec = await distributeOwnSenderKey(roomId, members);
-  const { envelope, state: next } = await window.GroupCrypto.encryptWithState(rec, roomId, String(state.me.id), text);
-  await saveOwnSenderKey(roomId, next);
+  if(state.me?.id!==owner)throw Error('Сеанс изменился');
+  const { envelope, state: next } = await window.GroupCrypto.encryptWithState(rec, roomId, String(owner), text);
+  await saveOwnSenderKey(roomId, next,owner);
   const encrypted_content = JSON.stringify(envelope);
   groupPlainCache.set(encrypted_content, text);
+  await createAccountStore(owner).set('group-plain:'+encrypted_content,text);
   return { type: "text", text: null, meta: { e2e_group: true, v: 1 }, encrypted_content };
 }
 
@@ -1284,7 +1211,7 @@ async function rekeyOnMembershipChange(roomId) {
     const members = await fetchAllMemberIds(roomId);
     if (!members.includes(String(state.me.id))) return;
     if (!(await window.SigStore.get(groupKey(roomId, 'own'), null))) return; // nothing distributed yet
-    await distributeOwnSenderKey(roomId, members, { rotate: true });
+    await groupSerial(()=>distributeOwnSenderKey(roomId, members, { rotate: true }));
   } catch (e) {
     console.error('Group re-key failed:', e.message);
   }
@@ -1293,64 +1220,53 @@ async function rekeyOnMembershipChange(roomId) {
 // Fetch pending sender-key distributions addressed to me; import and ack each one.
 // Rows that fail to decrypt stay pending so a later attempt can retry them.
 function syncGroupInbox(roomId) {
-  if (groupInboxInflight.has(roomId)) return groupInboxInflight.get(roomId);
+  const owner=state.me?.id,device=getE2EDeviceId(),inflightKey=owner+':'+roomId;
+  if (groupInboxInflight.has(inflightKey)) return groupInboxInflight.get(inflightKey);
   const p = (async () => {
-    const rows = await api(`/rooms/${roomId}/sender-keys`) || [];
+    const rows = await api(`/rooms/${roomId}/sender-keys?device_id=${device}`) || [];
     for (const row of rows) {
       try {
-        const plain = await decryptMessageE2E(row.from_user_id, JSON.parse(row.payload));
-        if (!plain) continue;
-        const d = JSON.parse(plain);
+        if(state.me?.id!==owner)return;
+        const pending=groupKey(roomId,'distribution:'+row.id,owner);
+        let d=await window.SigStore.get(pending,null);
+        if(!d) {const plain=await decryptMessageE2E(row.from_user_id,JSON.parse(row.payload)); if(!plain)continue;d=JSON.parse(plain);await window.SigStore.put(pending,d);}
         if (d.room_id !== roomId) continue;
-        const key = groupKey(roomId, `in:${row.from_user_id}`);
+        const key = groupKey(roomId, `in:${row.from_user_id}:${d.kid}`,owner);
         const cur = await window.SigStore.get(key, null);
         if (!cur || cur.keyId !== d.kid) {
-          await window.SigStore.put(key, window.GroupCrypto.receiverStateFromDistribution(d));
+          const initial=window.GroupCrypto.receiverStateFromDistribution(d);
+          await window.SigStore.put(key,{...initial,initial});
         }
-        await api(`/rooms/${roomId}/sender-keys/${row.id}`, { method: 'DELETE' });
+        if(state.me?.id!==owner)return;
+        await api(`/rooms/${roomId}/sender-keys/${row.id}?device_id=${device}`, { method: 'DELETE' });
       } catch (e) {
         console.error('Sender key import failed:', e.message);
       }
     }
-  })().finally(() => groupInboxInflight.delete(roomId));
-  groupInboxInflight.set(roomId, p);
+  })().finally(() => groupInboxInflight.delete(inflightKey));
+  groupInboxInflight.set(inflightKey, p);
   return p;
 }
 
 const GROUP_KEY_UNAVAILABLE = "🔐 [Ключ отправителя недоступен]";
 
-async function decryptGroupMsg(roomId, msg) {
-  const cached = groupPlainCache.get(msg.encrypted_content);
-  if (cached !== undefined) return cached;
-  let env;
-  try { env = JSON.parse(msg.encrypted_content); } catch { return "❌ [Ошибка E2E расшифровки]"; }
-  const senderId = String(msg.sender_id);
-  const isOwn = senderId === String(state.me?.id);
-
-  let readState = null;
-  if (isOwn) {
-    const own = await window.SigStore.get(groupKey(roomId, `own:${env.kid}`), null);
-    if (own) readState = window.GroupCrypto.ownReceiverState(own);
-  } else {
-    const key = groupKey(roomId, `in:${senderId}`);
-    let inState = await window.SigStore.get(key, null);
-    if (!inState || inState.keyId !== env.kid) {
-      await syncGroupInbox(roomId);
-      inState = await window.SigStore.get(key, null);
-    }
-    if (inState && inState.keyId === env.kid) readState = inState;
-  }
-  if (!readState) return GROUP_KEY_UNAVAILABLE;
-
+function decryptGroupMsg(roomId,msg) {return groupSerial(owner=>decryptGroupMsgUnlocked(roomId,msg,owner));}
+async function decryptGroupMsgUnlocked(roomId,msg,owner) {
+  const content=msg.encrypted_content,local=createAccountStore(owner);
+  const cached=await local.get('group-plain:'+content,null);if(cached!==null)return cached;
+  if(state.me?.id!==owner)throw Error('Сеанс изменился');
+  const env=JSON.parse(content),senderId=String(msg.sender_id),inKey=groupKey(roomId,`in:${senderId}:${env.kid}`,owner);
+  const own=senderId===String(owner) ? await window.SigStore.get(groupKey(roomId,`own:${env.kid}`,owner),null) : null;
+  let incoming=await window.SigStore.get(inKey,null);
+  if(!incoming && !own) {await syncGroupInbox(roomId);incoming=await window.SigStore.get(inKey,null);}
+  if(!incoming && !own)return GROUP_KEY_UNAVAILABLE;
   try {
-    const { plaintext, state: next } = await window.GroupCrypto.decryptWithState(readState, roomId, senderId, env);
-    if (!isOwn) await window.SigStore.put(groupKey(roomId, `in:${senderId}`), next);
-    groupPlainCache.set(msg.encrypted_content, plaintext);
-    return plaintext;
-  } catch (e) {
-    console.error('Group E2E decrypt failed:', e.message);
-    return "🔐 [Не удалось расшифровать E2E сообщение]";
-  }
+    let result;
+    if(own)result=await window.GroupCrypto.decryptWithState(window.GroupCrypto.ownReceiverState(own),roomId,senderId,env);
+    else {try {result=await window.GroupCrypto.decryptWithState(incoming,roomId,senderId,env);}catch(error) {if(!incoming.initial)throw error;result=await window.GroupCrypto.decryptWithState(incoming.initial,roomId,senderId,env);}
+      if(result.state.n>=incoming.n)await window.SigStore.put(inKey,{...result.state,initial:incoming.initial});}
+    await local.set('group-plain:'+content,result.plaintext);return result.plaintext;
+  }catch(error){console.warn('Расшифровка группы:',error.message);return '🔐 Не удалось получить ключ сообщения';}
 }
 
 window.toggleGroupE2e = async () => {
@@ -1359,7 +1275,7 @@ window.toggleGroupE2e = async () => {
   const on = await roomE2eEnabled(roomId);
   const warning = on
     ? "Отключить сквозное шифрование? Новые сообщения пойдут без E2E."
-    : "Включить сквозное шифрование группы?\n\nСообщения станут нечитаемы для участников, у которых нет веб-версии с поддержкой E2E (в т.ч. мобильного приложения). Вложения и медиа этим режимом НЕ шифруются. Сервер по-прежнему видит, кто и когда пишет.";
+    : "Включить сквозное шифрование группы?\n\nУчастникам нужны актуальная версия сайта или приложения. Новые сообщения и ключи вложений будут защищены сквозным шифрованием. Сервер видит участников и время отправки.";
   if (!confirm(warning)) return;
   const res = await api(`/rooms/${roomId}/e2e`, { method: 'PUT', body: JSON.stringify({ enabled: !on }) });
   if (!res) { alert("Не удалось изменить настройку (нужны права владельца или администратора)."); return; }
@@ -1420,7 +1336,9 @@ function connectWS() {
       state.wsReconnectAttempts = 0;
       state.wsAuthed = true;
       if (state.activeRoomId) joinActiveRoom();
-      if (!state.activeRoomId) render(); // Only render if not in chat
+      updateChatPresence();
+      void chatRuntime.flush();
+      if (state.messages.some(m => !m.delivery)) void chatRuntime.newer();
 
       // Auto-save E2E keys periodically (every 5 minutes)
       if (!state.autoBackupInterval) {
@@ -1445,66 +1363,40 @@ function connectWS() {
       return;
     }
 
-    if (data.type === "message.new" && data.message.room_id === state.activeRoomId) {
-      const m = data.message;
-      if (m.type === "text") m._text = await decryptMsg(state.activeRoomId, m);
-      state.messages.push(m);
-      renderMessages(); // Render only messages, not full UI
-      // Mark as read after receiving
-      setTimeout(() => markMessagesRead(), 500);
-    }
-
-    // Update room list on new message
     if (data.type === "message.new") {
-      // The sender obviously stopped typing once their message arrived.
-      if (data.message?.room_id && data.message?.sender_id) {
-        const wasActive = String(data.message.room_id) === String(state.activeRoomId);
-        clearTypingUser(String(data.message.room_id), String(data.message.sender_id), wasActive);
-      }
-      loadRooms();
-
-      // Show notification if message is not in active room or tab is not focused
-      if (data.message.room_id !== state.activeRoomId || !document.hasFocus()) {
-        const room = state.rooms.find(r => r.id === data.message.room_id);
-        if (room && data.message.sender_id !== state.me?.id) {
-          // Decrypt message for notification
-          const m = data.message;
-          if (m.type === "text") m._text = await decryptMsg(m.room_id, m);
-          notifyNewMessage(m, room);
-        }
+      const roomId = data.message.room_id, account = state.me?.id;
+      const prepared = await chatRuntime.received(data.message);
+      if (state.me?.id !== account) return;
+      clearTypingUser(roomId, data.message.sender_id, roomId === state.activeRoomId);
+      void loadRooms().catch(() => {});
+      if (prepared && (roomId !== state.activeRoomId || !document.hasFocus())) {
+        const room = state.rooms.find(r => r.id === roomId);
+        if (room && prepared.sender_id !== account) notifyNewMessage(prepared, room);
       }
     }
-    
+
     // Handle messages read status
     if (data.type === "messages.read" && data.user_id !== state.me?.id) {
-      // Update read status for messages from me
-      const myId = String(state.me?.id || "");
-      const readerId = String(data.user_id || "");
-      state.messages.forEach(m => {
-        if (String(m.sender_id || "") === myId) {
-          if (!m.read_by) m.read_by = [];
-          if (!m.read_by.includes(readerId)) {
-            m.read_by.push(readerId);
-          }
-        }
-      });
-      // Force re-render of messages
-      render();
+      const ids = new Set(data.message_ids || []);
+      if (data.room_id === state.activeRoomId) {
+        state.messages = state.messages.map(m => ids.has(m.id) ? { ...m, read_by: [...new Set([...(m.read_by || []), data.user_id])] } : m);
+        render();
+      }
+      const local = chatRuntime.local();
+      if (local) void local.get('messages:' + data.room_id, []).then(rows => local.saveMessages(data.room_id, rows.filter(m => ids.has(m.id)).map(m => ({ ...m, read_by: [...new Set([...(m.read_by || []), data.user_id])] })))).catch(() => {});
     }
-    
+
     // Handle message deletion
     if (data.type === "message.delete") {
+      void chatRuntime.local()?.removeMessage(data.room_id || state.activeRoomId, data.message_id).catch(() => {});
       state.messages = state.messages.filter(m => m.id !== data.message_id);
       if (state.editMessage?.id === data.message_id) state.editMessage = null;
       render();
     }
 
     if (data.type === "message.update" && data.message) {
-      const m = data.message;
-      if (m.type === "text") m._text = await decryptMsg(m.room_id, m);
-      state.messages = state.messages.map(item => item.id === m.id ? { ...item, ...m } : item);
-      if (state.editMessage?.id === m.id) state.editMessage = null;
-      render();
+      await chatRuntime.received(data.message);
+      if (state.editMessage?.id === data.message.id) state.editMessage = null;
     }
 
     // Handle reactions
@@ -1528,7 +1420,7 @@ function connectWS() {
         render();
       }
     }
-    
+
     if (data.type === "reaction.remove") {
       const msg = state.messages.find(m => m.id === data.message_id);
       if (msg && msg.reactions && msg.reactions[data.emoji]) {
@@ -1538,22 +1430,23 @@ function connectWS() {
       }
     }
 
+    if(data.type=== "call.created")state.currentCallId=data.call_id;
     if (data.type === "call.offer") {
       if (String(data.from_user_id || "") !== String(state.me?.id || "")) handleCall(data);
     }
-    if (data.type === "call.answer" && state.pc && data.sdp) {
+    if (data.type === "call.answer" && data.room_id===state.currentCallRoomId && state.pc && (data.sdp || data.answer)) {
       try {
-        await state.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        await state.pc.setRemoteDescription(new RTCSessionDescription(data.sdp || data.answer));
         await flushPendingIceCandidates();
       } catch (e) { console.error("setRemoteDescription failed:", e); }
     }
-    if (data.type === "call.ice" && state.pc && data.candidate) {
+    if (data.type === "call.ice" && data.room_id===state.currentCallRoomId && data.candidate) {
       try {
-        if (state.pc.remoteDescription) await state.pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        if (state.pc?.remoteDescription) await state.pc.addIceCandidate(new RTCIceCandidate(data.candidate));
         else state.pendingIceCandidates.push(data.candidate);
       } catch (e) { console.error("addIceCandidate failed:", e); }
     }
-    if (data.type === "call.hangup") { if (typeof window.hangupCall === "function") window.hangupCall(false); }
+    if (data.type === "call.hangup" && (!state.currentCallId || data.call_id===state.currentCallId) && data.room_id===state.currentCallRoomId) { if (typeof window.hangupCall === "function") window.hangupCall(false); }
     if (data.type === "sender_key.available" && data.room_id) {
       syncGroupInbox(data.room_id).then(async () => {
         if (state.activeRoomId !== data.room_id) return;
@@ -1581,7 +1474,7 @@ function connectWS() {
       mount();
       return;
     }
-    
+
     if (data.type === "typing") {
       const roomId = String(data.room_id || "");
       if (!roomId) return;
@@ -1590,7 +1483,7 @@ function connectWS() {
       else clearTypingUser(roomId, uId);
       if (roomId === state.activeRoomId) render(); // Use render() instead of mount() to preserve focus
     }
-    
+
     // Update room list in real-time
     if (data.type === "rooms.update" && Array.isArray(data.rooms)) {
       state.rooms = await prepareRoomPreviews(data.rooms);
@@ -1601,6 +1494,7 @@ function connectWS() {
   ws.onclose = (ev) => {
     if (!isCurrent()) return; // intentional close / superseded socket
     state.wsAuthed = false;
+    updateChatPresence();
     if (state.wsAuthTimer) { clearTimeout(state.wsAuthTimer); state.wsAuthTimer = null; }
     clearAllTyping(true); // typing "stop" events can't arrive on a dead socket
 
@@ -1616,7 +1510,8 @@ function connectWS() {
 
 async function handleCall(data) {
   const fromName = data.from_username || data.from_user_id || "unknown";
-  if (!data.sdp) { console.error("No SDP in call offer"); return; }
+  data.sdp ||= data.offer;
+  if (!data.sdp) { toast("Не удалось получить данные звонка"); return; }
   if (state.callState !== 'idle') {
     try {
       state.ws?.send(JSON.stringify({ type: "call.hangup", room_id: data.room_id, to_user_id: data.from_user_id }));
@@ -1627,10 +1522,11 @@ async function handleCall(data) {
   // Detect if it's a video call by checking SDP
   const isVideoCall = data.sdp.sdp && data.sdp.sdp.includes('m=video');
 
+  state.currentCallId=data.call_id;
   state.callState = 'incoming';
   state.currentCallRoomId = data.room_id || state.activeRoomId || null;
   state.currentCallPeerId = data.from_user_id || null;
-  state.pendingIceCandidates = [];
+  state.pendingIceCandidates = data.candidates || [];
   state.isVideoCall = isVideoCall;
   state.isVideoEnabled = isVideoCall;
   state.isAudioEnabled = true;
@@ -1656,11 +1552,14 @@ async function handleCall(data) {
   document.body.appendChild(callDialog);
 
   const accepted = await new Promise(resolve => {
+    state.incomingCallResolve=resolve;
+    setTimeout(()=>resolve(false),Math.max(0,(data.expires_at || Date.now()+45000)-Date.now()));
     $("#acceptCallBtn").onclick = () => resolve(true);
     $("#rejectCallBtn").onclick = () => resolve(false);
   });
 
-  callDialog.remove();
+  state.incomingCallResolve=null;callDialog.remove();
+  if(state.callState==='idle' || (data.call_id && data.call_id!==state.currentCallId))return;
   if (!accepted) {
     state.callState = 'idle';
     try {
@@ -1812,6 +1711,7 @@ window.hangupCall = (notifyPeer = true) => {
   clearCallDisconnectTimer();
   state.callStartTime = null;
   state.callState = 'idle';
+  state.incomingCallResolve?.(false);state.incomingCallResolve=null;state.currentCallId=null;
   state.pendingIceCandidates = [];
   state.isVideoCall = false;
   state.isVideoEnabled = true;
@@ -1907,8 +1807,7 @@ window.switchCamera = async () => {
     const currentFacingMode = settings.facingMode || 'user';
     const newFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
 
-    // Stop current track
-    videoTrack.stop();
+    // Keep the current track available if acquiring the other camera fails.
 
     // Get new stream with different camera
     const newStream = await navigator.mediaDevices.getUserMedia({
@@ -1928,6 +1827,7 @@ window.switchCamera = async () => {
     }
 
     // Replace track in local stream
+    videoTrack.stop();
     state.localStream.removeTrack(videoTrack);
     state.localStream.addTrack(newVideoTrack);
 
@@ -2031,12 +1931,18 @@ function joinActiveRoom() {
 
 // --- Search ---
 async function refreshSearch() {
-  const q = (state.searchQ || "").trim();
-  if (!q) { state.searchResults = []; state.searching = false; mountPreservingInput(); return; }
-  state.searching = true; mountPreservingInput();
-  const res = await api(`/users/search?q=${encodeURIComponent(q)}`);
-  state.searchResults = Array.isArray(res) ? res : [];
-  state.searching = false; mountPreservingInput();
+  const q = (state.searchQ || '').trim();
+  const account = state.me?.id;
+  if (!q) { state.peopleResults = []; state.searching = false; mountPreservingInput(); return; }
+  state.searching = true;
+  mountPreservingInput();
+  let results = [];
+  try { results = await api(`/users/search?q=${encodeURIComponent(q)}`); }
+  catch { /* Keep a readable empty state when offline. */ }
+  if (state.searchQ.trim() !== q || state.me?.id !== account || !state.composeOpen) return;
+  state.peopleResults = Array.isArray(results) ? results : [];
+  state.searching = false;
+  mountPreservingInput();
 }
 
 window.onSearchInput = v => {
@@ -2047,6 +1953,8 @@ window.onSearchInput = v => {
 
 window.onComposerInput = v => {
   state.composerText = String(v || "");
+  if (state.activeRoomId) chatRuntime.draft(state.activeRoomId, state.composerText);
+  resizeComposer();
   if (!state.wsAuthed || !state.activeRoomId || !state.ws) return;
   const hasText = String(v || "").trim().length > 0;
   if (hasText && !typingActive) {
@@ -2090,7 +1998,7 @@ window.addChannel = async () => {
   if (res?.id) { await loadRooms(); await selectRoom(res.id); }
 };
 
-window.backToList = () => { state.activeRoomId = null; state.messages = []; state.editingRoom = false; mount(); };
+window.backToList = (fromRoute = false) => { if (!fromRoute) { const url = new URL(location.href); url.searchParams.delete("room"); history.pushState({}, "", url); }  saveWebDraft(); ++roomRequestId; state.activeRoomId = null; state.messages = []; state.roomMembers = []; state.activeDmPeer = null; state.editingRoom = false; state.uiMenu = null; mount(); };
 
 // --- Profile ---
 window.showMyProfile = () => {
@@ -2179,9 +2087,9 @@ window.changePassword = async () => {
     alert("Пароль слишком короткий");
     return;
   }
-  const res = await api("/me/password", { 
-    method: "PUT", 
-    body: JSON.stringify({ new_password: newPass }) 
+  const res = await api("/me/password", {
+    method: "PUT",
+    body: JSON.stringify({ new_password: newPass })
   });
   if (res?.ok) {
     alert("Пароль изменен! Перезайдите в аккаунт.");
@@ -2531,50 +2439,32 @@ window.copySafetyNumber = async () => {
 };
 
 // --- Push Notifications ---
-async function initServiceWorker() {
-  if (!('serviceWorker' in navigator)) {
-    return;
-  }
-
-  try {
-    const registration = await navigator.serviceWorker.register('/sw.js');
-    state.serviceWorkerRegistration = registration;
-
-    // Check notification permission
-    state.notificationsPermission = Notification.permission;
-    state.notificationsEnabled = Notification.permission === 'granted';
-
-    // Update UI
-    mount();
-  } catch (err) {
-    console.error('Service Worker registration failed:', err);
-  }
-}
-
-window.requestNotificationPermission = async () => {
-  if (!('Notification' in window)) {
-    alert('Ваш браузер не поддерживает уведомления');
-    return;
-  }
-
-  try {
-    const permission = await Notification.requestPermission();
+const webNotifications = createWebNotifications({
+  api, activeRoom: () => state.activeRoomId,
+  status({ enabled, permission, registration }) {
+    state.notificationsEnabled = enabled;
     state.notificationsPermission = permission;
-    state.notificationsEnabled = permission === 'granted';
-
-    if (permission === 'granted') {
-      // Show test notification
-      showNotification('Уведомления включены', 'Вы будете получать уведомления о новых сообщениях');
-    } else if (permission === 'denied') {
-      alert('Уведомления заблокированы. Разрешите их в настройках браузера.');
-    }
-
-    mount();
-  } catch (err) {
-    console.error('Failed to request notification permission:', err);
-    alert('Ошибка запроса разрешения на уведомления');
-  }
+    state.serviceWorkerRegistration = registration;
+    const node = $('#notificationSettingStatus');
+    if (node) node.textContent = enabled ? 'Включены — нажмите, чтобы отключить' : 'Включить в этом браузере';
+  },
+});
+async function initServiceWorker() {
+  try { await webNotifications.start(); } catch { /* Settings offers an explicit retry. */ }
+}
+window.requestNotificationPermission = async () => {
+  try { await webNotifications.toggle(); mountPreservingInput(); }
+  catch (error) { alert(error.message || 'Не удалось включить уведомления'); }
 };
+window.testWebNotification = async () => {
+  try { await webNotifications.test(); } catch (error) { alert(error.message); }
+};
+navigator.serviceWorker?.addEventListener('message', event => {
+  if (event.data?.type === 'PUSH_SUBSCRIPTION_CHANGED' && state.me) void initServiceWorker();
+  if (event.data?.type === 'OPEN_ROOM' && event.data.roomId && state.me) {
+    if (state.rooms.some(room => room.id === event.data.roomId)) window.selectRoom(event.data.roomId);
+  }
+});
 
 function showNotification(title, body, data = {}) {
   if (!state.notificationsEnabled || !state.serviceWorkerRegistration) return;
@@ -2584,8 +2474,8 @@ function showNotification(title, body, data = {}) {
 
   state.serviceWorkerRegistration.showNotification(title, {
     body: body,
-    icon: '/favicon.png',
-    badge: '/favicon.png',
+    icon: '/icons/app-192.png',
+    badge: '/icons/notification-96.png',
     tag: data.tag || 'message',
     data: data,
     requireInteraction: false,
@@ -2594,6 +2484,7 @@ function showNotification(title, body, data = {}) {
 }
 
 function notifyNewMessage(message, room) {
+  if (webNotifications.subscribed()) return;
   if (!state.notificationsEnabled) return;
   if (document.hasFocus() && state.activeRoomId === room.id) return;
 
@@ -2759,7 +2650,7 @@ window.showAddMemberModal = () => {
     position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:10000;
     display:flex;align-items:center;justify-content:center;
   `;
-  
+
   // Get users from existing DMs
   const existingUsers = state.rooms
     .filter(r => r.kind === 'dm')
@@ -2773,12 +2664,12 @@ window.showAddMemberModal = () => {
       } : null;
     })
     .filter(Boolean);
-  
+
   modal.innerHTML = `
     <div style="background:var(--bg);border-radius:12px;padding:20px;max-width:500px;max-height:70vh;overflow:auto;width:90%;">
       <h3>Добавить участников</h3>
       <div style="margin-bottom:15px;">
-        <input type="text" id="memberSearch" placeholder="Поиск пользователей..." 
+        <input type="text" id="memberSearch" placeholder="Поиск пользователей..."
                style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text);">
       </div>
       <div id="memberList" style="max-height:300px;overflow-y:auto;margin-bottom:15px;">
@@ -2801,16 +2692,16 @@ window.showAddMemberModal = () => {
       </div>
     </div>
   `;
-  
+
   document.body.appendChild(modal);
-  
+
   // Add search functionality
   const searchInput = modal.querySelector('#memberSearch');
   const memberList = modal.querySelector('#memberList');
-  
+
   searchInput?.addEventListener('input', async (e) => {
     const query = e.target.value.trim();
-    
+
     if (query.length < 2) {
       // Show existing users if query is too short
       memberList.innerHTML = existingUsers.map(u => `
@@ -2827,11 +2718,11 @@ window.showAddMemberModal = () => {
       `).join('');
       return;
     }
-    
+
     try {
       // Search users via API
       const searchResults = await api(`/users/search?q=${encodeURIComponent(query)}`);
-      
+
       memberList.innerHTML = searchResults.map(u => `
         <div style="display:flex;align-items:center;gap:10px;padding:8px;border:1px solid var(--line);border-radius:6px;margin-bottom:5px;">
           <input type="checkbox" id="check-${u.id}" value="${u.id}" style="cursor:pointer;">
@@ -2849,7 +2740,7 @@ window.showAddMemberModal = () => {
       memberList.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted);">Ошибка поиска</div>';
     }
   });
-  
+
   // Show existing users initially
   if (searchInput) {
     searchInput.value = '';
@@ -2866,19 +2757,19 @@ window.addSelectedMembers = async () => {
   const modal = document.getElementById('addMemberModal');
   const searchInput = modal?.querySelector('#memberSearch');
   const query = searchInput?.value.trim();
-  
+
   // Legacy mass-add shortcut disabled for safety.
   if (false) {
     try {
-      const result = await api(`/rooms/${state.activeRoomId}/members`, { 
-        method: "POST", 
-        body: JSON.stringify({ username: query }) 
+      const result = await api(`/rooms/${state.activeRoomId}/members`, {
+        method: "POST",
+        body: JSON.stringify({ username: query })
       });
-      
+
       closeAddMemberModal();
       state.roomMembers = await api(`/rooms/${state.activeRoomId}/members`) || [];
       mount();
-      
+
       if (result.command) {
         alert(`Добавлено ${result.added || 0} пользователей`);
       } else {
@@ -2890,29 +2781,29 @@ window.addSelectedMembers = async () => {
     }
     return;
   }
-  
+
   // Normal user selection flow
   const checkboxes = modal?.querySelectorAll('input[type="checkbox"]:checked');
-  
+
   if (!checkboxes || checkboxes.length === 0) {
     alert('Выберите хотя бы одного пользователя');
     return;
   }
-  
+
   const userIds = Array.from(checkboxes).map(cb => cb.value);
-  
+
   try {
     for (const userId of userIds) {
-      await api(`/rooms/${state.activeRoomId}/members`, { 
-        method: "POST", 
-        body: JSON.stringify({ user_id: userId }) 
+      await api(`/rooms/${state.activeRoomId}/members`, {
+        method: "POST",
+        body: JSON.stringify({ user_id: userId })
       });
     }
-    
+
     closeAddMemberModal();
     state.roomMembers = await api(`/rooms/${state.activeRoomId}/members`) || [];
     mount();
-    alert(`Добавлено ${userIds.length} участников`);
+    alert(`Добавлено: ${userIds.length} ${plural(userIds.length, 'участник', 'участника', 'участников')}`);
   } catch (error) {
     console.error('Add members error:', error);
     alert('Ошибка добавления: ' + (error.message || 'неизвестная ошибка'));
@@ -2956,15 +2847,19 @@ window.cancelEdit = () => {
   }, 50);
 };
 
-window.deleteMessage = async (msgId) => {
-  if (!confirm("Удалить сообщение?")) return;
-  await api(`/rooms/${state.activeRoomId}/messages/${msgId}`, { method: "DELETE" });
-  state.messages = state.messages.filter(m => m.id !== msgId);
-  if (state.editMessage?.id === msgId) state.editMessage = null;
-  render();
+window.deleteMessage = async msgId => {
+  if (!confirm('Удалить сообщение у всех участников?')) return;
+  const roomId = state.activeRoomId, account = state.me?.id;
+  try {
+    const result = await api(`/rooms/${roomId}/messages/${msgId}`, { method: 'DELETE' });
+    if (!result?.ok) throw new Error('Не удалось удалить сообщение');
+    await chatRuntime.local()?.removeMessage(roomId, msgId);
+    if (account === state.me?.id && roomId === state.activeRoomId) { state.messages = state.messages.filter(m => m.id !== msgId); if (state.editMessage?.id === msgId) state.editMessage = null; render(); }
+  } catch (error) { toast(userError(error)); }
 };
 
 // Global error handler
+window.alert = message => toast(message);
 window.addEventListener('error', (event) => {
   console.error('Global error:', event.error);
   alert('Произошла ошибка: ' + (event.error?.message || 'неизвестная ошибка'));
@@ -2976,11 +2871,190 @@ window.addEventListener('unhandledrejection', (event) => {
   alert('Произошла ошибка: ' + (event.reason?.message || 'неизвестная ошибка'));
 });
 
+const webDrafts = new Map();
+const chatRuntime = createChatRuntime({ state, request: api, decode: decodeForWeb, buildText: buildTextMessage,
+  mount, refresh: mountPreservingInput, render: renderMessages, report: toast, drafts: webDrafts, loadRooms });
+async function decodeForWeb(roomId, message) {
+  const decoded = { ...message };
+  if(message.type!=='text' && message.meta?.caption_message)decoded.text=await decryptMsg(roomId,{...message.meta.caption_message,room_id:roomId,sender_id:message.sender_id,type:'text',id:message.id+'-caption'});
+  if (message.type === 'text') decoded._text = await decryptMsg(roomId, message);
+  if (message.reply_to) {
+    const preview = message.meta?.reply_preview;
+    const original = state.messages.find(m => m.id === message.reply_to.id);
+    let text = original?._text;
+    if (preview) text = await decryptMsg(roomId, { ...preview, type: 'text', room_id: roomId, sender_id: message.sender_id, id: message.id + '-reply' });
+    decoded.reply_to = { ...message.reply_to, sender_name: message.reply_to.sender_name || message.reply_to.sender_display_name || message.reply_to.sender_username || 'Пользователь', text: text ?? (preview ? 'Ответ на сообщение' : message.reply_to.text || 'Вложение') };
+  }
+  return decoded;
+}
+const webMediaUrls = new Map();
+const webMedia = createMediaController({ context: () => ({ userId: state.me?.id, roomId: state.activeRoomId, title: state.rooms.find(r => r.id === state.activeRoomId)?.other_display_name || state.rooms.find(r => r.id === state.activeRoomId)?.title || 'Переписка', store: chatRuntime.local() }),
+  enqueue: options => chatRuntime.enqueue(options), report: toast,
+  encryptFile: async (file, roomId) => {
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']), iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, await file.arrayBuffer());
+    const wrapped = await buildTextMessage(roomId, state.rooms.find(r => r.id === roomId), JSON.stringify({ key: bytesToBase64(new Uint8Array(await crypto.subtle.exportKey('raw', key))), iv: bytesToBase64(iv) }));
+    if (!wrapped.meta?.encrypted && !wrapped.meta?.e2e_group) throw new Error('Не удалось защитить ключ вложения. Повторите попытку.');
+    return { file: new File([data], 'attachment.bin', { type: 'application/octet-stream' }), kind: 'file', meta: { media_encryption: { v: 2, key_message: wrapped, name: file.name, mime: file.type || 'application/octet-stream', size: file.size } } };
+  }
+});
+async function resolveWebMedia(message) {
+  const info = message.meta?.media_encryption, uri = '/api/media/' + encodeURIComponent(message.media_id);
+  if (!info) return { url: uri, mime: message.media_mime, name: message.meta?.filename || '67chat-media' };
+  const account = state.me?.id, cacheId = account + ':' + message.media_id;
+  if (webMediaUrls.has(cacheId)) return webMediaUrls.get(cacheId);
+  const text = await decryptMsg(message.room_id, { ...info.key_message, room_id: message.room_id, sender_id: message.sender_id, id: message.id + '-file-key', type: 'text' });
+  let secret; try { secret = JSON.parse(text); } catch { throw new Error('Ключ вложения недоступен на этом устройстве'); }
+  const response = await fetch(uri, { credentials: 'include' }); if (!response.ok) throw new Error('Не удалось загрузить вложение');
+  const key = await crypto.subtle.importKey('raw', base64ToBytes(secret.key), { name: 'AES-GCM' }, false, ['decrypt']);
+  const data = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToBytes(secret.iv) }, key, await response.arrayBuffer());
+  if (account !== state.me?.id) throw new Error('Сессия завершена');
+  const result = { url: URL.createObjectURL(new Blob([data], { type: info.mime })), mime: info.mime, name: info.name }; webMediaUrls.set(cacheId, result); return result;
+}
+window.openWebMedia = id => { const message = state.messages.find(m => m.id === id); if (message) void webMedia.openViewer(message, state.messages, resolveWebMedia).catch(e => toast(userError(e))); };
+async function hydrateVisibleMedia() {
+  if (!state.autoDownload) return;
+  const account = state.me?.id;
+  for (const node of document.querySelectorAll('[data-encrypted-media]')) {
+    if (node.dataset.loading || node.getBoundingClientRect().top > innerHeight + 500) continue;
+    const message = state.messages.find(m => m.id === node.dataset.encryptedMedia); if (!message) continue;
+    node.dataset.loading = 'yes';
+    try { const result = await resolveWebMedia(message); if (!node.isConnected || account !== state.me?.id) return;
+      if (result.mime?.startsWith('image/')) { const image = document.createElement('img'); image.className = 'media-image'; image.src = result.url; image.alt = message.text || 'Фотография'; node.replaceChildren(image); }
+    } catch { node.dataset.loading = ''; }
+  }
+}
+const folderManager = createFolderManager({ state, request: api, refresh: async () => { await loadRooms(); await mountPreservingInput(); }, openRoom: (...args) => window.selectRoom(...args), report: toast });
+window.openSavedMessages = folderManager.saved;
+window.editChatFolder = folderManager.edit;
+window.selectChatFolder = id => { state.selectedFolder = id; state.archiveOpen = false; mountPreservingInput(); };
+const chatActions = createChatActions({ state, request: api, runtime: chatRuntime, report: toast, mount: mountPreservingInput, buildText: buildTextMessage, decrypt: decryptMsg, openViewer: (message, list) => webMedia.openViewer(message, list, resolveWebMedia) });
+window.openRoomActions = chatActions.roomMenu;
+window.setChatPreference = (id, change) => chatActions.preference(id, change);
+window.toggleMessageSelection = chatActions.select;
+window.clearMessageSelection = () => { state.selectedMessages.clear(); mountPreservingInput(); };
+window.selectMessageIfNeeded = (id, event) => { if (state.selectedMessages.size) { event.preventDefault(); event.stopPropagation(); chatActions.select(id); } };
+window.copySelectedMessages = chatActions.copySelected;
+window.deleteSelectedMessages = chatActions.removeSelected;
+window.forwardSelectedMessages = () => chatActions.forward([...state.selectedMessages]);
+window.openSharedMedia = () => void chatActions.sharedMedia().catch(e => toast(userError(e)));
+window.retryQueuedMessage = id => void chatRuntime.retry(id).catch(e => toast(userError(e)));
+window.cancelQueuedMessage = id => void chatRuntime.cancel(id).catch(e => toast(userError(e)));
+window.loadOlderMessages = () => void chatRuntime.older();
+window.jumpToLatest = async () => { if (state.chatHistory?.has_newer) await chatRuntime.open(state.activeRoomId, { latest: true }); const box = $('#msgs'); if (box) box.scrollTop = box.scrollHeight; state.newMessages = 0; };
+window.cancelHistorySearch = () => chatRuntime.cancelSearch();
+window.stateRoomId = () => state.activeRoomId;
+window.openMessageMenu = (id, event) => {
+  event.preventDefault(); event.stopPropagation();
+  $('#messageActions')?.remove();
+  const message = state.messages.find(item => item.id === id);
+  const bubble = document.getElementById('msg-' + id);
+  if (!message || !bubble) return;
+  const rect = bubble.getBoundingClientRect();
+  const menu = document.createElement('div');
+  menu.id = 'messageActions'; menu.className = 'message-actions'; menu.setAttribute('role', 'menu');
+  const add = (label, action, danger = false) => {
+    const button = document.createElement('button');
+    button.textContent = label; button.type = 'button'; button.setAttribute('role', 'menuitem');
+    if (danger) button.className = 'danger-text';
+    button.onclick = async e => { e.stopPropagation(); menu.remove(); try { await action(); } catch { alert('Не удалось выполнить действие. Повторите попытку.'); } };
+    menu.appendChild(button);
+  };
+  add('Выделить', () => chatActions.select(id));
+  add('Переслать', () => chatActions.forward([id]));
+  add('Ответить', () => window.replyToMessage(id));
+  add('Поставить реакцию', () => window.showReactionPicker(id, { target: bubble, stopPropagation() {} }));
+  if (message._text || message.text) add('Копировать текст', () => navigator.clipboard.writeText(message._text || message.text));
+  if (message.sender_id === state.me.id) {
+    if (message.type === 'text') add('Изменить', () => window.startEditMessage(id));
+    add('Удалить', () => window.deleteMessage(id), true);
+  }
+  menu.style.left = Math.max(8, Math.min(innerWidth - 238, event.clientX || rect.left)) + 'px';
+  menu.style.top = Math.max(8, Math.min(innerHeight - menu.children.length * 44 - 20, event.clientY || rect.bottom)) + 'px';
+  document.body.appendChild(menu);
+  menu.querySelector('button')?.focus({ preventScroll: true });
+};
+function saveWebDraft() {
+  if (state.activeRoomId && $('#inp')) chatRuntime.draft(state.activeRoomId, $('#inp').value);
+}
+function resizeComposer() {
+  const input = $('#inp');
+  if (!input) return;
+  input.style.height = '40px';
+  input.style.height = Math.min(120, Math.max(40, input.scrollHeight)) + 'px';
+}
+window.openNewChat = () => {
+  saveWebDraft(); state.composeOpen = true; state.settingsOpen = false; state.uiMenu = null;
+  if (innerWidth <= 900) { ++roomRequestId; state.activeRoomId = null; }
+  mount(); requestAnimationFrame(() => $('#peopleSearch')?.focus());
+};
+window.openChatList = () => { state.composeOpen = false; state.settingsOpen = false; state.uiMenu = null; mountPreservingInput(); };
+window.openWebSettings = () => { state.composeOpen = false; state.settingsOpen = true; state.uiMenu = null; mountPreservingInput(); };
+window.setWebTheme = theme => { state.themeMode = theme; state.darkTheme = theme === 'dark' || (theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches); localStorage.setItem('themeMode', theme); localStorage.setItem('theme', state.darkTheme ? 'dark' : 'light'); mountPreservingInput(); };
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (state.themeMode === 'system') { applyTheme(); void mountPreservingInput(); } });
+window.setMessageFontSize = value => { state.fontSize = Math.max(12, Math.min(24, Number(value))); localStorage.setItem('messageFontSize', state.fontSize); applyTheme(); };
+window.setAutoDownload = value => { state.autoDownload = !!value; localStorage.setItem('autoDownload', value ? 'yes' : 'no'); void hydrateVisibleMedia(); };
+window.openArchive = () => { saveWebDraft(); state.archiveOpen = !state.archiveOpen; state.settingsOpen = false; if (innerWidth <= 900) state.activeRoomId = null; mountPreservingInput(); };
+window.toggleWebMenu = (menu, event) => {
+  event.stopPropagation();
+  state.uiMenu = state.uiMenu === menu ? null : menu;
+  mountPreservingInput();
+  if (state.uiMenu) requestAnimationFrame(() => $('.web-popover button')?.focus());
+};
+window.closeWebMenu = () => { state.uiMenu = null; mountPreservingInput(); };
+document.addEventListener('click', event => {
+  const actions = $('#messageActions');
+  if (actions && !actions.contains(event.target) && !event.target.closest('.message-menu-trigger')) actions.remove();
+  if (state.uiMenu && !event.target.closest('.web-popover') && !event.target.closest('#accountMenuToggle,#chatMenuToggle')) window.closeWebMenu();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') {
+    if (state.uiMenu) { const target = state.uiMenu === 'chat' ? 'chatMenuToggle' : 'accountMenuToggle'; window.closeWebMenu(); requestAnimationFrame(() => document.getElementById(target)?.focus()); }
+    $('#messageActions')?.remove(); $('#reactionPicker')?.remove();
+  }
+  const menu = event.target.closest('.web-popover,.message-actions');
+  if (menu && ['ArrowDown','ArrowUp'].includes(event.key)) {
+    event.preventDefault(); const buttons = [...menu.querySelectorAll('button')];
+    buttons[(buttons.indexOf(document.activeElement) + (event.key === 'ArrowDown' ? 1 : buttons.length - 1)) % buttons.length]?.focus();
+  }
+});
+function updateChatPresence() {
+  const room = state.rooms.find(item => item.id === state.activeRoomId);
+  const node = $('#chatPresence');
+  const typing = Object.values(state.typingByRoom[state.activeRoomId] || {});
+  if (node) {
+    node.textContent = typing.length ? (typing.length === 1 ? `${typing[0]} печатает…` : 'Несколько человек печатают…') : room?.kind === 'dm' ? presenceLabel(state.activeDmPeer) : `${state.roomMembers.length} участников`;
+    node.classList.toggle('online', !!typing.length || !!state.activeDmPeer?.online);
+  }
+  const connection = $('#webConnection');
+  if (connection) { connection.hidden = state.wsAuthed; connection.textContent = navigator.onLine ? 'Подключение…' : 'Нет сети'; }
+}
+let refreshingPresence = false;
+async function refreshWebPresence() {
+  if (refreshingPresence || document.hidden || !state.me) return;
+  const room = state.rooms.find(item => item.id === state.activeRoomId), account = state.me.id;
+  if (room?.kind !== 'dm' || !room.other_user_id) return;
+  refreshingPresence = true;
+  try {
+    const peer = await api(`/users/${room.other_user_id}`);
+    if (state.activeRoomId === room.id && state.me?.id === account) { state.activeDmPeer = peer; updateChatPresence(); }
+  } catch { /* Next foreground/poll retries without interrupting text entry. */ }
+  finally { refreshingPresence = false; }
+}
+setInterval(refreshWebPresence, 25000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) void refreshWebPresence(); });
+window.addEventListener('online', updateChatPresence);
+window.addEventListener('offline', updateChatPresence);
+
 // --- Main UI ---
+let parkedMessages = null;
 async function mount() {
   applyTheme();
   const root = $("#app");
-  
+  const previous = $('#msgs');
+  if (previous?.dataset.roomId && state.me) { previous.remove(); parkedMessages={roomId:previous.dataset.roomId,account:state.me.id,node:previous}; }
+  if (!state.me || parkedMessages?.account!==state.me.id || parkedMessages?.roomId!==state.activeRoomId) parkedMessages=null;
+
   // Admin panel
   if (state.adminPanel) {
     root.innerHTML = renderAdminPanel();
@@ -3010,194 +3084,28 @@ async function mount() {
     root.innerHTML = renderProfileModal();
     return;
   }
-  
+
   // Room settings modal
   if (state.editingRoom && state.activeRoomId) {
     root.innerHTML = renderRoomSettings();
     return;
   }
-  
+
   if (!state.me) {
-    root.innerHTML = `
-      <div class="shell">
-        <div class="card" style="margin:auto; max-width:520px;">
-          <div class="topbar"><div class="brand"><span class="badge">67</span> <span>Вход</span></div></div>
-          <div class="pad col">
-            <input class="input" id="u" placeholder="Username" autocomplete="username">
-            <input class="input" id="p" type="password" placeholder="Password" autocomplete="current-password">
-            <div id="captcha-container" style="display:none;margin:10px 0;">
-              <div class="h-captcha" data-sitekey="11dc04d6-78e8-44f8-9814-c5c032fc68be" data-callback="onCaptchaSuccess"></div>
-            </div>
-            <div class="row">
-              <button class="btn primary" onclick="login()">Войти</button>
-              <button class="btn" onclick="showRegister()">Регистрация</button>
-            </div>
-          </div>
-        </div>
-      </div>`;
+    root.innerHTML = renderLogin();
     return;
   }
-
-  // Prepare chat header
-  let chatTitle = "Чат";
-  let chatSubtitle = "";
-  let chatAvatar = null;
-  
-  if (state.activeRoomId) {
-    const room = state.rooms.find(r => r.id === state.activeRoomId);
-    const members = state.roomMembers || [];
-    const others = members.filter(m => m.id !== state.me.id);
-    const typingMap = state.typingByRoom[state.activeRoomId] || {};
-    const typingUsers = Object.values(typingMap);
-
-    if (room) {
-      if (room.kind === "dm" && others.length === 1) {
-        chatTitle = displayName(others[0]);
-        chatAvatar = avatarUrl(others[0].avatar_id);
-      } else if (room.kind === "channel") {
-        chatTitle = "📢 " + (room.title || "Канал");
-        chatAvatar = avatarUrl(room.avatar_id);
-      } else {
-        chatTitle = room.title || "Группа";
-        chatAvatar = avatarUrl(room.avatar_id);
-      }
-    }
-
-    if (typingUsers.length) {
-      chatSubtitle = typingUsers.length === 1 ? `${typingUsers[0]} печатает…` : "Несколько печатают…";
-    } else if (room?.kind === "dm" && others.length === 1) {
-      const u = others[0];
-      if (u.online) chatSubtitle = "онлайн";
-      else if (u.last_seen) {
-        const d = new Date(u.last_seen);
-        chatSubtitle = `был(а) ${d.toLocaleDateString()} ${d.toLocaleTimeString().slice(0,5)}`;
-      }
-    } else if (others.length > 0) {
-      chatSubtitle = `${members.length} участников`;
-    }
-  }
-
-  const shellClass = state.activeRoomId ? "show-chat" : "show-list";
-  root.innerHTML = `
-    <div class="shell ${shellClass}">
-      <div class="card sidebar">
-        <div class="topbar">
-          <div class="brand clickable" onclick="showMyProfile()">
-            ${state.me.avatar_id ? `<img class="avatar-sm" src="${avatarUrl(state.me.avatar_id)}" alt="">` : `<span class="badge">67</span>`}
-            <div>
-              <div>${escapeHtml(displayName(state.me))}</div>
-              <div class="mini">@${state.me.username}</div>
-            </div>
-          </div>
-          <div class="row">
-            <button class="btn" onclick="toggleTheme()" title="Тема">${state.darkTheme ? '☀️' : '🌙'}</button>
-            ${state.notificationsPermission === 'granted' ? `<button class="btn" title="Уведомления включены">🔔</button>` : state.notificationsPermission === 'denied' ? `<button class="btn" onclick="requestNotificationPermission()" title="Уведомления заблокированы">🔕</button>` : `<button class="btn" onclick="requestNotificationPermission()" title="Включить уведомления">🔔</button>`}
-            <button class="btn" onclick="openBackupPanel()" title="Бэкап ключей">🔑</button>
-            <button class="btn" onclick="openSessionsPanel()" title="Активные сессии">📱</button>
-            <button class="btn" onclick="openCreateRoom('group')" title="Группа">+</button>
-            <button class="btn" onclick="openCreateRoom('channel')" title="Канал">📢</button>
-            <button class="btn danger" onclick="logout()">Выход</button>
-          </div>
-        </div>
-        <div class="pad" style="border-bottom:1px solid var(--line);">
-          <input class="input" id="searchInput" placeholder="Поиск..." value="${(state.searchQ||"").replaceAll('"','&quot;')}" oninput="onSearchInput(this.value)">
-          ${state.searching ? `<div class="mini" style="margin-top:8px;">поиск...</div>` : ``}
-          ${state.searchResults.length ? `
-            <div class="list" style="padding:8px 0 0 0; gap:6px;">
-              ${state.searchResults.map(u => `
-                <div class="item" onclick="startDM('${escapeJsSingleQuoted(u.username)}')">
-                  <div class="avatar-wrap">${u.avatar_id ? `<img class="avatar-sm" src="${avatarUrl(u.avatar_id)}">` : `<div class="avatar-placeholder"></div>`}</div>
-                  <div class="itemText">
-          <div class="title">${escapeHtml(displayName(u))}</div>
-                    <div class="meta">@${escapeHtml(u.username)}</div>
-                  </div>
-                </div>
-              `).join("")}
-            </div>
-          ` : ``}
-        </div>
-        <div class="list room-list" id="roomList">
-          ${state.rooms.map(r => renderRoomItem(r)).join("")}
-        </div>
-      </div>
-
-      <div class="card main">
-        ${state.activeRoomId ? `
-          <div class="chatHead">
-            ${(() => {
-              const room = state.rooms.find(r=>r.id===state.activeRoomId);
-              const isGroup = room?.kind === 'group';
-              const isChannel = room?.kind === 'channel';
-              const otherMember = isGroup || isChannel ? null : (state.roomMembers || []).find(m => m.id !== state.me?.id);
-              const onHeaderClick = isGroup || isChannel ? 'openRoomSettings()' : (otherMember ? `showProfile('${otherMember.id}')` : '');
-              return `
-            <div class="row clickable" onclick="${onHeaderClick}">
-              <button class="btn back" onclick="backToList();event.stopPropagation();">←</button>
-              ${chatAvatar ? `<img class="avatar-md" src="${chatAvatar}" alt="">` : `<div class="avatar-placeholder-md"></div>`}
-              <div class="chatTitle">
-                <div>${escapeHtml(chatTitle)}</div>
-                ${chatSubtitle ? `<div class="mini">${escapeHtml(chatSubtitle)}</div>` : ``}
-              </div>
-            </div>`;
-            })()}
-            <div class="row">
-              ${(() => {
-                const room = state.rooms.find(r=>r.id===state.activeRoomId);
-                // Only allow calls in DM, not in groups/channels
-                return room?.kind === "dm" ? `
-                  <button class="btn" onclick="startRoomCall(false)" title="Аудио звонок">📞</button>
-                  <button class="btn" onclick="startRoomCall(true)" title="Видео звонок">📹</button>
-                ` : "";
-              })()}
-              <button class="btn" onclick="toggleSearch()" title="Поиск по сообщениям">🔍</button>
-            </div>
-          </div>
-          ${state.searchMode ? `
-            <div class="searchBar">
-              <input
-                type="text"
-                id="searchInput"
-                class="input"
-                placeholder="Поиск по сообщениям..."
-                value="${escapeHtml(state.searchQuery)}"
-                oninput="searchMessages(this.value)"
-              />
-              <div class="searchControls">
-                ${state.searchResults.length > 0 ? `
-                  <span class="searchCounter">${state.currentSearchIndex + 1} / ${state.searchResults.length}</span>
-                  <button class="btn" onclick="prevSearchResult()" title="Предыдущий">↑</button>
-                  <button class="btn" onclick="nextSearchResult()" title="Следующий">↓</button>
-                ` : state.searchQuery.length >= 2 ? `
-                  <span class="searchCounter">Ничего не найдено</span>
-                ` : ''}
-                <button class="btn" onclick="toggleSearch()" title="Закрыть">✕</button>
-              </div>
-            </div>
-          ` : ''}
-          <div id="msgs" class="messages"></div>
-          ${(() => {
-            const room = state.rooms.find(r=>r.id===state.activeRoomId);
-            return renderComposeArea(room);
-          })()}
-        ` : `
-          <div class="pad empty-state">
-            <div class="title">Выбери чат</div>
-            <div class="hint">или начни новый через поиск</div>
-          </div>
-        `}
-      </div>
-    </div>
-    
-    ${state.createRoomMode ? renderCreateRoomModal() : ''}
-  `;
-
+  root.innerHTML = renderMessengerShell(state, renderComposeArea) +
+    (state.createRoomMode ? renderCreateRoomModal() : '');
+  if(parkedMessages && $('#msgs')) $('#msgs').replaceWith(parkedMessages.node);
   if (state.activeRoomId) render();
+  resizeComposer();
 }
 
 function renderCreateRoomModal() {
   const isGroup = state.createRoomMode === 'group';
   const title = isGroup ? 'Создать группу' : 'Создать канал';
-  
+
   return `
     <div class="modal-overlay create-room-modal" onclick="closeCreateRoom()">
       <div class="modal" onclick="event.stopPropagation()">
@@ -3207,14 +3115,14 @@ function renderCreateRoomModal() {
         </div>
         <div class="modal-body">
             <input class="input" id="createRoomTitleInput" placeholder="Название..." value="${state.createRoomTitle.replaceAll('"','&quot;')}" oninput="onCreateRoomTitleChange(this.value)">
-          
+
           <div class="create-room-members">
             <div class="mini" style="margin-bottom:8px;">Добавить участников:</div>
             <input class="input" id="createRoomSearchInput" placeholder="Поиск пользователей..." value="${state.createRoomQuery.replaceAll('"','&quot;')}" oninput="onCreateRoomQueryChange(this.value)">
-            
+
             <div id="createRoomResults" class="search-results" style="display:none;"></div>
           </div>
-          
+
           <div id="createRoomSelectedContainer" style="margin-top:16px;${state.createRoomSelected.length ? '' : 'display:none;'}">
             <div class="mini" style="margin-bottom:8px;">Выбрано:</div>
             <div id="createRoomSelected" class="selected-users">
@@ -3237,61 +3145,7 @@ function renderCreateRoomModal() {
 }
 
 function renderRoomItem(r) {
-  const isActive = r.id === state.activeRoomId;
-  let title = r.title || "Чат";
-  let avatar = avatarUrl(r.avatar_id);
-  
-  // For DM, show other user's name from other_* fields
-  if (r.kind === "dm") {
-    // Use the other person's info directly from the query
-    title = r.other_display_name || r.other_username || "Личные сообщения";
-    // Also use other user's avatar if no room avatar
-    if (r.other_avatar_id && !r.avatar_id) {
-      avatar = avatarUrl(r.other_avatar_id);
-    }
-  }
-  
-  let lastMsg = "";
-  const lastMeta = r.last_msg_meta || {};
-  const lastEncrypted = !!r.last_msg_encrypted_content || !!lastMeta.encrypted || !!lastMeta.e2e;
-  if (r._lastText) {
-    const sender = r.last_msg_sender_id === state.me?.id ? "Вы" : (r.last_msg_sender_name || r.last_msg_sender_username || "");
-    const text = r._lastText.length > 30 ? r._lastText.slice(0,30) + "…" : r._lastText;
-    lastMsg = sender ? `${sender}: ${text}` : text;
-  } else if (lastEncrypted && r.last_msg_type === "text") {
-    const sender = r.last_msg_sender_id === state.me?.id ? "Вы" : (r.last_msg_sender_name || r.last_msg_sender_username || "");
-    const text = "🔐 Зашифрованное сообщение";
-    lastMsg = sender ? `${sender}: ${text}` : text;
-  } else if (r.last_msg_text) {
-    const sender = r.last_msg_sender_id === state.me?.id ? "Вы" : (r.last_msg_sender_name || r.last_msg_sender_username || "");
-    const text = r.last_msg_text.length > 30 ? r.last_msg_text.slice(0,30) + "…" : r.last_msg_text;
-    lastMsg = sender ? `${sender}: ${text}` : text;
-  } else if (r.last_msg_type === "voice") {
-    lastMsg = "🎙️ Голосовое";
-  } else if (r.last_msg_type === "video_note") {
-    lastMsg = "⏺️ Кружок";
-  } else if (r.last_msg_type === "media") {
-    lastMsg = "📎 Медиа";
-  }
-
-  const kindLabel = r.kind === "channel" ? "📢 Канал" : r.kind === "dm" ? "Нет сообщений" : "Группа";
-
-  // Unread counter
-  const unreadBadge = r.unread_count > 0 ? `<span class="unread-badge">${r.unread_count > 99 ? '99+' : r.unread_count}</span>` : '';
-
-  return `
-    <div class="item ${isActive ? "active" : ""}" onclick="selectRoom('${r.id}')">
-      <div class="avatar-wrap">${avatar ? `<img class="avatar-sm" src="${avatar}">` : `<div class="avatar-placeholder"></div>`}</div>
-      <div class="itemText">
-        <div class="title">${r.kind === "channel" ? "📢 " : ""}${title}</div>
-        <div class="meta">${lastMsg || kindLabel}</div>
-      </div>
-      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:2px;">
-        ${r.last_msg_at ? `<div class="itemTime">${new Date(r.last_msg_at).toLocaleTimeString().slice(0,5)}</div>` : ""}
-        ${unreadBadge}
-      </div>
-    </div>
-  `;
+  return renderRoomRow(r, { ...state.me, activeRoomId: state.activeRoomId });
 }
 
 function renderProfileModal() {
@@ -3552,9 +3406,9 @@ function renderSessionsPanel() {
                 <div class="session-item current">
                   <div class="session-icon">${getDeviceIcon(currentSession.deviceType)}</div>
                   <div class="session-info">
-                    <div class="session-name">${escapeHtml(currentSession.deviceName)}</div>
+                    <div class="session-name">${escapeHtml(String(currentSession.deviceName || 'Устройство').replace(/^Unknown on /,'').replace(/^Unknown(?: Device)?$/,'Неизвестное устройство'))}</div>
                     <div class="session-details">
-                      <span class="session-ip">${currentSession.ipAddress || 'Unknown IP'}</span>
+                      <span class="session-ip">${currentSession.ipAddress || 'IP не определён'}</span>
                       <span class="session-activity">${formatLastActivity(currentSession.lastActivity)}</span>
                     </div>
                     <div class="session-created">Создана: ${new Date(currentSession.createdAt).toLocaleString()}</div>
@@ -3576,9 +3430,9 @@ function renderSessionsPanel() {
                   <div class="session-item">
                     <div class="session-icon">${getDeviceIcon(s.deviceType)}</div>
                     <div class="session-info">
-                      <div class="session-name">${escapeHtml(s.deviceName)}</div>
+                      <div class="session-name">${escapeHtml(String(s.deviceName || 'Устройство').replace(/^Unknown on /,'').replace(/^Unknown(?: Device)?$/,'Неизвестное устройство'))}</div>
                       <div class="session-details">
-                        <span class="session-ip">${s.ipAddress || 'Unknown IP'}</span>
+                        <span class="session-ip">${s.ipAddress || 'IP не определён'}</span>
                         <span class="session-activity">${formatLastActivity(s.lastActivity)}</span>
                       </div>
                       <div class="session-created">Создана: ${new Date(s.createdAt).toLocaleString()}</div>
@@ -3661,9 +3515,9 @@ function renderRoomSettings() {
         </div>
         <div class="profile-info">
           <h2>${isDM ? (members.find(m => m.id !== state.me.id)?.username || "Пользователь") : (room?.title || "Группа")} ${!isDM && canEdit ? `<button class="btn-sm" onclick="updateRoomTitle()">✏️</button>` : ""}</h2>
-          <div class="status">${isDM ? "Личная переписка" : `${members.length} ${room?.kind === "channel" ? "подписчиков" : "участников"}`}</div>
+          <div class="status">${isDM ? "Личная переписка" : `${members.length} ${room?.kind === "channel" ? plural(members.length, 'подписчик', 'подписчика', 'подписчиков') : plural(members.length, 'участник', 'участника', 'участников')}`}</div>
         </div>
-        
+
         ${!isDM ? `
         <div class="members-section">
           <div class="members-header">
@@ -3693,7 +3547,7 @@ function renderRoomSettings() {
           </div>
         </div>
         ` : ""}
-        
+
         <div class="profile-actions">
           ${isDM ? `<button class="btn danger" onclick="deleteDMChat()">🗑️ Удалить чат</button>` : ""}
           ${!isDM && myRole === "owner" ? `<button class="btn danger" onclick="deleteRoom()">🗑️ Удалить группу</button>` : ""}
@@ -3708,12 +3562,13 @@ function renderRoomSettings() {
 
 function renderComposeArea(room) {
   if (!room) return "";
-  
+  if (state.roomLoading || state.roomLoadError) return '<div class="compose-hint">Переписка загружается</div>';
+
   // Reply preview
   const replyHtml = state.replyTo ? `
     <div class="reply-preview">
       <div class="reply-content">
-        <div class="reply-name">${escapeHtml(state.replyTo.sender_display_name || state.replyTo.sender_username || 'Unknown')}</div>
+        <div class="reply-name">${escapeHtml(state.replyTo.sender_display_name || state.replyTo.sender_username || 'Пользователь')}</div>
         <div class="reply-text">${escapeHtml((state.replyTo.text || '').slice(0, 100))}${(state.replyTo.text || '').length > 100 ? '...' : ''}</div>
       </div>
       <button class="btn-cancel-reply" onclick="cancelReply()">✕</button>
@@ -3732,7 +3587,7 @@ function renderComposeArea(room) {
   if (dmBlocked) {
     return `<div class="compose" style="justify-content:center;color:var(--muted);">${state.activeDmPeer?.blocks_me ? 'Пользователь забанил вас, писать нельзя' : 'Вы забанили пользователя, переписка только для чтения'}</div>`;
   }
-  
+
   if (room.kind !== "channel") {
     // Regular chat - full compose
     return `
@@ -3740,12 +3595,12 @@ function renderComposeArea(room) {
         ${editHtml}
         ${replyHtml}
         <div class="compose">
-          <button class="btn" onclick="triggerFileSelect()">📎</button>
-          <input type="file" id="file" hidden onchange="uploadSelectedFile()">
-          <textarea class="textarea" id="inp" placeholder="Сообщение..." oninput="onComposerInput(this.value)" onkeydown="handleMessageKeydown(event)">${escapeHtml(state.composerText || "")}</textarea>
-          <button class="btn" id="btn_voice" onclick="toggleVoice()">🎙️</button>
-          <button class="btn" id="btn_video_note" onclick="toggleVideoNote()">⏺️</button>
-          <button class="btn primary" onclick="doSend()">➤</button>
+          ${iconButton('attach', 'Прикрепить файл', 'triggerFileSelect()')}
+          <input type="file" id="file" multiple hidden onchange="uploadSelectedFile()">
+          <textarea class="textarea" id="inp" rows="1" aria-label="Сообщение" placeholder="Сообщение..." oninput="onComposerInput(this.value)" onkeydown="handleMessageKeydown(event)">${escapeHtml(state.composerText || "")}</textarea>
+          <button class="icon-button" id="btn_voice" onclick="toggleVoice()" aria-label="Голосовое сообщение" title="Голосовое сообщение">${icon('mic')}</button>
+          <button class="icon-button circle-note-button" id="btn_video_note" onclick="toggleVideoNote()" aria-label="Записать видеокружок" title="Видеокружок">${icon('video')}</button>
+          <button class="icon-button send-button" onclick="doSend()" aria-label="Отправить сообщение" title="Отправить">${icon('send')}</button>
         </div>
       </div>
     `;
@@ -3759,10 +3614,10 @@ function renderComposeArea(room) {
         ${editHtml}
         ${replyHtml}
         <div class="compose">
-          <button class="btn" onclick="triggerFileSelect()">📎</button>
-          <input type="file" id="file" hidden onchange="uploadSelectedFile()">
-          <textarea class="textarea" id="inp" placeholder="Сообщение канала..." oninput="onComposerInput(this.value)" onkeydown="handleMessageKeydown(event)">${escapeHtml(state.composerText || "")}</textarea>
-          <button class="btn primary" onclick="doSend()">➤</button>
+          ${iconButton('attach', 'Прикрепить файл', 'triggerFileSelect()')}
+          <input type="file" id="file" multiple hidden onchange="uploadSelectedFile()">
+          <textarea class="textarea" id="inp" rows="1" aria-label="Сообщение" placeholder="Сообщение канала..." oninput="onComposerInput(this.value)" onkeydown="handleMessageKeydown(event)">${escapeHtml(state.composerText || "")}</textarea>
+          <button class="icon-button send-button" onclick="doSend()" aria-label="Отправить сообщение" title="Отправить">${icon('send')}</button>
         </div>
       </div>
     `;
@@ -3771,11 +3626,16 @@ function renderComposeArea(room) {
 }
 
 function renderStatus(m) {
+  if (m.delivery) {
+    const labels = { sending: 'Отправляется…', queued: 'Ожидает соединения', failed: 'Не отправлено' };
+    const id = escapeJsSingleQuoted(m.client_message_id);
+    return `<span class="delivery-status" title="${escapeHtml(m.error || '')}">${labels[m.delivery] || ''}</span>${m.delivery === 'failed' ? `<button class="inline-action" onclick="retryQueuedMessage('${id}')">Повторить</button>` : ''}${m.delivery !== 'sending' ? `<button class="inline-action" onclick="cancelQueuedMessage('${id}')">Отменить</button>` : ''}`;
+  }
   // Only show for my messages
   const senderId = String(m.sender_id || "");
   const myId = String(state.me?.id || "");
   if (senderId !== myId) return "";
-  
+
   // Check read_by array for other users
   let readBy = m.read_by;
   // Parse if string (from JSON)
@@ -3783,39 +3643,39 @@ function renderStatus(m) {
     try { readBy = JSON.parse(readBy); } catch { readBy = []; }
   }
   if (!Array.isArray(readBy)) readBy = [];
-  
+
   // Normalize to array of strings
   readBy = readBy.map(x => typeof x === 'string' ? x : String(x));
-  
+
   // Get other members in room (excluding myself)
   const otherMembers = (state.roomMembers || []).filter(x => String(x.id) !== myId);
-  
+
   // Count how many other members have read this message
   const readCount = otherMembers.filter(x => readBy.includes(String(x.id))).length;
   const totalOthers = otherMembers.length;
-  
+
   // Telegram logic:
   // - One checkmark (✓): Message sent to server
   // - Two checkmarks (✓✓): Message delivered to at least one recipient's device
   // - Blue double checkmarks: Message read by all recipients (in our case - read by everyone)
-  
+
   if (totalOthers === 0) {
     // No other members (shouldn't happen in DM/group)
-    return `<span class="msg-status" title="Отправлено">✓</span>`;
+    return `<span class="msg-status" title="Отправлено">${icon('check')}</span>`;
   }
-  
+
   if (readCount === 0) {
     // Not read by anyone yet - show single checkmark
-    return `<span class="msg-status" title="Отправлено">✓</span>`;
+    return `<span class="msg-status" title="Отправлено">${icon('check')}</span>`;
   }
-  
+
   if (readCount >= totalOthers) {
     // Read by everyone - show blue double checkmarks
-    return `<span class="msg-status read" title="Прочитано всеми">✓✓</span>`;
+    return `<span class="msg-status read" title="Прочитано всеми">${icon('checks')}</span>`;
   }
-  
+
   // Read by some but not all - show gray double checkmarks
-  return `<span class="msg-status delivered" title="Доставлено (${readCount}/${totalOthers})">✓✓</span>`;
+  return `<span class="msg-status delivered" title="Прочитано (${readCount}/${totalOthers})">${icon('checks')}</span>`;
 }
 
 function shouldStickToBottom(box) {
@@ -3825,13 +3685,18 @@ function shouldStickToBottom(box) {
 }
 
 function legacyRenderMessages() {
+  updateChatPresence();
   const box = $("#msgs");
   if (!box) return;
+  if (state.roomLoading || state.roomLoadError) {
+    box.innerHTML = state.roomLoadError ? '<div class="list-hint">Не удалось загрузить переписку.<br><button class="btn" onclick="selectRoom(stateRoomId())">Повторить</button></div>' : '<div class="list-hint" role="status">Загрузка сообщений…</div>';
+    return;
+  }
   const stickToBottom = shouldStickToBottom(box);
-  
+
   // Check if current room is DM
   const currentRoom = state.rooms.find(r => r.id === state.activeRoomId);
-  
+
   // Update only messages content, not full UI
   const messagesHtml = state.messages.map(m => {
     const senderId = String(m.sender_id || "");
@@ -3842,7 +3707,7 @@ function legacyRenderMessages() {
     const senderAvatar = m.sender_avatar_id ? avatarUrl(m.sender_avatar_id) : null;
     const safeSenderName = escapeHtml(senderName);
     const safeMsgId = escapeJsSingleQuoted(msgId);
-    
+
     let body = "";
     if (m.type === "voice" && m.media_id) {
       body = `<audio class="media-audio" src="/api/media/${m.media_id}" controls preload="metadata" playsinline></audio>`;
@@ -3863,25 +3728,25 @@ function legacyRenderMessages() {
     } else {
       body = `<div class="bText">${escapeHtml((m._text ?? m.text ?? "").toString())}</div>`;
     }
-    
+
     // In DM: no avatars/names, just bubbles like Telegram
     // In groups: show avatars/names
     const showSenderInfo = !(currentRoom?.kind === "dm") && !mine;
-    
+
     // Check if this message is being replied to
     const isReplyingTo = state.replyTo?.id === msgId;
-    
+
     // Reply preview if this message is a reply
     const replyPreview = m.reply_to ? `
       <div class="reply-reference" onclick="scrollToMessage('${m.reply_to.id}', event)">
         <div class="reply-line"></div>
         <div class="reply-info">
-          <div class="reply-name">${escapeHtml(m.reply_to.sender_name || 'Unknown')}</div>
+          <div class="reply-name">${escapeHtml(m.reply_to.sender_name || 'Пользователь')}</div>
           <div class="reply-text">${escapeHtml((m.reply_to.text || '').slice(0, 60))}${(m.reply_to.text || '').length > 60 ? '...' : ''}</div>
         </div>
       </div>
     ` : '';
-    
+
     // Reactions
     const myId = String(state.me?.id || "");
     const reactions = m.reactions || {};
@@ -3894,13 +3759,13 @@ function legacyRenderMessages() {
         }).join('')}
       </div>
     ` : '';
-    
+
     // Check read status for my messages
     const isRead = mine && m.read_by && m.read_by.length > 0;
     const readStatus = isRead ? (m.read_by.length === 1 ? "✓✓" : "✓") : "";
-    
+
     return `
-      <div class="bubble ${mine ? "me" : ""} ${currentRoom?.kind === "dm" ? 'dm' : ''} ${isReplyingTo ? 'replying-to' : ''}" id="msg-${escapeHtml(msgId)}"
+      <div class="bubble ${mine ? "me" : ""} ${currentRoom?.kind === "dm" ? 'dm' : ''} ${isReplyingTo ? 'replying-to' : ''}" id="msg-${escapeHtml(msgId)}" data-message-id="${escapeHtml(msgId)}"
            ondblclick="replyToMessage('${safeMsgId}', event)"
            ontouchstart="handleTouchStart(event, '${safeMsgId}')"
            ontouchend="handleTouchEnd(event)">
@@ -3915,20 +3780,25 @@ function legacyRenderMessages() {
       </div>
     `;
   }).join("");
-  
+
   box.innerHTML = messagesHtml;
   if (stickToBottom) box.scrollTop = box.scrollHeight;
 }
 
 function legacyRender() {
+  updateChatPresence();
   const box = $("#msgs");
   if (!box) return;
+  if (state.roomLoading || state.roomLoadError) {
+    box.innerHTML = state.roomLoadError ? '<div class="list-hint">Не удалось загрузить переписку.<br><button class="btn" onclick="selectRoom(stateRoomId())">Повторить</button></div>' : '<div class="list-hint" role="status">Загрузка сообщений…</div>';
+    return;
+  }
   const stickToBottom = shouldStickToBottom(box);
-  
+
   // Check if current room is DM
   const currentRoom = state.rooms.find(r => r.id === state.activeRoomId);
   const isDM = currentRoom?.kind === "dm";
-  
+
   box.innerHTML = state.messages.map(m => {
     const senderId = String(m.sender_id || "");
     const msgId = String(m.id || "");
@@ -3938,7 +3808,7 @@ function legacyRender() {
     const senderAvatar = m.sender_avatar_id ? avatarUrl(m.sender_avatar_id) : null;
     const safeSenderName = escapeHtml(senderName);
     const safeMsgId = escapeJsSingleQuoted(msgId);
-    
+
     let body = "";
     if (m.type === "voice" && m.media_id) {
       body = `<audio class="media-audio" src="/api/media/${m.media_id}" controls preload="metadata" playsinline></audio>`;
@@ -3959,25 +3829,25 @@ function legacyRender() {
     } else {
       body = `<div class="bText">${escapeHtml((m._text ?? m.text ?? "").toString())}</div>`;
     }
-    
+
     // In DM: no avatars/names, just bubbles like Telegram
     // In groups: show avatars/names
     const showSenderInfo = !isDM && !mine;
-    
+
     // Check if this message is being replied to
     const isReplyingTo = state.replyTo?.id === msgId;
-    
+
     // Reply preview if this message is a reply
     const replyPreview = m.reply_to ? `
       <div class="reply-reference" onclick="scrollToMessage('${m.reply_to.id}', event)">
         <div class="reply-line"></div>
         <div class="reply-info">
-          <div class="reply-name">${escapeHtml(m.reply_to.sender_name || 'Unknown')}</div>
+          <div class="reply-name">${escapeHtml(m.reply_to.sender_name || 'Пользователь')}</div>
           <div class="reply-text">${escapeHtml((m.reply_to.text || '').slice(0, 60))}${(m.reply_to.text || '').length > 60 ? '...' : ''}</div>
         </div>
       </div>
     ` : '';
-    
+
     // Reactions
     const myId = String(state.me?.id || "");
     const reactions = m.reactions || {};
@@ -3990,13 +3860,13 @@ function legacyRender() {
         }).join('')}
       </div>
     ` : '';
-    
+
     // Check read status for my messages
     const isRead = mine && m.read_by && m.read_by.length > 0;
     const readStatus = isRead ? (m.read_by.length === 1 ? "✓✓" : "✓") : "";
-    
+
     return `
-      <div class="bubble ${mine ? "me" : ""} ${isDM ? 'dm' : ''} ${isReplyingTo ? 'replying-to' : ''}" id="msg-${escapeHtml(msgId)}"
+      <div class="bubble ${mine ? "me" : ""} ${isDM ? 'dm' : ''} ${isReplyingTo ? 'replying-to' : ''}" id="msg-${escapeHtml(msgId)}" data-message-id="${escapeHtml(msgId)}"
            ondblclick="replyToMessage('${safeMsgId}', event)"
            ontouchstart="handleTouchStart(event, '${safeMsgId}')"
            ontouchend="handleTouchEnd(event)">
@@ -4015,6 +3885,7 @@ function legacyRender() {
 }
 
 function renderMessageBody(m) {
+  if (m.meta?.media_encryption) return `<button class="encrypted-media" data-encrypted-media="${escapeHtml(m.id)}" onclick="openWebMedia('${escapeJsSingleQuoted(m.id)}')">${icon('attach')}<span>${escapeHtml(m.meta.media_encryption.name || 'Вложение')} · Открыть</span></button>`;
   if (m.type === "voice" && m.media_id) {
     return `<audio class="media-audio" src="/api/media/${m.media_id}" controls preload="metadata" playsinline></audio>`;
   }
@@ -4027,7 +3898,7 @@ function renderMessageBody(m) {
   }
   if (m.type === "media" && m.media_id) {
     if (m.media_mime?.startsWith("image/")) {
-      return `<img class="media-image" src="/api/media/${m.media_id}" onclick="window.open(this.src)" alt="">`;
+      return `<img class="media-image" src="/api/media/${m.media_id}" onclick="openWebMedia('${escapeJsSingleQuoted(m.id)}')" alt="Фотография" loading="lazy">`;
     }
     if (m.media_mime?.startsWith("video/")) {
       return `<video class="media-video" src="/api/media/${m.media_id}" controls playsinline ${m.thumb_path ? `poster="/api/media/${m.media_id}/thumb"` : ""}></video>`;
@@ -4042,7 +3913,7 @@ function buildRenderedMessagesHtml() {
   const isDM = currentRoom?.kind === "dm";
   let lastRenderedDay = null;
 
-  return state.messages.map(m => {
+  return state.messages.map((m, index) => {
     const senderId = String(m.sender_id || "");
     const msgId = String(m.id || "");
     const mine = senderId === String(state.me?.id || "");
@@ -4061,7 +3932,7 @@ function buildRenderedMessagesHtml() {
       <div class="reply-reference" onclick="scrollToMessage('${m.reply_to.id}', event)">
         <div class="reply-line"></div>
         <div class="reply-info">
-          <div class="reply-name">${escapeHtml(m.reply_to.sender_name || 'Unknown')}</div>
+          <div class="reply-name">${escapeHtml(m.reply_to.sender_name || 'Пользователь')}</div>
           <div class="reply-text">${escapeHtml((m.reply_to.text || '').slice(0, 60))}${(m.reply_to.text || '').length > 60 ? '...' : ''}</div>
         </div>
       </div>
@@ -4069,35 +3940,32 @@ function buildRenderedMessagesHtml() {
 
     const myId = String(state.me?.id || "");
     const reactions = m.reactions || {};
-    const reactionsHtml = Object.keys(reactions).length > 0 ? `
-      <div class="reactions">
-        ${Object.entries(reactions).map(([emoji, users]) => {
-          const count = users.length;
-          const myReaction = users.includes(myId);
-          return `<button class="reaction-tag ${myReaction ? 'my-reaction' : ''}" onclick="${myReaction ? `removeReaction('${safeMsgId}', '${escapeJsSingleQuoted(emoji)}', event)` : `addReaction('${safeMsgId}', '${escapeJsSingleQuoted(emoji)}')`}">${escapeHtml(emoji)} ${count}</button>`;
-        }).join('')}
-      </div>
-    ` : '';
-
-    const editButton = mine && m.type === "text"
-      ? ` <button class="btn-delete-msg" onclick="startEditMessage('${safeMsgId}', event)" title="Редактировать">✏️</button>`
-      : "";
-    const deleteButton = mine && msgId
-      ? ` <button class="btn-delete-msg" onclick="deleteMessage('${safeMsgId}')" title="Удалить">✖</button>`
-      : "";
+    const reactionsHtml = Object.keys(reactions).length ? `<div class="reactions">${Object.entries(reactions).map(([emoji, users]) => {
+      const people = reactionPeople(users, [state.me, ...state.roomMembers, state.activeDmPeer]);
+      const mine = people.some(person => String(person.id) === myId);
+      const names = people.map(person => person.display_name || person.username).join(', ');
+      const faces = isDM ? `<span class="reaction-faces">${people.map(person => avatar(person.id, person.display_name || person.username, avatarUrl(person.avatar_id))).join('')}</span>` : people.length;
+      return `<button class="reaction-tag ${mine ? 'my-reaction' : ''}" title="${escapeHtml(names)}" aria-label="${escapeHtml(emoji + ': ' + names)}" onclick="${mine ? `removeReaction('${safeMsgId}', '${escapeJsSingleQuoted(emoji)}', event)` : `addReaction('${safeMsgId}', '${escapeJsSingleQuoted(emoji)}')`}">${escapeHtml(emoji)}${faces}</button>`;
+    }).join('')}</div>` : '';
+    const groupedBefore = groupWith(state.messages[index - 1], m);
+    const groupedAfter = groupWith(m, state.messages[index + 1]);
 
     return `
       ${needsDaySeparator ? `<div class="day-separator" data-day-label="${escapeHtml(formatDayLabel(m.created_at))}"><span>${formatDayLabel(m.created_at)}</span></div>` : ""}
-      <div class="bubble ${mine ? "me" : ""} ${isDM ? 'dm' : ''} ${isReplyingTo ? 'replying-to' : ''}" id="msg-${escapeHtml(msgId)}"
+      <div class="bubble ${mine ? "me" : ""} ${isDM ? 'dm' : ''} ${isReplyingTo ? 'replying-to' : ''} ${groupedBefore ? 'group-before' : ''} ${groupedAfter ? 'group-after' : ''} ${state.selectedMessages?.has(msgId) ? 'selected-message' : ''}" onclick="selectMessageIfNeeded('${safeMsgId}',event)" id="msg-${escapeHtml(msgId)}" data-message-id="${escapeHtml(msgId)}"
+           oncontextmenu="openMessageMenu('${safeMsgId}', event)"
+           ontouchmove="cancelMessagePress()"
            ondblclick="replyToMessage('${safeMsgId}', event)"
            ontouchstart="handleTouchStart(event, '${safeMsgId}')"
            ontouchend="handleTouchEnd(event)">
         ${showSenderInfo && senderId ? `<div class="bAvatar">${senderAvatar ? `<img src="${senderAvatar}">` : `<div class="avatar-placeholder-sm"></div>`}</div>` : ""}
+        <button class="icon-button message-menu-trigger" aria-label="Действия с сообщением" onclick="openMessageMenu('${safeMsgId}', event)">${icon('more')}</button>
         <div class="bContent">
           ${showSenderInfo && senderId ? `<div class="bSender">${safeSenderName}</div>` : ""}
           ${replyPreview}
           ${renderMessageBody(m)}
-          <div class="bTime">${formatMessageTime(m.created_at)} ${editedBadge}${editButton}${deleteButton} <button class="btn-reaction" onclick="showReactionPicker('${safeMsgId}', event)">😊</button>${renderStatus(m)}</div>
+          ${m.type !== "text" && (m._text || m.text) ? `<div class="bText media-caption">${renderMentionText(m._text || m.text)}</div>` : ""}
+          <div class="bTime">${formatMessageTime(m.created_at)} ${editedBadge}${renderStatus(m)}</div>
           ${reactionsHtml}
         </div>
       </div>
@@ -4106,107 +3974,68 @@ function buildRenderedMessagesHtml() {
 }
 
 function renderMessages() {
-  const box = $("#msgs");
-  if (!box) return;
-  const stickToBottom = shouldStickToBottom(box);
-  box.innerHTML = `<div id="scrollDateIndicator" class="scroll-date-indicator" aria-hidden="true"></div>${buildRenderedMessagesHtml()}`;
-  if (stickToBottom) box.scrollTop = box.scrollHeight;
-  bindMessagesScrollIndicator();
-  syncScrollDateIndicator(box, false);
+  updateChatPresence(); const box = $('#msgs'); if (!box) return;
+  box.dataset.roomId=state.activeRoomId || '';
+  if (state.roomLoading || state.roomLoadError) { box.innerHTML = state.roomLoadError ? '<div class="list-hint">Не удалось загрузить переписку.<button class="btn" onclick="selectRoom(stateRoomId())">Повторить</button></div>' : '<div class="list-hint" role="status">Загрузка сообщений…</div>'; return; }
+  const bottom = shouldStickToBottom(box);
+  const older = state.chatHistory?.has_older !== false ? `<button id="loadOlderMessages" class="history-load" onclick="loadOlderMessages()" ${state.loadingOlder ? 'disabled' : ''}>${state.loadingOlder ? 'Загрузка…' : 'Загрузить предыдущие сообщения'}</button>` : '';
+  reconcileMessages(box, `<div id="scrollDateIndicator" class="scroll-date-indicator" aria-hidden="true"></div>${older}${buildRenderedMessagesHtml()}`, bottom);
+  bindMessagesScrollIndicator(); syncScrollDateIndicator(box, false); chatRuntime.bind(); void hydrateVisibleMedia();
 }
-
-function render() {
-  const box = $("#msgs");
-  if (!box) return;
-  const stickToBottom = shouldStickToBottom(box);
-  box.innerHTML = `<div id="scrollDateIndicator" class="scroll-date-indicator" aria-hidden="true"></div>${buildRenderedMessagesHtml()}`;
-  if (stickToBottom) box.scrollTop = box.scrollHeight;
-  bindMessagesScrollIndicator();
-  syncScrollDateIndicator(box, false);
-}
+function render() { renderMessages(); }
 
 // --- Auth ---
-window.login = async () => {
-  const res = await api("/auth/login", { method:"POST", body: JSON.stringify({username:$("#u").value, password:$("#p").value}) });
-  if (res?.user) {
-    state.me = await api("/me");
-    if (!state.me?.id) { alert("Ошибка авторизации"); return; }
-
-    // Initialize E2E encryption
-    await initE2E();
-
-    // Initialize Service Worker and notifications
-    await initServiceWorker();
-
-    connectWS();
-    await loadRooms();
-    await syncProfileRoute();
-  } else {
-    const message = res?.error === "bad_credentials"
-      ? "Неверный логин или пароль"
-      : "Не удалось войти. Попробуйте еще раз.";
-    alert(message);
-  }
-};
+function authReport(message, signedIn = false) {
+  const node = $('#authError');
+  if (node && !signedIn) { node.textContent = message; node.hidden = !message; }
+  else if (message) toast(message);
+}
+const authenticate = createAuthFlow({ request: api, setUser: user => { state.me = user; }, render: () => mount(),
+  initialize: async () => { localStorage.setItem('67chat-profile', JSON.stringify(state.me)); await chatRuntime.start(state.me); connectWS(); await loadRooms(); await syncProfileRoute(); void initE2E(); void initServiceWorker(); },
+  report: authReport, busy: value => { document.querySelectorAll('.auth-card button,.auth-card input').forEach(node => node.disabled = value); }
+});
+window.login = () => authenticate('login', { username: $('#u').value.trim(), password: $('#p').value });
+window.retryBootstrap = async () => { try { await loadRooms(); } catch (error) { toast(userError(error)); } };
 
 // Captcha handling
 let captchaToken = "";
 window.onCaptchaSuccess = (token) => { captchaToken = token; };
 
-window.showRegister = () => {
-  const container = $("#captcha-container");
-  if (container) container.style.display = "block";
-  // Load hCaptcha script if not loaded
-  if (!window.hcaptcha) {
-    const script = document.createElement("script");
-    script.src = "https://js.hcaptcha.com/1/api.js";
-    script.async = true;
-    script.defer = true;
-    document.head.appendChild(script);
-  }
-  // Change button to actual register
-  const btn = event.target;
-  btn.textContent = "Создать аккаунт";
-  btn.onclick = () => window.register();
+window.showRegister = async event => {
+  const btn = event.currentTarget;
+  try {
+    const config = await api('/auth/config');
+    if (!config.captcha_required) return window.register();
+    const container = $('#captcha-container'); if (container) container.style.display = 'block';
+    if (!window.hcaptcha) { const script = document.createElement('script'); script.src = 'https://js.hcaptcha.com/1/api.js'; script.async = true; document.head.append(script); }
+    btn.onclick = () => window.register();
+    authReport('Пройдите проверку и нажмите «Создать аккаунт».');
+  } catch (error) { authReport(userError(error)); }
 };
-
 window.register = async () => {
-  if (!captchaToken) {
-    alert("Пройдите капчу");
-    return;
-  }
-  const res = await api("/auth/register", { 
-    method:"POST", 
-    body: JSON.stringify({
-      username: $("#u").value, 
-      password: $("#p").value,
-      captcha: captchaToken
-    }) 
-  });
-  if (res?.user) {
-    state.me = await api("/me");
-    if (!state.me?.id) { alert("Ошибка регистрации"); return; }
-
-    // Initialize E2E encryption
-    await initE2E();
-
-    // Initialize Service Worker and notifications
-    await initServiceWorker();
-
-    connectWS();
-    await loadRooms();
-    await syncProfileRoute();
-  } else alert(res?.error === "captcha_failed" ? "Капча не пройдена" : "Ошибка регистрации");
+  const username = $('#u').value.trim(), password = $('#p').value;
+  if (!/^[a-zA-Z0-9_]{3,30}$/.test(username)) return authReport('Имя: 3–30 латинских букв, цифр или знаков подчёркивания.');
+  if (password.length < 6) return authReport('Пароль должен содержать не менее 6 символов.');
+  await authenticate('register', { username, password, captcha: captchaToken });
 };
 
 window.logout = async () => {
+  try { await webNotifications.disable(); } catch {}
   try { await api("/auth/logout", { method: "POST", body: JSON.stringify({}) }); } catch {}
   resetClientSession();
   mount();
 };
 
 async function loadRooms() {
-  state.rooms = await prepareRoomPreviews(await api("/rooms") || []);
+  const account = state.me?.id; if (!account) return;
+  const rooms = await prepareRoomPreviews(await api("/rooms") || []);
+  if (state.me?.id !== account) return;
+  state.rooms = rooms;
+  const folders = await api("/me/folders");
+  if (state.me?.id !== account) return;
+  state.folders = Array.isArray(folders) ? folders : [];
+  await chatRuntime.local()?.set("folders", state.folders);
+  await chatRuntime.saveRooms(rooms);
   updateRoomsList();
 }
 
@@ -4248,6 +4077,7 @@ function updateRoomsList() {
     }
   }
 
+  if (state.me && !state.activeRoomId && !state.rooms.length) mountPreservingInput();
   // Update page title with total unread count
   updatePageTitle();
 }
@@ -4256,9 +4086,13 @@ function updatePageTitle() {
   const totalUnread = state.rooms.reduce((sum, r) => sum + (r.unread_count || 0), 0);
 
   if (totalUnread > 0) {
-    document.title = `(${totalUnread > 99 ? '99+' : totalUnread}) 67`;
+    document.title = `(${totalUnread > 99 ? '99+' : totalUnread}) 67chat`;
   } else {
-    document.title = '67';
+    document.title = '67chat';
+  }
+  if ('setAppBadge' in navigator) {
+    const operation = totalUnread ? navigator.setAppBadge(totalUnread) : navigator.clearAppBadge();
+    operation?.catch(() => {});
   }
 }
 
@@ -4285,43 +4119,15 @@ window.toggleSearch = () => {
   }
 };
 
-window.searchMessages = (query) => {
-  state.searchQuery = query;
-
-  if (!query || query.length < 2) {
-    state.searchResults = [];
-    state.currentSearchIndex = 0;
-    clearSearchHighlights();
-    mount();
-    return;
-  }
-
-  const lowerQuery = query.toLowerCase();
-
-  // Search through messages
-  state.searchResults = state.messages
-    .map((msg, index) => ({ msg, index }))
-    .filter(({ msg }) => {
-      const text = msg._text || msg.text || '';
-      return text.toLowerCase().includes(lowerQuery);
-    });
-
-  state.currentSearchIndex = 0;
-
-  // Highlight and scroll to first result
-  if (state.searchResults.length > 0) {
-    scrollToSearchResult(0);
-  }
-
-  mount();
-};
+let historySearchTimer;
+window.searchMessages = query => { state.searchQuery = query; clearTimeout(historySearchTimer); chatRuntime.cancelSearch(); historySearchTimer = setTimeout(() => void chatRuntime.search(query).catch(e => toast(userError(e))), 250); };
 
 window.nextSearchResult = () => {
   if (state.searchResults.length === 0) return;
 
   state.currentSearchIndex = (state.currentSearchIndex + 1) % state.searchResults.length;
   scrollToSearchResult(state.currentSearchIndex);
-  mount();
+  mountPreservingInput();
 };
 
 window.prevSearchResult = () => {
@@ -4329,31 +4135,10 @@ window.prevSearchResult = () => {
 
   state.currentSearchIndex = (state.currentSearchIndex - 1 + state.searchResults.length) % state.searchResults.length;
   scrollToSearchResult(state.currentSearchIndex);
-  mount();
+  mountPreservingInput();
 };
 
-function scrollToSearchResult(index) {
-  if (!state.searchResults[index]) return;
-
-  const msgId = state.searchResults[index].msg.id;
-  const msgEl = document.getElementById(`msg-${msgId}`);
-
-  if (msgEl) {
-    msgEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-    // Highlight current result
-    clearSearchHighlights();
-    msgEl.classList.add('search-highlight-current');
-
-    // Highlight all other results
-    state.searchResults.forEach((result, i) => {
-      if (i !== index) {
-        const el = document.getElementById(`msg-${result.msg.id}`);
-        if (el) el.classList.add('search-highlight');
-      }
-    });
-  }
-}
+function scrollToSearchResult(index) { const item = state.searchResults[index]; if (item) void chatRuntime.jump((item.msg || item).id).catch(e => toast(userError(e))); }
 
 function clearSearchHighlights() {
   document.querySelectorAll('.search-highlight, .search-highlight-current').forEach(el => {
@@ -4389,61 +4174,14 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-window.selectRoom = async id => {
-  state.activeRoomId = id;
-  state.editingRoom = false;
-  state.editMessage = null;
-  state.activeDmPeer = null;
-
-  // Reset search when changing rooms
-  state.searchMode = false;
-  state.searchQuery = '';
-  state.searchResults = [];
-  state.currentSearchIndex = 0;
-  clearSearchHighlights();
-
-  if (state.wsAuthed) joinActiveRoom();
-
-  // Load members first
-  state.roomMembers = await api(`/rooms/${id}/members`) || [];
-  groupE2eRooms.delete(id);
-  await roomE2eEnabled(id);
-  const room = state.rooms.find(r => r.id === id);
-  if (room?.kind === "dm" && room.other_user_id) {
-    state.activeDmPeer = await api(`/users/${room.other_user_id}`);
-
-    // Initialize E2E session for DM chat
-    if (state.e2eReady) {
-      await getE2ESessionForUser(room.other_user_id);
-    }
-  }
-
-  const msgs = await api(`/rooms/${id}/messages`) || [];
-  for (let m of msgs) {
-    if (m.type === "text") m._text = await decryptMsg(id, m);
-  }
-  state.messages = msgs;
-  
-  // Mark messages as read when opening room
-  await markMessagesRead();
-  
-  // Re-render everything after marking as read
-  mountPreservingInput();
+let roomRequestId = 0;
+window.selectRoom = async (id, options = {}) => {
+  saveWebDraft(); ++roomRequestId; state.editingRoom = false;
+  if (!options.fromRoute) { const url = new URL(location.href); url.searchParams.set('room', id); history[options.replace ? 'replaceState' : 'pushState']({ roomId: id }, '', url); }
+  if (state.wsAuthed) state.ws?.send(JSON.stringify({ type: 'rooms.join', room_id: id }));
+  try { await chatRuntime.open(id, options); } catch (error) { toast(userError(error)); }
 };
-
-async function markMessagesRead() {
-  if (!state.activeRoomId) return;
-  try {
-    await api(`/rooms/${state.activeRoomId}/read`, { 
-      method: "POST",
-      body: JSON.stringify({}) // Send empty JSON object instead of no body
-    });
-    // Reload rooms to update unread counters
-    await loadRooms();
-  } catch (e) {
-    console.error("Failed to mark messages as read:", e);
-  }
-}
+async function markMessagesRead() { chatRuntime.bind(); }
 
 async function buildTextMessage(roomId, currentRoom, text) {
   if (currentRoom?.kind === "group" && await roomE2eEnabled(roomId)) return encryptGroupText(roomId, text);
@@ -4462,74 +4200,26 @@ async function buildTextMessage(roomId, currentRoom, text) {
 }
 
 // --- Messaging ---
+let sendingDraft = false;
 window.doSend = async () => {
+  if (sendingDraft) return;
+  const input = $('#inp'), roomId = state.activeRoomId, account = state.me?.id;
+  const text = input?.value.trim(), reply = state.replyTo, editing = state.editMessage;
+  if (!text || !roomId) return;
+  if (text.length > 5000) return toast('Сообщение слишком длинное: максимум 5000 символов.');
+  sendingDraft = true;
   try {
-    const input = $("#inp");
-    if (!input) return;
-    const text = input.value.trim();
-    if (!text) return;
-    if (text.length > 5000) { alert("Сообщение слишком длинное (макс 5000 символов)"); return; }
-    if (!state.ws || state.ws.readyState !== 1) {
-      alert("Нет подключения к серверу");
-      return;
+    if (editing) {
+      const body = await buildTextMessage(roomId, state.rooms.find(r => r.id === roomId), text);
+      if (state.me?.id !== account) return;
+      const sent = await api(`/rooms/${roomId}/messages/${editing.id}`, { method: 'PUT', body: JSON.stringify({ text: body.text, meta: body.meta }) });
+      await chatRuntime.received(sent);
+    } else await chatRuntime.enqueue({ roomId, text, reply });
+    if (state.me?.id === account && state.activeRoomId === roomId && $('#inp')?.value.trim() === text) {
+      state.composerText = ''; $('#inp').value = ''; chatRuntime.draft(roomId, ''); state.replyTo = null; state.editMessage = null; resizeComposer();
+      if (reply || editing) await mountPreservingInput();
     }
-    const currentRoom = state.rooms.find(r => r.id === state.activeRoomId);
-    let message = await buildTextMessage(state.activeRoomId, currentRoom, text);
-
-    if (state.editMessage) {
-      const updated = await api(`/rooms/${state.activeRoomId}/messages/${state.editMessage.id}`, {
-        method: "PUT",
-        body: JSON.stringify({ text: message.text, meta: message.meta })
-      });
-      if (!updated?.id) {
-        alert("Не удалось отредактировать сообщение");
-        return;
-      }
-      if (updated.type === "text") updated._text = await decryptMsg(state.activeRoomId, updated);
-      state.messages = state.messages.map(m => m.id === updated.id ? updated : m);
-      input.value = "";
-      state.composerText = "";
-      state.editMessage = null;
-      await mount();
-      setTimeout(() => {
-        const nextInput = $("#inp");
-        if (nextInput) nextInput.focus();
-      }, 50);
-      return;
-    }
-    // Add reply info if present
-    if (state.replyTo) {
-      message.reply_to = {
-        id: state.replyTo.id,
-        text: state.replyTo.text?.slice(0, 100),
-        sender_name: state.replyTo.sender_display_name || state.replyTo.sender_username
-      };
-    }
-    state.ws.send(JSON.stringify({ type: "message.send", room_id: state.activeRoomId, message }));
-    input.value = "";
-    state.composerText = "";
-    state.replyTo = null;
-    state.editMessage = null;
-    
-    // Preserve focus and cursor during render
-    const activeElement = document.activeElement;
-    const wasInputFocused = activeElement === input;
-    const cursorPosition = input.selectionStart;
-    const cursorEnd = input.selectionEnd;
-    
-    render(); // Use render() instead of mount() to preserve focus
-    
-    // Restore focus and cursor if it was on input
-    if (wasInputFocused) {
-      setTimeout(() => {
-        input.focus();
-        input.setSelectionRange(cursorPosition, cursorEnd);
-      }, 0);
-    }
-  } catch (error) {
-    console.error("Error sending message:", error);
-    alert("Ошибка отправки сообщения: " + error.message);
-  }
+  } catch (error) { toast(userError(error)); } finally { sendingDraft = false; }
 };
 
 window.setE2EE = async () => {
@@ -4538,601 +4228,88 @@ window.setE2EE = async () => {
   selectRoom(state.activeRoomId);
 };
 
-// --- Voice ---
-const isVoiceSupported = typeof MediaRecorder !== "undefined" && typeof MediaRecorder.isTypeSupported === "function";
-
-window.toggleVoice = async () => {
-  if (!isVoiceSupported) { alert("Голосовые сообщения не поддерживаются в этом браузере."); return; }
-  if (state.recorder) {
-    try { state.recorder.stop(); } catch {}
-    state.recorder = null;
-    $("#btn_voice").textContent = "🎙️";
-  } else {
-    let stream;
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
-    catch (e) { alert("Нет доступа к микрофону."); return; }
-    
-    const mimeType = MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4"
-      : MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus"
-      : MediaRecorder.isTypeSupported("audio/ogg;codecs=opus") ? "audio/ogg;codecs=opus" : "";
-    
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-    const chunks = [];
-    recorder.ondataavailable = e => chunks.push(e.data);
-    recorder.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      
-      // Show upload progress for voice
-      const ext = recorder.mimeType?.includes("mp4") ? "m4a" : recorder.mimeType?.includes("ogg") ? "ogg" : "webm";
-      showUploadProgress("voice." + ext);
-      
-      const fd = new FormData();
-      fd.append("file", new Blob(chunks, { type: recorder.mimeType || "application/octet-stream" }), `voice.${ext}`);
-      
-      try {
-        // Use XMLHttpRequest for upload progress tracking
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", "/api/media/upload?kind=voice", true);
-        xhr.withCredentials = true;
-        
-        // Track upload progress
-        xhr.upload.addEventListener("progress", (e) => {
-          if (e.lengthComputable) {
-            const percentComplete = Math.round((e.loaded / e.total) * 100);
-            const progressEl = $("#uploadProgress");
-            if (progressEl) {
-              const bar = progressEl.querySelector('.upload-progress-bar');
-              const text = progressEl.querySelector('.upload-progress-text');
-              if (bar) bar.style.width = percentComplete + '%';
-              if (text) text.textContent = `${percentComplete}%`;
-            }
-          }
-        });
-        
-        xhr.onload = async () => {
-          if (xhr.status === 200) {
-            try {
-              const data = JSON.parse(xhr.responseText);
-              if (data?.id) {
-                state.ws?.send(JSON.stringify({ type: "message.send", room_id: state.activeRoomId, message: { type: "voice", media_id: data.id, meta: {} } }));
-              } else {
-                alert("Ошибка отправки");
-              }
-              hideUploadProgress();
-            } catch (e) {
-              console.error("Voice upload error:", e);
-              alert("Ошибка отправки: " + e.message);
-              hideUploadProgress();
-            }
-          } else {
-            alert("Ошибка отправки: " + xhr.responseText);
-            hideUploadProgress();
-          }
-        };
-        
-        xhr.onerror = () => {
-          alert("Ошибка сети при отправке");
-          hideUploadProgress();
-        };
-        
-        xhr.send(fd);
-      } catch (e) {
-        console.error("Voice upload error:", e);
-        alert("Ошибка отправки: " + e.message);
-        hideUploadProgress();
-      }
-    };
-    state.recorder = recorder;
-    recorder.start();
-    $("#btn_voice").textContent = "⏹️";
-  }
-};
-
-// --- Video Note (Kruzhki) ---
-window.toggleVideoNotePlayback = (container) => {
-  const video = container.querySelector("video");
-  if (video.paused) {
-    video.play();
-  } else {
-    video.pause();
-  }
-};
-
-window.toggleVideoNote = async () => {
-  
-  if (state.recordingVideoNote) {
-    // Stop recording
-    if (state.recorder) {
-      state.recorder.stop();
-    }
-    state.recorder = null;
-    state.recordingVideoNote = false;
-    $("#btn_video_note").textContent = "⏺️";
-    const preview = $("#videoNotePreview");
-    if (preview) preview.remove();
-    // Clear timer reference
-    window.currentVideoNoteTimer = null;
-  } else {
-    // Start recording
-    let stream;
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { facingMode: "user", width: 480, height: 480 } }); }
-    catch (e) { alert("Нет доступа к камере/микрофону."); return; }
-    
-    // Show preview
-    const preview = document.createElement("div");
-    preview.id = "videoNotePreview";
-    preview.innerHTML = '<video autoplay playsinline muted></video><div class="vn-timer">0:00</div><button class="vn-switch-camera" onclick="switchVideoNoteCamera()">🔄</button>';
-    document.body.appendChild(preview);
-    const video = preview.querySelector("video");
-    video.srcObject = stream;
-    
-    let seconds = 0;
-    const timer = setInterval(() => {
-      seconds++;
-      if (seconds >= 60) { window.toggleVideoNote(); return; }
-      preview.querySelector(".vn-timer").textContent = `0:${String(seconds).padStart(2,"0")}`;
-    }, 1000);
-    
-    // Store timer reference globally for camera switch access
-    window.currentVideoNoteTimer = timer;
-    
-    const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4"
-      : MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9"
-      : MediaRecorder.isTypeSupported("video/webm") ? "video/webm" : "";
-    
-    
-    // Initialize global chunks array for video note recording
-    state.videoNoteChunks = [];
-    
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-    recorder.ondataavailable = e => {
-      if (e.data && e.data.size > 0) {
-        state.videoNoteChunks.push(e.data);
-      }
-    };
-    recorder.onstop = async () => {
-      clearInterval(timer);
-      stream.getTracks().forEach(t => t.stop());
-      const previewEl = $("#videoNotePreview");
-      if (previewEl) previewEl.remove();
-      
-      // Show upload progress for video note
-      showUploadProgress("video_note." + (recorder.mimeType?.includes("mp4") ? "mp4" : "webm"));
-      
-      // Use global chunks array
-      const fd = new FormData();
-      const ext = recorder.mimeType?.includes("mp4") ? "mp4" : "webm";
-      fd.append("file", new Blob(state.videoNoteChunks, { type: recorder.mimeType || "video/webm" }), `video_note.${ext}`);
-      
-      try {
-        const res = checkUnauthorized(await fetch("/api/media/upload?kind=video_note", { method: "POST", body: fd, credentials: "include" }));
-        const data = await res.json().catch(() => null);
-        if (data?.id) {
-          state.ws?.send(JSON.stringify({ type: "message.send", room_id: state.activeRoomId, message: { type: "video_note", media_id: data.id, meta: {} } }));
-        } else {
-          console.error("Failed to upload video note");
-          alert("Ошибка отправки");
-        }
-      } catch (e) {
-        console.error("Upload error:", e);
-        alert("Ошибка отправки: " + e.message);
-      } finally {
-        hideUploadProgress();
-      }
-      
-      // Clear chunks after upload
-      state.videoNoteChunks = [];
-      // Clear timer reference
-      window.currentVideoNoteTimer = null;
-    };
-    state.recorder = recorder;
-    state.recordingVideoNote = true;
-    state.currentStream = stream;
-    recorder.start();
-    $("#btn_video_note").textContent = "⏹️";
-  }
-};
-
+// Recording and uploads preserve the original account/recipient and require confirmation.
+window.toggleVoice = () => void webMedia.compose('voice').catch(e => toast(userError(e)));
+window.toggleVideoNote = () => void webMedia.compose('circle').catch(e => toast(userError(e)));
+let selectedFileContext;
 window.triggerFileSelect = () => {
-  const input = $("#file");
-  if (input) {
-    input.value = ""; // Clear previous selection
-    input.click();
-  }
+  const dialog=document.createElement('dialog');dialog.className='actions-dialog';const title=document.createElement('h2');title.textContent='Вложения';dialog.append(title);
+  const owner={userId:state.me?.id,roomId:state.activeRoomId,title:state.rooms.find(r=>r.id===state.activeRoomId)?.title || state.rooms.find(r=>r.id===state.activeRoomId)?.other_display_name || 'Переписка',store:chatRuntime.local()};
+  const close=()=>{dialog.close();dialog.remove();};
+  const add=(label,action)=>{const b=document.createElement('button');b.textContent=label;b.onclick=()=>{close();action();};dialog.append(b);};
+  const choose=accept=>{selectedFileContext=owner;const input=$('#file');if(input){input.accept=accept;input.click();}};
+  add('Фото и видео',()=>choose('image/*,video/*'));add('Файл',()=>choose(''));add('Черновики вложений',()=>void webMedia.compose('files',[],owner).catch(e=>toast(userError(e))));add('Голосовое сообщение',()=>void webMedia.compose('voice',[],owner).catch(e=>toast(userError(e))));add('Видеокружок',()=>void webMedia.compose('circle',[],owner).catch(e=>toast(userError(e))));add('Отмена',()=>{});document.body.append(dialog);dialog.showModal();
 };
-
-// --- Upload progress indicator ---
-window.showUploadProgress = (filename) => {
-  const progress = document.createElement("div");
-  progress.id = "uploadProgress";
-  progress.style.cssText = `
-    position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:10000;
-    display:flex;align-items:center;justify-content:center;flex-direction:column;gap:15px;
-  `;
-  progress.innerHTML = `
-    <div style="background:var(--bg);border-radius:12px;padding:20px;max-width:300px;width:90%;text-align:center;">
-      <div style="font-size:16px;margin-bottom:10px;">Загрузка файла...</div>
-      <div style="font-size:14px;opacity:0.7;word-break:break-all;">${filename}</div>
-      <div style="margin-top:15px;">
-        <div style="width:100%;height:4px;background:var(--line);border-radius:2px;overflow:hidden;">
-          <div id="uploadProgressBar" style="width:0%;height:100%;background:var(--accent);transition:width 0.3s;"></div>
-        </div>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(progress);
-};
-
-window.hideUploadProgress = () => {
-  const progress = $("#uploadProgress");
-  if (progress) progress.remove();
-};
-
-window.updateUploadProgress = (percent) => {
-  const bar = $("#uploadProgressBar");
-  if (bar) bar.style.width = percent + "%";
-};
-
-// --- File upload ---
-window.uploadSelectedFile = async () => {
-  const input = $("#file");
-  const f = input?.files?.[0];
-  if (!f) { alert("Файл не выбран"); return; }
-  const MAX_SIZE = 1024 * 1024 * 1024; // 1GB
-  if (f.size > MAX_SIZE) { alert("Файл слишком большой (макс 1GB)"); input.value = ""; return; }
-  const isImage = f.type.startsWith("image/");
-  const isVideo = f.type.startsWith("video/");
-  const kind = isImage ? "image" : isVideo ? "video" : "file";
-
-  showUploadProgress(f.name);
-
-  const currentRoom = state.rooms.find(r => r.id === state.activeRoomId);
-  let encryptedFile = null;
-  let mediaKeyData = null;
-
-  // Encrypt file for DM chats
-  if (currentRoom?.kind === "dm" && currentRoom.other_user_id && state.e2eReady) {
-    try {
-      const mediaEncryption = new window.MediaEncryption();
-
-      // Encrypt file
-      encryptedFile = await mediaEncryption.encryptFile(f);
-
-      // Encrypt media key with E2E
-      const encryptedKey = await mediaEncryption.encryptMediaKey(
-        state.e2eManager,
-        currentRoom.other_user_id,
-        encryptedFile.key,
-        encryptedFile.iv
-      );
-
-      mediaKeyData = {
-        encrypted_key: JSON.stringify(encryptedKey),
-        original_name: encryptedFile.originalName,
-        original_type: encryptedFile.originalType,
-        original_size: encryptedFile.originalSize
-      };
-
-      // Create blob from encrypted data
-      const encryptedBlob = new Blob([encryptedFile.encryptedData], { type: 'application/octet-stream' });
-      f = new File([encryptedBlob], 'encrypted_' + encryptedFile.originalName, { type: 'application/octet-stream' });
-
-    } catch (e) {
-      console.error('Media encryption failed:', e);
-      alert("Не удалось зашифровать файл: " + e.message);
-      hideUploadProgress();
-      return;
-    }
-  }
-
-  const fd = new FormData();
-  fd.append("file", f, f.name || "file");
-
-  // Add encryption metadata if encrypted
-  if (mediaKeyData) {
-    fd.append("encrypted", "true");
-    fd.append("media_key_data", JSON.stringify(mediaKeyData));
-  }
-
-  try {
-    // Use XMLHttpRequest for upload progress tracking
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", `/api/media/upload?kind=${kind}`, true);
-    xhr.withCredentials = true;
-
-    // Track upload progress
-    xhr.upload.addEventListener("progress", (e) => {
-      if (e.lengthComputable) {
-        const percentComplete = Math.round((e.loaded / e.total) * 100);
-        const progressEl = $("#uploadProgress");
-        if (progressEl) {
-          const bar = progressEl.querySelector('.upload-progress-bar');
-          const text = progressEl.querySelector('.upload-progress-text');
-          if (bar) bar.style.width = percentComplete + '%';
-          if (text) text.textContent = `${percentComplete}%`;
-        }
-      }
-    });
-
-    xhr.onload = async () => {
-      if (xhr.status === 200) {
-        try {
-          const data = JSON.parse(xhr.responseText);
-          input.value = "";
-          if (!data?.id) {
-            alert("Ошибка загрузки: нет ID файла");
-            hideUploadProgress();
-            return;
-          }
-
-          const messageMeta = { kind };
-          if (mediaKeyData) {
-            messageMeta.encrypted_media = true;
-          }
-
-          state.ws?.send(JSON.stringify({
-            type: "message.send",
-            room_id: state.activeRoomId,
-            message: {
-              type: "media",
-              media_id: data.id,
-              meta: messageMeta
-            }
-          }));
-          hideUploadProgress();
-        } catch (e) {
-          alert("Ошибка ответа сервера: " + e.message);
-          hideUploadProgress();
-        }
-      } else {
-        const err = xhr.responseText || "unknown error";
-        alert("Ошибка загрузки: " + err);
-        input.value = "";
-        hideUploadProgress();
-      }
-    };
-
-    xhr.onerror = () => {
-      alert("Ошибка сети при загрузке");
-      input.value = "";
-      hideUploadProgress();
-    };
-
-    xhr.send(fd);
-  } catch (e) {
-    alert("Ошибка сети при загрузке: " + e.message);
-    input.value = "";
-    hideUploadProgress();
-  }
-};
+window.uploadSelectedFile = () => { const input = $('#file'), files = [...(input?.files || [])],owner=selectedFileContext; if (input) input.value = ''; if (files.length) void webMedia.compose('files', files,owner).catch(e => toast(userError(e))); };
 
 // --- Calls ---
 let currentCamera = 'user'; // 'user' for front, 'environment' for back
-let currentVideoNoteCamera = 'user'; // For video notes recording
-let videoNoteRecorder = null; // Single recorder for entire session
-let videoNoteStream = null; // Current stream
 
-window.startRoomCall = async () => {
+window.startRoomCall = async (isVideo = false) => {
   if (!state.wsAuthed) { alert("Нет подключения"); return; }
 
   if (state.callState !== 'idle') return;
 
+  const roomId = state.activeRoomId;
+  state.isVideoCall = !!isVideo; state.isVideoEnabled = !!isVideo; state.isAudioEnabled = true;
   state.callState = 'calling';
   state.currentCallRoomId = state.activeRoomId || null;
   state.currentCallPeerId = null;
   state.pendingIceCandidates = [];
-  showAudioCallUI();
+  if (isVideo) showVideoCallUI(); else showAudioCallUI();
 
   let stream;
-  try { 
+  try {
     // Audio only call
-    stream = await navigator.mediaDevices.getUserMedia(getAudioConstraints()); 
+    stream = await navigator.mediaDevices.getUserMedia({ ...getAudioConstraints(), video: isVideo ? { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } } : false });
   }
   catch (e) { hangupCall(false); alert("Нет доступа к микрофону."); return; }
 
+  if (state.callState !== "calling" || state.currentCallRoomId !== roomId) { stream.getTracks().forEach(track => track.stop()); return; }
   state.localStream = stream;
   await loadRtcIceServers();
-  state.pc = new RTCPeerConnection({ 
+  state.pc = new RTCPeerConnection({
     iceServers: getRtcIceServers(),
     iceTransportPolicy: "all",
     iceCandidatePoolSize: 4
   });
-  showAudioCallUI();
-  updateCallStatus("Р’С‹Р·РѕРІ...", false);
+  if (isVideo) showVideoCallUI(); else showAudioCallUI();
+
   updateCallStatus("Вызов...", false);
-  wirePeerConnectionHandlers({ roomId: state.activeRoomId, peerUserId: null });
+  wirePeerConnectionHandlers({ roomId, peerUserId: null });
 
   stream.getTracks().forEach(t => state.pc.addTrack(t, stream));
 
+  setTimeout(() => { if (state.callState === "calling" && state.currentCallRoomId === roomId) { toast("Абонент не ответил"); hangupCall(); } }, 45000);
   try {
     const offer = await state.pc.createOffer();
     await state.pc.setLocalDescription(offer);
-    state.ws?.send(JSON.stringify({ type: "call.offer", toRoom: state.activeRoomId, room_id: state.activeRoomId, sdp: { type: offer.type, sdp: offer.sdp } }));
+    state.ws?.send(JSON.stringify({ type: "call.offer", toRoom: roomId, room_id: roomId, is_video: !!isVideo, sdp: { type: offer.type, sdp: offer.sdp } }));
   } catch (e) { console.error("Failed to start call:", e); alert("Ошибка звонка"); hangupCall(); }
 };
 
-// Switch camera for video notes (mobile) - BACK TO WORKING APPROACH
-window.switchVideoNoteCamera = async () => {
-  
-  if (!state.recordingVideoNote) {
-    return;
-  }
-  
-  // Switch camera
-  currentVideoNoteCamera = currentVideoNoteCamera === 'user' ? 'environment' : 'user';
-  
-  try {
-    // Get new stream FIRST to minimize delay
-    const newStream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: { facingMode: currentVideoNoteCamera, width: 480, height: 480 }
-    });
-    
-    // Update preview video IMMEDIATELY
-    const preview = $("#videoNotePreview");
-    if (preview) {
-      const video = preview.querySelector("video");
-      if (video) {
-        video.srcObject = newStream;
-      }
-    }
-    
-    // Update recorder if exists
-    if (state.recorder) {
-      
-      // Create new recorder with new stream FIRST
-      const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4"
-        : MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9"
-        : MediaRecorder.isTypeSupported("video/webm") ? "video/webm" : "";
-      
-      const newRecorder = new MediaRecorder(newStream, mimeType ? { mimeType } : undefined);
-      
-      // Continue using the global chunks array
-      newRecorder.ondataavailable = e => {
-        if (e.data && e.data.size > 0) {
-          state.videoNoteChunks.push(e.data);
-        }
-      };
-      
-      // Store the original timer reference
-      const timerRef = window.currentVideoNoteTimer;
-      
-      newRecorder.onstop = async () => {
-        // This will be called when user actually stops recording
-        if (timerRef) clearInterval(timerRef);
-        newStream.getTracks().forEach(t => t.stop());
-        const previewEl = $("#videoNotePreview");
-        if (previewEl) previewEl.remove();
-        
-        // Show upload progress for video note
-        showUploadProgress("video_note." + (newRecorder.mimeType?.includes("mp4") ? "mp4" : "webm"));
-        
-        // Use global chunks array
-        const fd = new FormData();
-        const ext = newRecorder.mimeType?.includes("mp4") ? "mp4" : "webm";
-        fd.append("file", new Blob(state.videoNoteChunks, { type: newRecorder.mimeType || "video/webm" }), `video_note.${ext}`);
-        
-        try {
-          const res = checkUnauthorized(await fetch("/api/media/upload?kind=video_note", { method: "POST", body: fd, credentials: "include" }));
-          const data = await res.json().catch(() => null);
-          if (data?.id) {
-            state.ws?.send(JSON.stringify({ type: "message.send", room_id: state.activeRoomId, message: { type: "video_note", media_id: data.id, meta: {} } }));
-          } else {
-            console.error("Failed to upload video note");
-            alert("Ошибка отправки");
-          }
-        } catch (e) {
-          console.error("Upload error:", e);
-          alert("Ошибка отправки: " + e.message);
-        } finally {
-          hideUploadProgress();
-        }
-        
-        // Clear chunks after upload
-        state.videoNoteChunks = [];
-      };
-      
-      // MINIMIZE DELAY: Start new recorder BEFORE stopping old one
-      newRecorder.start();
-      
-      // Wait for new recorder to actually start recording
-      await new Promise(resolve => {
-        const checkStarted = () => {
-          if (newRecorder.state === 'recording') {
-            // Wait a bit more to ensure it's actually capturing data
-            setTimeout(resolve, 300);
-          } else {
-            setTimeout(checkStarted, 10);
-          }
-        };
-        checkStarted();
-      });
-      
-      // Now stop old recorder with minimal delay
-      const oldRecorder = state.recorder;
-      state.recorder = newRecorder;
-      
-      if (oldRecorder.state === 'recording') {
-        // CRITICAL: Replace onstop with empty function to prevent upload
-        oldRecorder.onstop = () => {
-          // intentionally ignored
-        };
-        oldRecorder.stop();
-      }
-      
-      // Stop old stream tracks AFTER new recorder is running
-      if (state.currentStream) {
-        state.currentStream.getTracks().forEach(track => {
-          track.stop();
-        });
-      }
-      state.currentStream = newStream;
-      
-    }
-    
-  } catch (e) {
-    console.error("Failed to switch camera:", e);
-    // Fallback to front camera
-    currentVideoNoteCamera = 'user';
-  }
-};
-
-// Switch camera for mobile devices
-window.switchCamera = async () => {
-  if (!state.localStream) return;
-  
-  // Stop current video track
-  const videoTrack = state.localStream.getVideoTracks()[0];
-  if (videoTrack) {
-    videoTrack.stop();
-  }
-  
-  // Switch camera
-  currentCamera = currentCamera === 'user' ? 'environment' : 'user';
-  
-  try {
-    const newStream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: { facingMode: currentCamera }
-    });
-    
-    // Replace track in peer connection
-    if (state.pc && videoTrack) {
-      const newVideoTrack = newStream.getVideoTracks()[0];
-      await state.pc.replaceTrack(videoTrack, newVideoTrack, state.localStream);
-    }
-    
-    // Update local stream
-    state.localStream = newStream;
-    
-    // Update local video if exists
-    const localVideo = $("#localVideo");
-    if (localVideo) {
-      localVideo.srcObject = newStream;
-    }
-    
-  } catch (e) {
-    console.error("Failed to switch camera:", e);
-    // Fallback to audio only
-    currentCamera = 'user';
-  }
-};
-
 window.addEventListener("popstate", () => {
+  const roomId = new URL(location.href).searchParams.get("room");
+  if (roomId && state.me) void selectRoom(roomId, { fromRoute: true });
+  else if (state.activeRoomId) window.backToList(true);
   syncProfileRoute().catch(err => console.error("Route sync error:", err));
 });
 
 // --- Init ---
 (async () => {
   try {
-    state.me = await api("/me");
-    if (state.me?.id) await initE2E(); // restores keys from IndexedDB, starts pre-key monitor
-    await loadRooms();
-    if (state.me?.id) connectWS();
-    mount();
+    try {state.me=JSON.parse(localStorage.getItem('67chat-profile') || 'null');}catch{state.me=null;}
+    if(state.me?.id) {
+      await chatRuntime.start(state.me);await mount();
+      const roomId=new URL(location.href).searchParams.get('room');
+      if(roomId && state.rooms.some(room=>room.id===roomId))void selectRoom(roomId);
+    } else await mount();
+    const user=await api('/me').catch(error=>{if(error.status!==401)toast(userError(error));return state.me;});
+    if(!user?.id){await mount();return;}
+    state.me=user;localStorage.setItem('67chat-profile',JSON.stringify(user));await chatRuntime.start(user);
+    connectWS();void initE2E();void initServiceWorker();
+    await loadRooms().catch(error=>toast(userError(error)));await mount();
+    const roomId=new URL(location.href).searchParams.get('room');if(roomId && !state.activeRoomId && state.rooms.some(room=>room.id===roomId))await selectRoom(roomId);
     await syncProfileRoute();
-  } catch (e) {
-    console.error("Init error:", e);
-    mount();
-  }
+  }catch(error){console.error('Init error:',error);toast(userError(error));await mount();}
 })();
