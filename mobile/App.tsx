@@ -19,6 +19,9 @@ import { AppNavigation } from "./src/components/AppNavigation";
 import { ConnectionBanner } from "./src/components/ConnectionBanner";
 import { UpdateBanner } from "./src/components/UpdateBanner";
 import { useAppUpdate } from "./src/hooks/useAppUpdate";
+import { beginCall as beginAudioCall, endCall as endAudioCall } from "./src/audioSession";
+import { describeLock, lockLabel, unlockApp, watchBackground } from "./src/appLock";
+import { LockScreen } from "./src/components/LockScreen";
 import { ThemeProvider, useTheme } from "./src/ThemeProvider";
 import "react-native-get-random-values";
 import { StatusBar } from "expo-status-bar";
@@ -26,7 +29,7 @@ import { Audio } from "expo-av";
 import { ResizeMode, Video } from './src/components/Video';
 import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -190,6 +193,48 @@ function App() {
     return {type:'text', ...(await encryptRoomText(roomId,secret,text))};
   }
   const appUpdate = useAppUpdate(baseUrl, true);
+  // --- App lock -------------------------------------------------------------
+  const [lockEnabled, setLockEnabled] = useState(false);
+  const [unlocked, setUnlocked] = useState(true);
+  const [unlocking, setUnlocking] = useState(false);
+  const [lockError, setLockError] = useState<string | null>(null);
+  const [lockButtonLabel, setLockButtonLabel] = useState("Разблокировать");
+
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      const state = await describeLock();
+      if (!live) return;
+      setLockEnabled(state.enabled && state.available);
+      setLockButtonLabel(lockLabel(state.biometry));
+      // Locked on a cold start; a session already open in this run stays open.
+      if (state.enabled && state.available) setUnlocked(false);
+    })();
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const tryUnlock = useCallback(async () => {
+    if (unlocking) return;
+    setUnlocking(true);
+    setLockError(null);
+    try {
+      if (await unlockApp()) {
+        setUnlocked(true);
+      } else {
+        setLockError("Не удалось подтвердить. Попробуйте ещё раз.");
+      }
+    } finally {
+      setUnlocking(false);
+    }
+  }, [unlocking]);
+
+  useEffect(() => {
+    if (!lockEnabled) return;
+    return watchBackground(() => setUnlocked(false));
+  }, [lockEnabled]);
+
   const local = useAccountData({
     me,
     token,
@@ -1177,6 +1222,7 @@ function App() {
       );
 
       activeCallRef.current = call;
+      await beginAudioCall();
       await call.start();
       await nativeCalls.start(isVideo); setSpeakerEnabled(isVideo); await nativeCalls.speaker(isVideo);
       for (const ice of pendingCallIce.current.splice(0)) if (ice.roomId === roomId) await call.addIceCandidate(ice.candidate);
@@ -1288,6 +1334,9 @@ function App() {
     if(callIdRef.current)void nativeCalls.clear(callIdRef.current);callIdRef.current=null;void nativeCalls.stop();
     if (call) void call.end();
     if(signal && roomId && wsRef.current?.readyState===WebSocket.OPEN)wsRef.current.send(JSON.stringify({type:'call.hangup',room_id:roomId}));
+    // Every exit path lands here: hang up, decline, network drop, timeout.
+    // Restoring media routing is what stops audio sounding "like a call".
+    void endAudioCall();
     setActiveCall(null); setLocalStream(null); setRemoteStream(null); setCallState("idle"); setIncomingCall(null);
   }
 
@@ -1343,6 +1392,22 @@ function App() {
         <StatusBar style={theme.dark ? "light" : "dark"} />
         <ActivityIndicator size="large" color={telegramColors.misc.progress} />
       </SafeAreaView>
+    );
+  }
+
+  // App lock: gate the whole UI until the device authenticates. Shown before
+  // the login screen so a locked app never reveals cached chats either.
+  if (lockEnabled && !unlocked) {
+    return (
+      <>
+        <StatusBar style={theme.dark ? "light" : "dark"} />
+        <LockScreen
+          label={lockButtonLabel}
+          busy={unlocking}
+          error={lockError}
+          onUnlock={tryUnlock}
+        />
+      </>
     );
   }
 

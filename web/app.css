@@ -504,12 +504,32 @@ button,input{font:inherit}
 .media-audio{width:200px}
 .media-file{display:inline-block;padding:8px 12px;background:rgba(0,0,0,.2);border-radius:8px;font-size:13px}
 
-/* Video note (kruzhki) */
+/* Video note (кружок): circle, progress ring, duration badge, mute toggle.
+   No border — Telegram draws none; the ring is the only chrome. */
 .video-note{
+  position:relative;display:inline-grid;place-items:center;
   width:200px;height:200px;border-radius:50%;overflow:hidden;cursor:pointer;
-  border:3px solid var(--accent);background:#000;
+  background:#000;isolation:isolate;
 }
-.video-note video{width:100%;height:100%;object-fit:cover}
+.video-note video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:50%}
+.vn-ring{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg);pointer-events:none}
+.vn-ring-track{fill:none;stroke:rgba(255,255,255,.22);stroke-width:3}
+.vn-ring-progress{fill:none;stroke:#fff;stroke-width:3;stroke-linecap:round;opacity:0;transition:opacity .15s linear}
+.vn-badge{
+  position:absolute;bottom:14px;left:50%;transform:translateX(-50%);
+  padding:2px 9px;border-radius:11px;background:rgba(0,0,0,.55);
+  color:#fff;font-size:11px;font-variant-numeric:tabular-nums;pointer-events:none;
+}
+.video-note.playing .vn-badge{opacity:0}
+.vn-mute{
+  position:absolute;top:12px;right:12px;width:32px;height:32px;padding:0;
+  display:grid;place-items:center;border:0;border-radius:50%;
+  background:rgba(0,0,0,.5);color:#fff;cursor:pointer;opacity:0;transition:opacity .15s linear;
+}
+.vn-mute .ui-icon{width:17px;height:17px}
+.vn-mute.muted{background:rgba(0,0,0,.72);opacity:1}
+.video-note:hover .vn-mute,.video-note:focus-within .vn-mute,.video-note.playing .vn-mute{opacity:1}
+.video-note:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* Reply styles */
 .reply-preview{
   display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bubble2);border-left:3px solid var(--accent);margin-bottom:8px;border-radius:8px;

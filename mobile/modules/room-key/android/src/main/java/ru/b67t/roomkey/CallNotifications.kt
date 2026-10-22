@@ -6,6 +6,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.RingtoneManager
 import android.os.Build
@@ -111,14 +112,59 @@ class IncomingCallActivity : Activity() {
 
 class ActiveCallService : Service() {
   private lateinit var audio: AudioManager
-  private var previousMode=AudioManager.MODE_NORMAL
-  override fun onCreate(){super.onCreate();audio=getSystemService(AudioManager::class.java);previousMode=audio.mode;audio.mode=AudioManager.MODE_IN_COMMUNICATION}
-  override fun onBind(intent:Intent?):IBinder?=null
-  override fun onStartCommand(intent:Intent?,flags:Int,startId:Int):Int {
-    val open=PendingIntent.getActivity(this,6702,packageManager.getLaunchIntentForPackage(packageName),PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-    val note=CallNotifications.builder(this,false).setContentText("Звонок идёт · нажмите, чтобы вернуться").setOngoing(true).setContentIntent(open).build()
-    if(Build.VERSION.SDK_INT>=29) startForeground(6702,note,ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or if(intent?.getBooleanExtra("video",false)==true)ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0) else startForeground(6702,note)
+  private var focusRequest: AudioFocusRequest? = null
+
+  override fun onCreate() {
+    super.onCreate()
+    audio = getSystemService(AudioManager::class.java)
+    // Communication mode + audio focus: music and podcasts pause instead of
+    // playing into the call.
+    if (Build.VERSION.SDK_INT >= 26) {
+      focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+        .setAudioAttributes(
+          AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+        )
+        .setAcceptsDelayedFocusGain(false)
+        .build()
+        .also { audio.requestAudioFocus(it) }
+    } else {
+      @Suppress("DEPRECATION")
+      audio.requestAudioFocus(null, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+    }
+    audio.mode = AudioManager.MODE_IN_COMMUNICATION
+  }
+
+  override fun onBind(intent: Intent?): IBinder? = null
+
+  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    val open = PendingIntent.getActivity(this, 6702, packageManager.getLaunchIntentForPackage(packageName), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    val note = CallNotifications.builder(this, false).setContentText("Звонок идёт · нажмите, чтобы вернуться").setOngoing(true).setContentIntent(open).build()
+    if (Build.VERSION.SDK_INT >= 29) startForeground(6702, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or if (intent?.getBooleanExtra("video", false) == true) ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0) else startForeground(6702, note)
     return START_NOT_STICKY
   }
-  override fun onDestroy(){if(Build.VERSION.SDK_INT>=31)audio.clearCommunicationDevice();audio.isSpeakerphoneOn=false;audio.mode=previousMode;super.onDestroy()}
+
+  // Leaving MODE_IN_COMMUNICATION behind is what made everything sound "like a
+  // call" after hanging up: the recorder and the WebRTC session both set it, and
+  // restoring a snapshot taken earlier is not enough. Reset it explicitly and
+  // hand audio focus back.
+  override fun onDestroy() {
+    if (Build.VERSION.SDK_INT >= 31) {
+      audio.clearCommunicationDevice()
+    } else {
+      @Suppress("DEPRECATION")
+      audio.isSpeakerphoneOn = false
+    }
+    audio.mode = AudioManager.MODE_NORMAL
+    if (Build.VERSION.SDK_INT >= 26) {
+      focusRequest?.let { audio.abandonAudioFocusRequest(it) }
+      focusRequest = null
+    } else {
+      @Suppress("DEPRECATION")
+      audio.abandonAudioFocus(null)
+    }
+    super.onDestroy()
+  }
 }

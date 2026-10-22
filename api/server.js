@@ -336,6 +336,14 @@ async function runMigrations() {
          SELECT 1 FROM user_public_names upn WHERE upn.user_id = u.id
        )
      ON CONFLICT (name) DO NOTHING`,
+    // "Delete for me": a per-user, per-message tombstone. The message stays
+    // intact for everyone else, including in their history.
+    `CREATE TABLE IF NOT EXISTS hidden_messages (user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, message_id uuid NOT NULL REFERENCES messages(id) ON DELETE CASCADE, created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (user_id, message_id))`,
+    `CREATE INDEX IF NOT EXISTS hidden_messages_user_idx ON hidden_messages(user_id)`,
+    // Pinned message per chat (Telegram keeps one).
+    `ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_message_id uuid REFERENCES messages(id) ON DELETE SET NULL`,
+    `ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_at timestamptz`,
+    `ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_by uuid REFERENCES users(id) ON DELETE SET NULL`,
   ];
   for (const sql of migrations) {
     try {
@@ -669,7 +677,9 @@ async function convertVideoNote(inputPath, outputPath, thumbPath) {
       "-b:a",
       "64k",
       "-vf",
-      "crop=min(iw\\,ih):min(iw\\,ih),scale=320:320",
+      "crop=min(iw\\,ih):min(iw\\,ih),scale=480:480",
+      "-pix_fmt",
+      "yuv420p",
       "-movflags",
       "+faststart",
       "-t",
@@ -2709,11 +2719,12 @@ app.get("/rooms/:id/messages", async (req, reply) => {
     JOIN users u ON u.id = m.sender_id
     LEFT JOIN media md ON md.id = m.media_id
     WHERE m.room_id=$1
+      AND NOT EXISTS (SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$2)
   `;
-  const args = [roomId];
+  const args = [roomId, me.id];
 
   if (before) {
-    q += ` AND m.created_at < (SELECT created_at FROM messages WHERE id=$2) `;
+    q += ` AND m.created_at < (SELECT created_at FROM messages WHERE id=$3) `;
     args.push(before);
   }
 
@@ -3053,6 +3064,71 @@ app.post("/rooms/:roomId/read", async (req, reply) => {
   await notifyRoomListUpdate(me.id);
 
   return { ok: true };
+});
+
+// Hide a message for the current user only. The message stays intact for
+// everyone else; history queries filter it out via hidden_messages.
+app.delete("/rooms/:roomId/messages/:msgId/hide", async (req, reply) => {
+  const me = await requireAuth(req);
+  const roomId = String(req.params.roomId);
+  const msgId = String(req.params.msgId);
+  if (!(await isRoomMember(roomId, me.id))) return reply.code(404).send({ error: "not_found" });
+
+  const { rows } = await pool.query(
+    `SELECT 1 FROM messages WHERE id=$1 AND room_id=$2 LIMIT 1`,
+    [msgId, roomId],
+  );
+  if (!rows.length) return reply.code(404).send({ error: "not_found" });
+
+  await pool.query(
+    `INSERT INTO hidden_messages(user_id, message_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,
+    [me.id, msgId],
+  );
+  await notifyRoomListUpdate(me.id);
+  return { ok: true };
+});
+
+// Pin (or unpin) a single message in a chat. Owners/admins pin in groups and
+// channels; in a DM either participant may pin.
+app.put("/rooms/:roomId/pin", async (req, reply) => {
+  const me = await requireAuth(req);
+  const roomId = String(req.params.roomId);
+  if (!(await isRoomMember(roomId, me.id))) return reply.code(404).send({ error: "not_found" });
+
+  const { rows: roomRows } = await pool.query(
+    `SELECT kind FROM rooms WHERE id=$1 LIMIT 1`,
+    [roomId],
+  );
+  if (!roomRows.length) return reply.code(404).send({ error: "not_found" });
+  const kind = roomRows[0].kind;
+
+  if (kind !== "dm") {
+    const role = await getRoomRole(roomId, me.id);
+    if (role !== "owner" && role !== "admin") return reply.code(403).send({ error: "forbidden" });
+  }
+
+  const messageId = req.body?.message_id ? String(req.body.message_id) : null;
+  if (!messageId) {
+    await pool.query(
+      `UPDATE rooms SET pinned_message_id=NULL, pinned_at=NULL, pinned_by=NULL WHERE id=$1`,
+      [roomId],
+    );
+    broadcastToRoom(roomId, { type: "room.pin", room_id: roomId, message_id: null });
+    return { ok: true, message_id: null };
+  }
+
+  const { rows } = await pool.query(
+    `SELECT id FROM messages WHERE id=$1 AND room_id=$2 LIMIT 1`,
+    [messageId, roomId],
+  );
+  if (!rows.length) return reply.code(404).send({ error: "not_found" });
+
+  await pool.query(
+    `UPDATE rooms SET pinned_message_id=$2, pinned_at=now(), pinned_by=$3 WHERE id=$1`,
+    [roomId, messageId, me.id],
+  );
+  broadcastToRoom(roomId, { type: "room.pin", room_id: roomId, message_id: messageId });
+  return { ok: true, message_id: messageId };
 });
 
 // Delete message (sender only, hard delete)

@@ -144,7 +144,39 @@ window.cancelReply = () => {
   mountPreservingInput();
 };
 
-window.scrollToMessage = (id, event) => { event?.stopPropagation(); void chatRuntime.jump(id).catch(e => toast(userError(e))); };
+// Chat-list previews must match what Telegram shows: media kinds are named,
+// a draft is announced, and long text is left to CSS ellipsis (not sliced
+// here, which used to break emoji surrogate pairs).
+const PREVIEW_KINDS = { voice: "Голосовое сообщение", video_note: "Видеокружок", media: "Вложение", call: "Звонок" };
+function previewFor(room, me) {
+  const mine = room.last_msg_sender_id === me?.id;
+  const direct = room.kind === "dm" && !room.is_saved;
+  let text = room._lastText || room.last_msg_text || "";
+  const encrypted = room.last_msg_encrypted_content || room.last_msg_meta?.encrypted || room.last_msg_meta?.e2e;
+  if (!text && encrypted) text = "Зашифрованное сообщение";
+  if (!text) text = PREVIEW_KINDS[room.last_msg_type] || "";
+  if (room.draft) return "Черновик: " + room.draft;
+  if (mine && (room._lastText || room.last_msg_text)) text = "Вы: " + text;
+  else if (!direct && room.last_msg_sender_username && room._lastText) text = (room.last_msg_sender_name || room.last_msg_sender_username) + ": " + text;
+  return text;
+}
+
+window.pinMessage = async (id) => {
+  if (!state.activeRoomId) return;
+  await request(`/rooms/${state.activeRoomId}/pin`, { method: 'PUT', body: JSON.stringify({ message_id: id }) });
+  toast('Сообщение закреплено');
+  await loadRooms();
+  await mount();
+};
+
+window.unpinMessage = async () => {
+  if (!state.activeRoomId) return;
+  await request(`/rooms/${state.activeRoomId}/pin`, { method: 'PUT', body: JSON.stringify({ message_id: null }) });
+  await loadRooms();
+  await mount();
+};
+
+window.scrollToMessage = (id, event) => { event?.stopPropagation?.(); void chatRuntime.jump(id).catch(e => toast(userError(e))); };
 
 // Create room (group/channel) with user search
 window.openCreateRoom = (mode) => {
@@ -1462,6 +1494,11 @@ function connectWS() {
     if (data.type === "room.e2e" && data.room_id) {
       groupE2eRooms.set(data.room_id, !!data.enabled);
       if (state.activeRoomId === data.room_id) render();
+    }
+    if (data.type === "room.pin" && data.room_id) {
+      const room = state.rooms.find(item => item.id === data.room_id);
+      if (room) room.pinned_message_id = data.message_id || null;
+      if (state.activeRoomId === data.room_id) mount();
     }
     if (data.type === "room.deleted" && data.room_id) {
       if (state.activeRoomId === data.room_id) {
@@ -2933,6 +2970,13 @@ window.openRoomActions = chatActions.roomMenu;
 window.setChatPreference = (id, change) => chatActions.preference(id, change);
 window.toggleMessageSelection = chatActions.select;
 window.clearMessageSelection = () => { state.selectedMessages.clear(); mountPreservingInput(); };
+window.selectAllMessages = () => {
+  // Everything currently loaded, which is what the user sees on screen.
+  for (const message of state.messages || []) {
+    if (message?.id) state.selectedMessages.add(message.id);
+  }
+  mountPreservingInput();
+};
 window.selectMessageIfNeeded = (id, event) => { if (state.selectedMessages.size) { event.preventDefault(); event.stopPropagation(); chatActions.select(id); } };
 window.copySelectedMessages = chatActions.copySelected;
 window.deleteSelectedMessages = chatActions.removeSelected;
@@ -2963,11 +3007,30 @@ window.openMessageMenu = (id, event) => {
   add('Выделить', () => chatActions.select(id));
   add('Переслать', () => chatActions.forward([id]));
   add('Ответить', () => window.replyToMessage(id));
+  add('Закрепить', () => window.pinMessage(id));
   add('Поставить реакцию', () => window.showReactionPicker(id, { target: bubble, stopPropagation() {} }));
+  // A link that opens this exact message: ?room=<id>&msg=<id>
+  add('Копировать ссылку', async () => {
+    const url = new URL(location.href);
+    url.searchParams.set('room', state.activeRoomId);
+    url.searchParams.set('msg', id);
+    url.hash = '';
+    await navigator.clipboard.writeText(url.toString());
+    toast('Ссылка на сообщение скопирована');
+  });
   if (message._text || message.text) add('Копировать текст', () => navigator.clipboard.writeText(message._text || message.text));
+  // Deleting only for yourself hides it locally and on your other devices,
+  // leaving the message intact for everyone else.
+  add('Удалить у себя', async () => {
+    if (!confirm('Удалить сообщение только у себя? У других оно останется.')) return;
+    await request(`/rooms/${state.activeRoomId}/messages/${id}/hide`, { method: 'DELETE' });
+    state.messages = state.messages.filter(item => item.id !== id);
+    await chatRuntime.local()?.removeMessage(state.activeRoomId, id);
+    await mount();
+  }, true);
   if (message.sender_id === state.me.id) {
     if (message.type === 'text') add('Изменить', () => window.startEditMessage(id));
-    add('Удалить', () => window.deleteMessage(id), true);
+    add('Удалить у всех', () => window.deleteMessage(id), true);
   }
   menu.style.left = Math.max(8, Math.min(innerWidth - 238, event.clientX || rect.left)) + 'px';
   menu.style.top = Math.max(8, Math.min(innerHeight - menu.children.length * 44 - 20, event.clientY || rect.bottom)) + 'px';
@@ -3684,204 +3747,33 @@ function shouldStickToBottom(box) {
   return box.scrollHeight - box.scrollTop - box.clientHeight < threshold;
 }
 
-function legacyRenderMessages() {
-  updateChatPresence();
-  const box = $("#msgs");
-  if (!box) return;
-  if (state.roomLoading || state.roomLoadError) {
-    box.innerHTML = state.roomLoadError ? '<div class="list-hint">Не удалось загрузить переписку.<br><button class="btn" onclick="selectRoom(stateRoomId())">Повторить</button></div>' : '<div class="list-hint" role="status">Загрузка сообщений…</div>';
-    return;
-  }
-  const stickToBottom = shouldStickToBottom(box);
-
-  // Check if current room is DM
-  const currentRoom = state.rooms.find(r => r.id === state.activeRoomId);
-
-  // Update only messages content, not full UI
-  const messagesHtml = state.messages.map(m => {
-    const senderId = String(m.sender_id || "");
-    const msgId = String(m.id || "");
-    const mine = senderId === String(state.me?.id || "");
-    const time = new Date(m.created_at).toLocaleTimeString().slice(0,5);
-    const senderName = m.sender_display_name || m.sender_username || "?";
-    const senderAvatar = m.sender_avatar_id ? avatarUrl(m.sender_avatar_id) : null;
-    const safeSenderName = escapeHtml(senderName);
-    const safeMsgId = escapeJsSingleQuoted(msgId);
-
-    let body = "";
-    if (m.type === "voice" && m.media_id) {
-      body = `<audio class="media-audio" src="/api/media/${m.media_id}" controls preload="metadata" playsinline></audio>`;
-    } else if (m.type === "video_note" && m.media_id) {
-      body = `
-        <div class="video-note" onclick="toggleVideoNotePlayback(this)">
-          <video src="/api/media/${m.media_id}" playsinline loop ${m.thumb_path ? `poster="/api/media/${m.media_id}/thumb"` : ""}></video>
-        </div>
-      `;
-    } else if (m.type === "media" && m.media_id) {
-      if (m.media_mime?.startsWith("image/")) {
-        body = `<img class="media-image" src="/api/media/${m.media_id}" onclick="window.open(this.src)" alt="">`;
-      } else if (m.media_mime?.startsWith("video/")) {
-        body = `<video class="media-video" src="/api/media/${m.media_id}" controls playsinline ${m.thumb_path ? `poster="/api/media/${m.media_id}/thumb"` : ""}></video>`;
-      } else {
-        body = `<a class="media-file" href="/api/media/${m.media_id}" target="_blank">📎 Файл</a>`;
-      }
-    } else {
-      body = `<div class="bText">${escapeHtml((m._text ?? m.text ?? "").toString())}</div>`;
-    }
-
-    // In DM: no avatars/names, just bubbles like Telegram
-    // In groups: show avatars/names
-    const showSenderInfo = !(currentRoom?.kind === "dm") && !mine;
-
-    // Check if this message is being replied to
-    const isReplyingTo = state.replyTo?.id === msgId;
-
-    // Reply preview if this message is a reply
-    const replyPreview = m.reply_to ? `
-      <div class="reply-reference" onclick="scrollToMessage('${m.reply_to.id}', event)">
-        <div class="reply-line"></div>
-        <div class="reply-info">
-          <div class="reply-name">${escapeHtml(m.reply_to.sender_name || 'Пользователь')}</div>
-          <div class="reply-text">${escapeHtml((m.reply_to.text || '').slice(0, 60))}${(m.reply_to.text || '').length > 60 ? '...' : ''}</div>
-        </div>
-      </div>
-    ` : '';
-
-    // Reactions
-    const myId = String(state.me?.id || "");
-    const reactions = m.reactions || {};
-    const reactionsHtml = Object.keys(reactions).length > 0 ? `
-      <div class="reactions">
-        ${Object.entries(reactions).map(([emoji, users]) => {
-          const count = users.length;
-          const myReaction = users.includes(myId);
-          return `<button class="reaction-tag ${myReaction ? 'my-reaction' : ''}" onclick="${myReaction ? `removeReaction('${safeMsgId}', '${escapeJsSingleQuoted(emoji)}', event)` : `addReaction('${safeMsgId}', '${escapeJsSingleQuoted(emoji)}')`}">${escapeHtml(emoji)} ${count}</button>`;
-        }).join('')}
-      </div>
-    ` : '';
-
-    // Check read status for my messages
-    const isRead = mine && m.read_by && m.read_by.length > 0;
-    const readStatus = isRead ? (m.read_by.length === 1 ? "✓✓" : "✓") : "";
-
-    return `
-      <div class="bubble ${mine ? "me" : ""} ${currentRoom?.kind === "dm" ? 'dm' : ''} ${isReplyingTo ? 'replying-to' : ''}" id="msg-${escapeHtml(msgId)}" data-message-id="${escapeHtml(msgId)}"
-           ondblclick="replyToMessage('${safeMsgId}', event)"
-           ontouchstart="handleTouchStart(event, '${safeMsgId}')"
-           ontouchend="handleTouchEnd(event)">
-        ${showSenderInfo && senderId ? `<div class="bAvatar">${senderAvatar ? `<img src="${senderAvatar}">` : `<div class="avatar-placeholder-sm"></div>`}</div>` : ""}
-        <div class="bContent">
-          ${showSenderInfo && senderId ? `<div class="bSender">${safeSenderName}</div>` : ""}
-          ${replyPreview}
-          ${body}
-          <div class="bTime">${time}${mine && msgId ? ` <button class="btn-delete-msg" onclick="deleteMessage('${safeMsgId}')" title="Удалить">✕</button>` : ""} <button class="btn-reaction" onclick="showReactionPicker('${safeMsgId}', event)">😊</button>${readStatus ? ` <span class="msg-status ${isRead ? 'read' : 'delivered'}">${readStatus}</span>` : ""}</div>
-          ${reactionsHtml}
-        </div>
-      </div>
-    `;
-  }).join("");
-
-  box.innerHTML = messagesHtml;
-  if (stickToBottom) box.scrollTop = box.scrollHeight;
+function formatNoteDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 }
 
-function legacyRender() {
-  updateChatPresence();
-  const box = $("#msgs");
-  if (!box) return;
-  if (state.roomLoading || state.roomLoadError) {
-    box.innerHTML = state.roomLoadError ? '<div class="list-hint">Не удалось загрузить переписку.<br><button class="btn" onclick="selectRoom(stateRoomId())">Повторить</button></div>' : '<div class="list-hint" role="status">Загрузка сообщений…</div>';
-    return;
-  }
-  const stickToBottom = shouldStickToBottom(box);
-
-  // Check if current room is DM
-  const currentRoom = state.rooms.find(r => r.id === state.activeRoomId);
-  const isDM = currentRoom?.kind === "dm";
-
-  box.innerHTML = state.messages.map(m => {
-    const senderId = String(m.sender_id || "");
-    const msgId = String(m.id || "");
-    const mine = senderId === String(state.me?.id || "");
-    const time = new Date(m.created_at).toLocaleTimeString().slice(0,5);
-    const senderName = m.sender_display_name || m.sender_username || "?";
-    const senderAvatar = m.sender_avatar_id ? avatarUrl(m.sender_avatar_id) : null;
-    const safeSenderName = escapeHtml(senderName);
-    const safeMsgId = escapeJsSingleQuoted(msgId);
-
-    let body = "";
-    if (m.type === "voice" && m.media_id) {
-      body = `<audio class="media-audio" src="/api/media/${m.media_id}" controls preload="metadata" playsinline></audio>`;
-    } else if (m.type === "video_note" && m.media_id) {
-      body = `
-        <div class="video-note" onclick="toggleVideoNotePlayback(this)">
-          <video src="/api/media/${m.media_id}" playsinline loop ${m.thumb_path ? `poster="/api/media/${m.media_id}/thumb"` : ""}></video>
-        </div>
-      `;
-    } else if (m.type === "media" && m.media_id) {
-      if (m.media_mime?.startsWith("image/")) {
-        body = `<img class="media-image" src="/api/media/${m.media_id}" onclick="window.open(this.src)" alt="">`;
-      } else if (m.media_mime?.startsWith("video/")) {
-        body = `<video class="media-video" src="/api/media/${m.media_id}" controls playsinline ${m.thumb_path ? `poster="/api/media/${m.media_id}/thumb"` : ""}></video>`;
-      } else {
-        body = `<a class="media-file" href="/api/media/${m.media_id}" target="_blank">📎 Файл</a>`;
-      }
-    } else {
-      body = `<div class="bText">${escapeHtml((m._text ?? m.text ?? "").toString())}</div>`;
-    }
-
-    // In DM: no avatars/names, just bubbles like Telegram
-    // In groups: show avatars/names
-    const showSenderInfo = !isDM && !mine;
-
-    // Check if this message is being replied to
-    const isReplyingTo = state.replyTo?.id === msgId;
-
-    // Reply preview if this message is a reply
-    const replyPreview = m.reply_to ? `
-      <div class="reply-reference" onclick="scrollToMessage('${m.reply_to.id}', event)">
-        <div class="reply-line"></div>
-        <div class="reply-info">
-          <div class="reply-name">${escapeHtml(m.reply_to.sender_name || 'Пользователь')}</div>
-          <div class="reply-text">${escapeHtml((m.reply_to.text || '').slice(0, 60))}${(m.reply_to.text || '').length > 60 ? '...' : ''}</div>
-        </div>
-      </div>
-    ` : '';
-
-    // Reactions
-    const myId = String(state.me?.id || "");
-    const reactions = m.reactions || {};
-    const reactionsHtml = Object.keys(reactions).length > 0 ? `
-      <div class="reactions">
-        ${Object.entries(reactions).map(([emoji, users]) => {
-          const count = users.length;
-          const myReaction = users.includes(myId);
-          return `<button class="reaction-tag ${myReaction ? 'my-reaction' : ''}" onclick="${myReaction ? `removeReaction('${safeMsgId}', '${escapeJsSingleQuoted(emoji)}', event)` : `addReaction('${safeMsgId}', '${escapeJsSingleQuoted(emoji)}')`}">${escapeHtml(emoji)} ${count}</button>`;
-        }).join('')}
-      </div>
-    ` : '';
-
-    // Check read status for my messages
-    const isRead = mine && m.read_by && m.read_by.length > 0;
-    const readStatus = isRead ? (m.read_by.length === 1 ? "✓✓" : "✓") : "";
-
-    return `
-      <div class="bubble ${mine ? "me" : ""} ${isDM ? 'dm' : ''} ${isReplyingTo ? 'replying-to' : ''}" id="msg-${escapeHtml(msgId)}" data-message-id="${escapeHtml(msgId)}"
-           ondblclick="replyToMessage('${safeMsgId}', event)"
-           ontouchstart="handleTouchStart(event, '${safeMsgId}')"
-           ontouchend="handleTouchEnd(event)">
-        ${showSenderInfo && senderId ? `<div class="bAvatar">${senderAvatar ? `<img src="${senderAvatar}">` : `<div class="avatar-placeholder-sm"></div>`}</div>` : ""}
-        <div class="bContent">
-          ${showSenderInfo && senderId ? `<div class="bSender">${safeSenderName}</div>` : ""}
-          ${replyPreview}
-          ${body}
-          <div class="bTime">${time}${mine && msgId ? ` <button class="btn-delete-msg" onclick="deleteMessage('${safeMsgId}')" title="Удалить">✕</button>` : ""} <button class="btn-reaction" onclick="showReactionPicker('${safeMsgId}', event)">😊</button>${readStatus ? ` <span class="msg-status ${isRead ? 'read' : 'delivered'}">${readStatus}</span>` : ""}</div>
-          ${reactionsHtml}
-        </div>
-      </div>
-    `;
-  }).join("");
-  if (stickToBottom) box.scrollTop = box.scrollHeight;
+// Video note (кружок): circular preview, tap to play/pause, progress ring and a
+// mute toggle — the way Telegram renders them. The ring is an SVG circle whose
+// stroke-dashoffset tracks playback, so no per-frame layout work happens.
+function renderVideoNote(m) {
+  const src = `/api/media/${m.media_id}`;
+  const poster = m.thumb_path ? ` poster="/api/media/${m.thumb_path}"` : "";
+  const duration = Number(m.duration_sec) > 0 ? formatNoteDuration(m.duration_sec) : "";
+  return `
+    <div class="video-note" data-video-note role="button" tabindex="0"
+         aria-label="Видеокружок${duration ? `, ${duration}` : ""}"
+         onclick="toggleVideoNotePlayback(this)"
+         onkeydown="if(event.key===' '||event.key==='Enter'){event.preventDefault();toggleVideoNotePlayback(this);}">
+      <video src="${src}"${poster} playsinline loop preload="metadata"></video>
+      <svg class="vn-ring" viewBox="0 0 100 100" aria-hidden="true">
+        <circle class="vn-ring-track" cx="50" cy="50" r="48"></circle>
+        <circle class="vn-ring-progress" cx="50" cy="50" r="48"></circle>
+      </svg>
+      ${duration ? `<span class="vn-badge">${duration}</span>` : ""}
+      <button type="button" class="vn-mute" aria-label="Звук" aria-pressed="false"
+              onclick="toggleVideoNoteMute(event, this)">${icon('speaker')}</button>
+    </div>
+  `;
 }
 
 function renderMessageBody(m) {
@@ -3890,11 +3782,7 @@ function renderMessageBody(m) {
     return `<audio class="media-audio" src="/api/media/${m.media_id}" controls preload="metadata" playsinline></audio>`;
   }
   if (m.type === "video_note" && m.media_id) {
-    return `
-      <div class="video-note" onclick="toggleVideoNotePlayback(this)">
-        <video src="/api/media/${m.media_id}" playsinline loop ${m.thumb_path ? `poster="/api/media/${m.media_id}/thumb"` : ""}></video>
-      </div>
-    `;
+    return renderVideoNote(m);
   }
   if (m.type === "media" && m.media_id) {
     if (m.media_mime?.startsWith("image/")) {
@@ -3907,6 +3795,75 @@ function renderMessageBody(m) {
   }
   return `<div class="bText">${renderMentionText((m._text ?? m.text ?? "").toString())}</div>`;
 }
+
+const VN_RING_LENGTH = 2 * Math.PI * 48;
+
+function updateVideoNoteRing(note) {
+  const video = note.querySelector("video");
+  const ring = note.querySelector(".vn-ring-progress");
+  if (!video || !ring) return;
+  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+  const fraction = duration ? Math.min(1, video.currentTime / duration) : 0;
+  ring.style.strokeDasharray = String(VN_RING_LENGTH);
+  ring.style.strokeDashoffset = String(VN_RING_LENGTH * (1 - fraction));
+  ring.style.opacity = fraction > 0 ? "1" : "0";
+}
+
+// Only one video note plays at a time, like a voice message.
+function pauseOtherVideoNotes(current) {
+  for (const other of $$(".video-note")) {
+    if (other === current) continue;
+    const video = other.querySelector("video");
+    if (video && !video.paused) video.pause();
+  }
+}
+
+function bindVideoNote(note) {
+  if (note.dataset.vnBound === "1") return;
+  note.dataset.vnBound = "1";
+  const video = note.querySelector("video");
+  if (!video) return;
+  video.addEventListener("timeupdate", () => updateVideoNoteRing(note));
+  video.addEventListener("play", () => {
+    note.classList.add("playing");
+    pauseOtherVideoNotes(note);
+    updateVideoNoteRing(note);
+  });
+  video.addEventListener("pause", () => note.classList.remove("playing"));
+  video.addEventListener("ended", () => {
+    note.classList.remove("playing");
+    updateVideoNoteRing(note);
+  });
+  video.addEventListener("loadedmetadata", () => updateVideoNoteRing(note));
+  // Start muted so a tap never blasts audio unexpectedly; the mute button
+  // is the explicit opt-in, matching Telegram's default for кружки.
+  video.muted = true;
+  updateVideoNoteRing(note);
+}
+
+function bindAllVideoNotes() {
+  for (const note of $$(".video-note")) bindVideoNote(note);
+}
+
+window.toggleVideoNotePlayback = (container) => {
+  const video = container?.querySelector?.("video");
+  if (!video) return;
+  if (video.paused) {
+    video.play().catch(() => {});
+  } else {
+    video.pause();
+  }
+};
+
+window.toggleVideoNoteMute = (event, button) => {
+  event?.stopPropagation?.();
+  const note = button?.closest?.(".video-note");
+  const video = note?.querySelector?.("video");
+  if (!video) return;
+  video.muted = !video.muted;
+  button.setAttribute("aria-pressed", String(video.muted));
+  button.classList.toggle("muted", video.muted);
+};
 
 function buildRenderedMessagesHtml() {
   const currentRoom = state.rooms.find(r => r.id === state.activeRoomId);
@@ -3980,7 +3937,7 @@ function renderMessages() {
   const bottom = shouldStickToBottom(box);
   const older = state.chatHistory?.has_older !== false ? `<button id="loadOlderMessages" class="history-load" onclick="loadOlderMessages()" ${state.loadingOlder ? 'disabled' : ''}>${state.loadingOlder ? 'Загрузка…' : 'Загрузить предыдущие сообщения'}</button>` : '';
   reconcileMessages(box, `<div id="scrollDateIndicator" class="scroll-date-indicator" aria-hidden="true"></div>${older}${buildRenderedMessagesHtml()}`, bottom);
-  bindMessagesScrollIndicator(); syncScrollDateIndicator(box, false); chatRuntime.bind(); void hydrateVisibleMedia();
+  bindMessagesScrollIndicator(); syncScrollDateIndicator(box, false); chatRuntime.bind(); bindAllVideoNotes(); void hydrateVisibleMedia();
 }
 function render() { renderMessages(); }
 
@@ -4288,6 +4245,41 @@ window.startRoomCall = async (isVideo = false) => {
   } catch (e) { console.error("Failed to start call:", e); alert("Ошибка звонка"); hangupCall(); }
 };
 
+window.jumpToDate = () => {
+  const dialog = document.createElement('dialog');
+  dialog.className = 'actions-dialog';
+  dialog.innerHTML = '<h2>Перейти к дате</h2><label>Дата<input type="date" aria-label="Дата сообщения"></label><div class="row" style="margin-top:12px"><button type="button" class="btn primary">Перейти</button><button type="button" class="btn">Отмена</button></div>';
+  const input = dialog.querySelector('input');
+  const [go, cancel] = dialog.querySelectorAll('button');
+  const close = () => { dialog.close(); dialog.remove(); };
+  cancel.onclick = close;
+  go.onclick = async () => {
+    if (!input.value) return;
+    const target = new Date(`${input.value}T00:00:00`);
+    close();
+    // Walk back through history until the target day is loaded (bounded so a
+    // stray click cannot pull the whole archive).
+    for (let page = 0; page < 40; page += 1) {
+      const first = state.messages[0];
+      if (!first || new Date(first.created_at) <= target || state.chatHistory?.has_older === false) break;
+      await chatRuntime.older();
+    }
+    const hit = state.messages.find(message => new Date(message.created_at) >= target);
+    if (!hit) { toast('Сообщений за эту дату не найдено'); return; }
+    const node = document.getElementById('msg-' + hit.id);
+    if (node) {
+      node.scrollIntoView({ block: 'center' });
+      node.classList.add('selected-message');
+      setTimeout(() => node.classList.remove('selected-message'), 1600);
+    } else {
+      await chatRuntime.jump(hit.id);
+    }
+  };
+  document.body.append(dialog);
+  dialog.showModal();
+  input.focus();
+};
+
 window.addEventListener("popstate", () => {
   const roomId = new URL(location.href).searchParams.get("room");
   if (roomId && state.me) void selectRoom(roomId, { fromRoute: true });
@@ -4310,6 +4302,12 @@ window.addEventListener("popstate", () => {
     connectWS();void initE2E();void initServiceWorker();
     await loadRooms().catch(error=>toast(userError(error)));await mount();
     const roomId=new URL(location.href).searchParams.get('room');if(roomId && !state.activeRoomId && state.rooms.some(room=>room.id===roomId))await selectRoom(roomId);
+    // A shared message link (?room=…&msg=…) scrolls to that message once the
+    // history has rendered.
+    const linkedMessage = new URL(location.href).searchParams.get('msg');
+    if (linkedMessage && state.activeRoomId) {
+      requestAnimationFrame(() => window.scrollToMessage?.(linkedMessage, { highlight: true }));
+    }
     await syncProfileRoute();
   }catch(error){console.error('Init error:',error);toast(userError(error));await mount();}
 })();

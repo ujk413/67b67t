@@ -11,7 +11,7 @@ export function createMediaController({ context, enqueue, encryptFile, report })
     const valid = () => context()?.userId === owner.userId;
     const name = `media-draft:${owner.roomId}:${kind}`, blobName = name + ':blob';
     let stream, recorder, chunks = [], blob, savedBlob, uploaded, cancelled = false, busy = false, xhr, timer, startedAt = 0, facing = 'user', urls = [],fileIds=new Map(),captionSent=false,albumId=crypto.randomUUID();
-    const dialog = element('dialog', 'media-dialog'), heading = element('h2', '', kind === 'voice' ? 'Голосовое сообщение' : kind === 'circle' ? 'Видеокружок' : 'Вложения');
+    const dialog = element('dialog', kind === 'circle' ? 'media-dialog circle-recorder' : 'media-dialog'), heading = element('h2', '', kind === 'voice' ? 'Голосовое сообщение' : kind === 'circle' ? 'Видеокружок' : 'Вложения');
     const destination = element('p', 'media-destination', 'В чат: ' + owner.title), preview = element('div', 'recording-preview'), status = element('p', 'media-status'), error = element('p', 'form-error'); error.setAttribute('role', 'alert');
     const caption = element('textarea', 'textarea'); caption.placeholder = 'Подпись'; caption.setAttribute('aria-label', 'Подпись к вложениям');
     const progress = element('progress', 'media-progress'); progress.max = 1; progress.value = 0; progress.hidden = true;
@@ -65,7 +65,7 @@ export function createMediaController({ context, enqueue, encryptFile, report })
         if (cancelled || !valid()) { cleanupStream(); return; }
         chunks = []; uploaded = null; const choices = kind === 'voice' ? ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'] : ['video/mp4', 'video/webm;codecs=vp8,opus', 'video/webm'];
         const mime = choices.find(type => MediaRecorder.isTypeSupported(type)); recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-        preview.replaceChildren(); if (kind === 'circle') { const video = element('video', 'circle-preview'); video.srcObject = stream; video.autoplay = true; video.muted = true; video.playsInline = true; preview.append(video); }
+        preview.replaceChildren(); if (kind === 'circle') { const video = element('video', 'circle-preview'); video.srcObject = stream; video.autoplay = true; video.muted = true; video.playsInline = true; if (facing === 'user') video.setAttribute('style', 'transform:scaleX(-1)'); preview.append(video); }
         recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
         recorder.onstop = async () => {
           const duration = Date.now() - startedAt; cleanupStream(); stop.hidden = true; start.hidden = false; start.disabled = false; flip.disabled = false;

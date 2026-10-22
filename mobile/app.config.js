@@ -16,6 +16,11 @@ module.exports = ({ config }) => {
     plugins: [
       ...(config.plugins || []),
       "expo-sharing",
+      // Only arm64-v8a: a universal APK carries four ABIs and weighs ~168 MB,
+      // which is where the flaky update downloads came from. This cuts it to
+      // roughly a third. It is also what keeps the setting alive across
+      // `expo prebuild --clean`, unlike gradle.properties.
+      ["expo-build-properties", { android: { buildArchs: ["arm64-v8a"] } }],
       ["expo-video", { supportsBackgroundPlayback: false, supportsPictureInPicture: false }],
       ["expo-sqlite", { useSQLCipher: true, enableFTS: true }],
       "expo-secure-store",

@@ -9,7 +9,7 @@
     "web": "expo start --web",
     "postinstall": "node scripts/patch-expo-notifications.cjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --test ../tests/mobile-runtime.test.mjs ../tests/groupcrypto.test.mjs ../tests/mobile-data.test.mjs ../tests/room-crypto.test.mjs ../tests/mobile-push.test.mjs ../tests/group-interop.test.mjs ../tests/mobile-update.test.mjs",
+    "test": "node --test ../tests/mobile-runtime.test.mjs ../tests/groupcrypto.test.mjs ../tests/mobile-data.test.mjs ../tests/room-crypto.test.mjs ../tests/mobile-push.test.mjs ../tests/group-interop.test.mjs ../tests/mobile-update.test.mjs ../tests/audio-session.test.mjs",
     "icons:prepare": "node ../scripts/prepare_icons.cjs"
   },
   "dependencies": {
@@ -22,6 +22,7 @@
     "@react-navigation/native-stack": "^7.21.0",
     "expo": "~55.0.5",
     "expo-av": "^16.0.8",
+    "expo-build-properties": "~55.0.18",
     "expo-camera": "~55.0.23",
     "expo-clipboard": "~55.0.17",
     "expo-constants": "^55.0.15",
@@ -31,6 +32,7 @@
     "expo-image-manipulator": "~55.0.21",
     "expo-image-picker": "~55.0.11",
     "expo-intent-launcher": "~55.0.16",
+    "expo-local-authentication": "~55.0.18",
     "expo-network": "~55.0.18",
     "expo-notifications": "55.0.27",
     "expo-secure-store": "~55.0.18",
@@ -46,6 +48,7 @@
     "react-native-reanimated": "4.2.1",
     "react-native-safe-area-context": "~5.6.2",
     "react-native-screens": "~4.23.0",
+    "react-native-svg": "15.15.3",
     "react-native-webrtc": "^124.0.4",
     "react-native-worklets": "0.7.4"
   },

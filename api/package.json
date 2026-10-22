@@ -6,7 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test ../tests/mobile-api.test.mjs ../tests/socket-session.test.mjs ../tests/web-push.test.mjs ../tests/web-notifications.test.mjs ../tests/native-push.test.mjs ../tests/auth-flow.test.mjs ../tests/web-runtime.test.mjs ../tests/calls.test.mjs ../tests/chat-races.test.mjs ../tests/web-media.test.mjs ../tests/web-syntax.test.mjs ../tests/app-release.test.mjs"
+    "test": "node --test ../tests/mobile-api.test.mjs ../tests/socket-session.test.mjs ../tests/web-push.test.mjs ../tests/web-notifications.test.mjs ../tests/native-push.test.mjs ../tests/auth-flow.test.mjs ../tests/web-runtime.test.mjs ../tests/calls.test.mjs ../tests/chat-races.test.mjs ../tests/web-media.test.mjs ../tests/web-syntax.test.mjs ../tests/app-release.test.mjs ../tests/web-handlers.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",

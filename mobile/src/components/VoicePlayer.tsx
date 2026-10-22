@@ -2,9 +2,32 @@ import { useEffect, useRef, useState } from "react";
 import { Audio, type AVPlaybackStatus } from "expo-av";
 import { Pressable, Text, View } from "react-native";
 import { useTheme } from "../ThemeProvider";
+import { ensurePlaybackMode } from "../audioSession";
 import { useMediaHeaders } from "../MediaSession";
 import { Icon } from "./Icon";
 let current: Audio.Sound | null = null;
+
+// Stable pseudo-waveform per media URI: same message always draws the same
+// bars, without shipping or decoding an actual waveform.
+const WAVE_BARS = 30;
+function waveformFor(seed: string): number[] {
+  let hash = 2166136261;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  const bars: number[] = [];
+  for (let i = 0; i < WAVE_BARS; i += 1) {
+    hash ^= hash << 13;
+    hash ^= hash >>> 17;
+    hash ^= hash << 5;
+    hash >>>= 0;
+    // 0.18..1 keeps the shape readable but never a flat line.
+    bars.push(0.18 + (hash % 1000) / 1000 * 0.82);
+  }
+  return bars;
+}
+
 export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDuration?:number }) {
   const { colors } = useTheme(),
     headers = useMediaHeaders();
@@ -15,6 +38,7 @@ export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDu
     [duration, setDuration] = useState(initialDuration),
     [rate, setRate] = useState(1),
     [error, setError] = useState("");
+  const waveform = useRef(waveformFor(uri)).current;
   const update = (status: AVPlaybackStatus) => {
     if (!status.isLoaded) {
       setPlaying(false);
@@ -48,6 +72,8 @@ export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDu
         await current.unloadAsync().catch(() => {});
         current = null;
       }
+      // A previous call or recording may have left the communication route on.
+      await ensurePlaybackMode();
       if (!sound.current) {
         const created = await Audio.Sound.createAsync(
           { uri, headers },
@@ -115,23 +141,26 @@ export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDu
               ),
             );
           }}
-          style={{ flex: 1, paddingVertical: 20, marginHorizontal: 8 }}
+          style={{ flex: 1, paddingVertical: 18, marginHorizontal: 8 }}
         >
-          <View
-            style={{
-              height: 5,
-              borderRadius: 3,
-              backgroundColor: colors.divider,
-            }}
-          >
-            <View
-              style={{
-                height: 5,
-                width: `${duration ? (position / duration) * 100 : 0}%`,
-                backgroundColor: colors.text.blue,
-                borderRadius: 3,
-              }}
-            />
+          {/* Waveform instead of a flat bar: bars are derived from the media URI
+              so every message keeps a stable shape, and the played part is
+              tinted — the way Telegram draws a voice message. */}
+          <View style={{ flexDirection: "row", alignItems: "center", height: 26, gap: 2 }}>
+            {waveform.map((height, index) => {
+              const played = duration ? index / waveform.length <= position / duration : false;
+              return (
+                <View
+                  key={index}
+                  style={{
+                    flex: 1,
+                    height: Math.max(3, Math.round(height * 26)),
+                    borderRadius: 2,
+                    backgroundColor: played ? colors.text.blue : colors.divider,
+                  }}
+                />
+              );
+            })}
           </View>
         </Pressable>
         <Pressable

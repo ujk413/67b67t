@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { ensurePlaybackMode, ensureRecordingMode } from "../audioSession";
 import {
   Alert,
   ActivityIndicator,
@@ -97,6 +98,9 @@ export function VoiceRecorder({
         setLocked(false);
       }
       lock.current = false;
+      // Hand the audio session back: leaving recording mode on is what made
+      // later playback quiet and routed to the earpiece.
+      void ensurePlaybackMode();
     }
   };
   const start = async (lockedMode = false) => {
@@ -124,10 +128,7 @@ export function VoiceRecorder({
       }
       if (!previous.granted) { setError("Микрофон подключён. Удерживайте кнопку ещё раз, чтобы начать запись."); return; }
       if ((!held.current && !lockedMode) || cancelled.current || !mounted.current) return;
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
+      await ensureRecordingMode();
       const rec = new Audio.Recording();
       await rec.prepareToRecordAsync(
         Audio.RecordingOptionsPresets.HIGH_QUALITY,

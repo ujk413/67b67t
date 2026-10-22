@@ -1,4 +1,5 @@
 import { VoicePlayer } from "./VoicePlayer";
+import { VideoNote } from "./VideoNote";
 import { useTheme } from "../ThemeProvider";
 import { Alert, Image, Pressable, StyleSheet, Text, View } from "react-native";
 import { Video, ResizeMode } from "./Video";
@@ -11,6 +12,26 @@ import { messageStatus } from "../data/messages";
 import { RichText } from "./RichText";
 import { useMediaHeaders, useProtectedMedia } from "../MediaSession";
 import type { Message, User } from "../types";
+
+const MAX_MEDIA_SIDE = 280;
+const MIN_MEDIA_SIDE = 96;
+
+/**
+ * Photo box from the dimensions the server stored. Falls back to a square when
+ * they are missing, and keeps extreme panoramas readable by clamping the ratio.
+ */
+function imageBox(width?: number | null, height?: number | null) {
+  const w = Number(width) || 0;
+  const h = Number(height) || 0;
+  if (w <= 0 || h <= 0) return { width: MAX_MEDIA_SIDE, height: MAX_MEDIA_SIDE };
+  const ratio = Math.min(2.4, Math.max(0.42, w / h));
+  const boxWidth = ratio >= 1 ? MAX_MEDIA_SIDE : Math.round(MAX_MEDIA_SIDE * ratio);
+  const boxHeight = ratio >= 1 ? Math.round(MAX_MEDIA_SIDE / ratio) : MAX_MEDIA_SIDE;
+  return {
+    width: Math.max(MIN_MEDIA_SIDE, boxWidth),
+    height: Math.max(MIN_MEDIA_SIDE, boxHeight),
+  };
+}
 
 type MessageBubbleProps = {
   message: Message;
@@ -283,23 +304,23 @@ function MessageContent({
       </Pressable>
     );
 
-  if (message.type === "video_note" && url && onOpenMedia) {
+  if (message.type === "video_note" && url) {
     return (
-      <Pressable onPress={() => onOpenMedia(message)} onLongPress={onLongPress}>
-        <Video
-          source={{ uri: url, headers }}
-          style={styles.videoNote}
-          useNativeControls={false}
-          resizeMode={ResizeMode.COVER}
-          isLooping
-        />
-      </Pressable>
+      <VideoNote
+        uri={url}
+        durationSec={message.duration_sec}
+        onLongPress={onLongPress}
+        onOpenViewer={onOpenMedia ? () => onOpenMedia(message) : undefined}
+      />
     );
   }
 
   if (message.type === "media" && url && onOpenMedia) {
     const mime = message.media_mime || "";
     if (mime.startsWith("image/")) {
+      // Honour the real aspect ratio the server reported instead of cropping
+      // every photo to a square. Telegram sizes a photo by its own dimensions.
+      const natural = imageBox(message.width, message.height);
       return (
         <Pressable
           onPress={() => onOpenMedia(message)}
@@ -307,7 +328,7 @@ function MessageContent({
         >
           <Image
             source={{ uri: autoDownload ? url : thumb || url, headers }}
-            style={styles.mediaImage}
+            style={[styles.mediaImage, natural]}
             resizeMode="cover"
           />
         </Pressable>
