@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import type { ProtectedUploader } from "../protectedUpload";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -16,9 +17,15 @@ import * as DocumentPicker from "expo-document-picker";
 import * as Files from "expo-file-system/legacy";
 import { Video, ResizeMode } from "./Video";
 import { CircleCamera } from "./CircleCamera";
+import {PhotoEditor} from './PhotoEditor';
+import {runMediaTask} from '../mediaLifecycle';
+import {processVideo} from '../mediaProcessing';
 import { useTheme } from "../ThemeProvider";
 import { newId, type AccountRepository } from "../data/repository";
 type Attachment = {
+  original?:{uri:string;details?:import('../../../web/media-details.js').MediaDetails};
+  quality?:'original'|480|720;
+  details?:import('../../../web/media-details.js').MediaDetails;
   albumId?: string;
   caption?: string;
   id: string;
@@ -61,10 +68,12 @@ export function MediaTray({
     [circle, setCircle] = useState(initialCircle);
   const xhr = useRef<{abort():void} | null>(null),
     current = useRef(items);
+  const currentCaption = useRef(""), saveQueue = useRef<Promise<void>>(Promise.resolve());
   current.current = items;
-  const stopped = useRef(false);
+  const stopped = useRef(false), generation = useRef(0), live = useRef(true);
+  const [editingPhoto,setEditingPhoto]=useState<Attachment|null>(null);
   useEffect(() => {
-    let active = true;
+    let active = true; live.current = true; const owner = ++generation.current;
     void repository
       ?.get<{
         items: Attachment[];
@@ -72,45 +81,55 @@ export function MediaTray({
       }>(`attachments:${roomId}`, { items: [], caption: "" })
       .then((value) => {
         if (active) {
+          current.current = value.items;
+          currentCaption.current = value.caption;
           setItems(value.items);
           setCaption(value.caption);
         }
       });
     return () => {
-      active = false;
+      active = false; live.current = false; if (generation.current === owner) generation.current++;
       stopped.current = true;
       xhr.current?.abort();
     };
   }, [roomId]);
-  const save = (next: Attachment[], text = caption) => {
-    setItems(next);
-    current.current = next;
-    void repository?.set(`attachments:${roomId}`, {
-      items: next,
-      caption: text,
+  const save = (change: (items: Attachment[], text: string) => Attachment[], text?: string) => {
+    const owner = generation.current;
+    // Calculate from committed state only when earlier mutations have settled.
+    const operation = saveQueue.current.then(async () => {
+      if (!repository || !live.current || generation.current !== owner) throw Error("Экран вложений закрыт");
+      const next = change(current.current, currentCaption.current), nextCaption = text ?? currentCaption.current;
+      await repository.set(`attachments:${roomId}`, { items: next, caption: nextCaption });
+      if (live.current && generation.current === owner) {
+        current.current = next;
+        currentCaption.current = nextCaption;
+        setItems(next);
+      }
+      return next;
     });
+    saveQueue.current = operation.then(() => {}, () => {});
+    return operation;
   };
   const permissionError = () =>
-    Alert.alert("Нет разрешения", "Разрешите доступ в настройках приложения", [
-      { text: "Отмена" },
-      { text: "Настройки", onPress: () => void Linking.openSettings() },
+    Alert.alert(uiText("Нет разрешения"), uiText("Разрешите доступ в настройках приложения"), [
+      { text: uiText("Отмена") },
+      { text: uiText("Настройки"), onPress: () => void Linking.openSettings() },
     ]);
   const add = async (values: Omit<Attachment, "id">[]) => {
+    if(!repository || !live.current)throw Error("Экран вложений закрыт");
+    const owner=generation.current;
     try {
-      if (!repository) throw new Error("Хранилище ещё загружается. Повторите попытку.");
-      const dir = `${Files.documentDirectory}draft-media/${repository.userId}/`;
-      await Files.makeDirectoryAsync(dir, { intermediates: true });
-      const additions = [];
-      for (const value of values) {
-        const id = newId(),
-          uri = dir + id + "-" + value.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-        await Files.copyAsync({ from: value.uri, to: uri });
-        additions.push({ ...value, id, uri });
-      }
-      save([...current.current, ...additions]);
-    } catch (e) {
-      setError(String(e));
-    }
+      await runMediaTask(repository.userId,async task=>{
+        const check=()=>{task.check();if(!live.current || generation.current!==owner)throw Error("Экран вложений закрыт");};
+        const dir = `${Files.documentDirectory}draft-media/${repository.userId}/`,added:string[]=[];let saved=false;
+        try{
+          await Files.makeDirectoryAsync(dir, { intermediates: true });check();
+          const additions: Attachment[]=[];
+          for(const value of values){const id=newId(),uri=dir+id+'-'+value.name.replace(/[^a-zA-Z0-9._-]/g,'_');added.push(uri);await Files.copyAsync({from:value.uri,to:uri});check();additions.push({...value,id,uri});}
+          check();await save(items=>{check();return [...items,...additions];});saved=true;check();
+        }finally{if(!saved)await Promise.all(added.map(uri=>Files.deleteAsync(uri,{idempotent:true}).catch(()=>{})));}
+      });
+    }catch(e){if(live.current && generation.current===owner)setError(String(e));throw e;}
   };
   const gallery = async () => {
     try {
@@ -135,11 +154,37 @@ export function MediaTray({
               asset.mimeType ||
               `${asset.type === "video" ? "video/mp4" : "image/jpeg"}`,
             kind: asset.type === "video" ? "video" : "image",
+            details:{width:asset.width,height:asset.height,duration_ms:asset.duration || undefined},
           })),
         );
     } catch (e) {
       setError(String(e));
     }
+  };
+  const videoQuality=async(item:Attachment)=>{
+    if(!repository || !live.current)return;
+    const screenOwner=generation.current;
+    const quality=item.quality===undefined || item.quality==='original'?720:item.quality===720?480:'original';
+    const original=item.original || {uri:item.uri,details:item.details};
+    if(quality==='original'){await save(items=>items.map(value=>value.id===item.id?{...value,uri:original.uri,details:original.details,original,quality}:value));return;}
+    await runMediaTask(repository.userId,async ticket=>{
+    await saveQueue.current;ticket.check();if(!live.current || generation.current!==screenOwner)return;
+    const owner=++generation.current;const valid=()=>{try{ticket.check();return live.current && !stopped.current && generation.current===owner;}catch{return false;}};
+    setBusy(true);setError('');stopped.current=false;
+    const task=processVideo(original.uri,quality,value=>{if(valid())setProgress(value);});xhr.current={abort:task.abort};const cancel=ticket.onCancel(task.abort);
+    let output='',target='',published=false;
+    try {
+      const result=await task.promise;output=result.uri;if(!valid())return;
+      target=`${Files.documentDirectory}draft-media/${repository.userId}/${newId()}-video.mp4`;
+      await Files.copyAsync({from:result.uri,to:target});if(!valid())return;
+      await save(items=>{if(!valid())throw Error("Экран вложений закрыт");return items.map(value=>value.id===item.id?{...value,uri:target,mime:'video/mp4',name:'video.mp4',details:{...original.details,width:result.width,height:result.height,duration_ms:result.duration_ms,orientation:result.orientation,rotation:result.rotation},original,quality}:value);});published=true;
+    }catch(value){if(valid())setError(String(value));}finally{
+      cancel();
+      if(output.startsWith(Files.cacheDirectory||'invalid:'))await Files.deleteAsync(output,{idempotent:true}).catch(()=>{});
+      if(target && !published)await Files.deleteAsync(target,{idempotent:true}).catch(()=>{});
+      if(live.current && generation.current===owner){setBusy(false);setProgress(0);xhr.current=null;}
+    }
+    });
   };
   const camera = async () => {
     try {
@@ -155,6 +200,7 @@ export function MediaTray({
             name: "camera.jpg",
             mime: "image/jpeg",
             kind: "image",
+            details:{width:asset.width,height:asset.height},
           })),
         );
     } catch (e) {
@@ -191,47 +237,39 @@ export function MediaTray({
     stopped.current = false;
     const album = newId();
     try {
-      let remaining = current.current.map((item, index) => ({
+      let remaining = await save((items, text) => items.map((item, index) => ({
         ...item,
         albumId: item.albumId || album,
         caption:
           item.caption === undefined
             ? index === 0
-              ? caption
+              ? text
               : ""
             : item.caption,
-      }));
-      save(remaining);
+      })));
       for (const item of [...remaining]) {
         if (stopped.current) break;
-        let mediaId = item.uploaded;
-        if (!mediaId) {
-          const result = await upload(item);mediaId=result.id;item.protectedMeta=result.meta;
-          item.uploaded = mediaId;
-          save(remaining.map((x) => (x.id === item.id ? item : x)));
-        }
+        const mediaId = item.uploaded;
         if (stopped.current) break;
         await onSend(
           item.caption || "",
           {
             type: item.kind === "video_note" ? "video_note" : "media",
             media_id: mediaId,
+            __queue_id:item.id,
+            ...(!mediaId?{__upload:{uri:item.uri,name:item.name,mime:item.mime,details:item.details}}:{}),
             text: item.caption || "",
             meta: { album_id: item.albumId, filename: item.name, ...item.protectedMeta },
           },
           roomId,
         );
-        remaining = remaining.filter((x) => x.id !== item.id);
-        save(remaining);
-        await Files.deleteAsync(item.uri, { idempotent: true });
+        remaining = await save(items => items.filter((x) => x.id !== item.id));
+        // The durable outbox owns this file until delivery/cancellation.
       }
       if (!remaining.length) {
+        const latest = await save(items => items, "");
         setCaption("");
-        await repository?.set(`attachments:${roomId}`, {
-          items: [],
-          caption: "",
-        });
-        onSent();
+        if (!latest.length) onSent();
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -257,14 +295,25 @@ export function MediaTray({
         paddingBottom: 20,
       }}
     >
+      {editingPhoto && <PhotoEditor uri={editingPhoto.uri} onClose={()=>setEditingPhoto(null)} onApply={async (result,isCurrent)=>{
+        if(!repository || stopped.current || !live.current)throw Error("Экран вложений закрыт");
+        await runMediaTask(repository.userId,async task=>{
+          const uri=`${Files.documentDirectory}draft-media/${repository.userId}/${newId()}-edited.jpg`;let saved=false;
+          try{
+            await Files.copyAsync({from:result.uri,to:uri});task.check();
+            if(stopped.current || !live.current || isCurrent?.()===false)return;
+            await save(items=>{task.check();if(stopped.current || isCurrent?.()===false)throw Error("Экран вложений закрыт");return items.map(item=>item.id===editingPhoto.id?{...item,uri,mime:'image/jpeg',name:'photo.jpg',details:{width:result.width,height:result.height,orientation:1}}:item);});saved=true;
+          }finally{if(!saved)await Files.deleteAsync(uri,{idempotent:true}).catch(()=>{});}
+        });
+      }}/>}
       {!!error && (
         <Text style={{ padding: 12, color: colors.misc.error }}>{error}</Text>
       )}
       {circle ? (
         <CircleCamera
+          userId={repository?.userId}
           onCancel={() => setCircle(false)}
           onRecorded={async (uri) => {
-            setCircle(false);
             await add([
               {
                 uri,
@@ -273,19 +322,22 @@ export function MediaTray({
                 kind: "video_note",
               },
             ]);
+            setCircle(false);
           }}
         />
       ) : (
         <>
           <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
-            {button("Галерея", () => void gallery())}
-            {button("Камера", () => void camera())}
-            {button("Файл", () => void file())}
-            {button("Видеокружок", () => setCircle(true))}
+            {button(uiText("Галерея"), () => void gallery())}
+            {button(uiText("Камера"), () => void camera())}
+            {button(uiText("Файл"), () => void file())}
+            {button(uiText("Видеокружок"), () => setCircle(true))}
           </View>
           <ScrollView horizontal style={{ minHeight: items.length ? 170 : 0 }}>
             {items.map((item) => (
               <View key={item.id} style={{ width: 140, margin: 8 }}>
+                {item.mime.startsWith('image/') && button(uiText("Изменить фото"),()=>setEditingPhoto(item))}
+                {item.mime.startsWith('video/') && button(uiText("Качество: {0}",item.quality || uiText("оригинал")),()=>void videoQuality(item).catch(e=>setError(String(e))))}
                 {item.mime.startsWith("image/") ? (
                   <Image
                     source={{ uri: item.uri }}
@@ -305,13 +357,18 @@ export function MediaTray({
                 )}
                 <Pressable
                   onPress={() => {
-                    save(current.current.filter((x) => x.id !== item.id));
-                    void Files.deleteAsync(item.uri, { idempotent: true });
+                    let removedUri: string | undefined;
+                    void save(items => {
+                      removedUri = items.find(x => x.id === item.id)?.uri;
+                      return items.filter(x => x.id !== item.id);
+                    })
+                      .then(() => removedUri ? Files.deleteAsync(removedUri, { idempotent: true }) : undefined)
+                      .catch(e => setError(String(e)));
                   }}
                   disabled={busy}
                   style={{ minHeight: 48, padding: 10 }}
                 >
-                  <Text style={{ color: colors.misc.error }}>Убрать</Text>
+                  <Text style={{ color: colors.misc.error }}>{uiText("Убрать")}</Text>
                 </Pressable>
               </View>
             ))}
@@ -322,9 +379,9 @@ export function MediaTray({
                 value={caption}
                 onChangeText={(value) => {
                   setCaption(value);
-                  save(current.current, value);
+                  void save(items => items, value).catch(e => setError(String(e)));
                 }}
-                placeholder="Подпись"
+                placeholder={uiText("Подпись")}
                 placeholderTextColor={colors.text.secondary}
                 editable={!busy}
                 style={{ padding: 16, color: colors.text.primary }}
@@ -332,7 +389,7 @@ export function MediaTray({
               {busy ? (
                 <>
                   <Text style={{ padding: 12, color: colors.text.secondary }}>
-                    Загрузка: {Math.round(progress * 100)}%
+                    {uiText("Загрузка:")}{Math.round(progress * 100)}%
                   </Text>
                   <Pressable
                     onPress={() => {
@@ -341,11 +398,11 @@ export function MediaTray({
                     }}
                     style={{ padding: 16, minHeight: 48 }}
                   >
-                    <Text style={{ color: colors.misc.error }}>Остановить</Text>
+                    <Text style={{ color: colors.misc.error }}>{uiText("Остановить")}</Text>
                   </Pressable>
                 </>
               ) : (
-                button("Отправить вложения", () => void send())
+                button(uiText("Отправить вложения"), () => void send())
               )}
             </>
           )}

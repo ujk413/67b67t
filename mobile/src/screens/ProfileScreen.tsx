@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { useTheme } from "../ThemeProvider";
 import {
   ActivityIndicator,
@@ -52,7 +53,7 @@ export function ProfileScreen({
         <Pressable onPress={onClose} hitSlop={8}>
           <Text style={styles.closeIcon}>✕</Text>
         </Pressable>
-        <Text style={styles.title}>Профиль</Text>
+        <Text style={styles.title}>{uiText("Профиль")}</Text>
         <View style={styles.headerSpacer} />
       </View>
 
@@ -67,12 +68,12 @@ export function ProfileScreen({
           {busyUpload ? (
             <ActivityIndicator size="small" color={telegramColors.text.blue} />
           ) : (
-            <Text style={styles.avatarButtonText}>Изменить аватар</Text>
+            <Text style={styles.avatarButtonText}>{uiText("Изменить аватар")}</Text>
           )}
         </Pressable>
 
         <View style={styles.section}>
-          <Text style={styles.label}>Имя</Text>
+          <Text style={styles.label}>{uiText("Имя")}</Text>
           <TextInput
             style={styles.input}
             value={profileName}
@@ -83,12 +84,12 @@ export function ProfileScreen({
         </View>
 
         <View style={styles.section}>
-          <Text style={styles.label}>Новый пароль</Text>
+          <Text style={styles.label}>{uiText("Новый пароль")}</Text>
           <TextInput
             style={styles.input}
             value={newPassword}
             onChangeText={onChangePassword}
-            placeholder="Оставьте пустым, чтобы не менять"
+            placeholder={uiText("Оставьте пустым, чтобы не менять")}
             placeholderTextColor={telegramColors.text.gray5}
             secureTextEntry
           />
@@ -99,7 +100,7 @@ export function ProfileScreen({
         </View>
 
         <Pressable style={styles.saveButton} onPress={onSave}>
-          <Text style={styles.saveButtonText}>Сохранить</Text>
+          <Text style={styles.saveButtonText}>{uiText("Сохранить")}</Text>
         </Pressable>
       </ScrollView>
     </View>

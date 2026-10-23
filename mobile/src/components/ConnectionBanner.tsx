@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { Pressable, Text, View } from "react-native";
 import { useTheme } from "../ThemeProvider";
 export function ConnectionBanner({
@@ -26,17 +27,18 @@ export function ConnectionBanner({
       <Text style={{ flex: 1, color: error ? "white" : colors.text.primary }}>
         {error ||
           {
-            connecting: "Подключение…",
-            offline: "Нет соединения",
+            connecting: uiText("Подключение…"),
+            syncing: uiText("Синхронизация…"),
+            offline: uiText("Нет соединения"),
             connected: "",
           }[status] ||
-          "Подключение…"}
+          uiText("Подключение…")}
       </Text>
       {error && (
         <Pressable
           onPress={onDismiss}
           accessibilityRole="button"
-          accessibilityLabel="Закрыть ошибку"
+          accessibilityLabel={uiText("Закрыть ошибку")}
           style={{
             minWidth: 48,
             minHeight: 48,
@@ -44,7 +46,7 @@ export function ConnectionBanner({
             justifyContent: "center",
           }}
         >
-          <Text style={{ color: "white" }}>Закрыть</Text>
+          <Text style={{ color: "white" }}>{uiText("Закрыть")}</Text>
         </Pressable>
       )}
     </View>

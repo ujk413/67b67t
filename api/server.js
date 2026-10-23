@@ -1,3 +1,4 @@
+import {applyAccountMigrations,installAccountIntegration,createSessionIssuer} from "./account-integration.js";
 import {
   installMobileRoutes,
   getMobileMessage,
@@ -8,6 +9,15 @@ import { installSocketSession } from "./socket-session.js";
 import { installWebPush } from './web-push.js';
 import { installCalls } from "./calls.js";
 import { installAppRelease } from "./app-release.js";
+import {installConversationFeatures} from './conversation-features.js';
+import {installExpressiveFeatures} from './expressive-features.js';
+import {loadMapBundle} from './map-bundle.js';
+import {installQualityFeatures} from './quality-features.js';
+import {installCallFeatures,createLiveKitService,callFeaturesMigration} from './call-features.js';
+import {createMessageInserter} from './message-features.js';
+import {canAccessMedia,mediaByteRange} from './media-access.js';
+import {installSfuGateway} from './sfu-gateway.js';
+import {readSessionToken,selectedCookieAccount,setBrowserSession,clearBrowserSession,installBrowserAccounts} from './browser-accounts.js';
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
@@ -260,6 +270,7 @@ async function uploadToSwift(key, filePath, contentType) {
 // Database migrations
 async function runMigrations() {
   const migrations = [
+    `ALTER TABLE messages ADD COLUMN IF NOT EXISTS listened_by jsonb NOT NULL DEFAULT '[]'`,
     `CREATE TABLE IF NOT EXISTS room_secrets (room_id uuid PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE, secret text NOT NULL, created_at timestamptz NOT NULL DEFAULT now())`,
     `CREATE TABLE IF NOT EXISTS user_blocks (blocker_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, blocked_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (blocker_id, blocked_id), CHECK (blocker_id <> blocked_id))`,
     `CREATE INDEX IF NOT EXISTS user_blocks_blocked_idx ON user_blocks(blocked_id)`,
@@ -354,6 +365,11 @@ async function runMigrations() {
   }
 }
 await runMigrations();
+// Mandatory migrations fail startup rather than expose partially installed APIs.
+await pool.query(fs.readFileSync(new URL('./mobile-schema.sql',import.meta.url),'utf8'));
+await pool.query(callFeaturesMigration);
+// Security migrations are critical: never listen after a partial failure.
+await applyAccountMigrations(pool);
 
 // Optionally create a bootstrap admin and news channel.
 async function setupSystemChannel() {
@@ -404,7 +420,7 @@ async function setupSystemChannel() {
 }
 await setupSystemChannel();
 
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: {serializers:{req:req=>({method:req.method,url:String(req.url||'').split('?')[0],hostname:req.hostname,remoteAddress:req.ip})}} });
 appLogger = app.log;
 
 await app.register(cors, { origin: publicOriginList(), credentials: true });
@@ -536,9 +552,10 @@ function httpError(statusCode, publicCode) {
 }
 
 app.setErrorHandler((err, req, reply) => {
-  const statusCode = Number(err.statusCode) || 500;
+  const limited=err.code==='P0001'&&['slow_mode','duplicate_spam'].includes(err.message);
+  const statusCode = limited?429:Number(err.statusCode) || 500;
   const publicCode =
-    statusCode >= 500 ? "server_error" : err.publicCode || "error";
+    statusCode >= 500 ? "server_error" : err.publicCode || (/^[a-z][a-z0-9_]{1,80}$/.test(err.message)?err.message:'error');
   if (reply.sent) return;
 
   logError("API Error", {
@@ -552,23 +569,13 @@ app.setErrorHandler((err, req, reply) => {
 });
 
 async function requireAuth(req) {
-  const auth = req.headers.authorization || "";
-  let token = "";
-  if (auth.toLowerCase().startsWith("bearer ")) token = auth.slice(7).trim();
-  if (!token && req.cookies?.token) token = String(req.cookies.token);
-  if (!token && req.headers?.cookie) {
-    const raw = String(req.headers.cookie);
-    const part = raw
-      .split(";")
-      .map((s) => s.trim())
-      .find((s) => s.toLowerCase().startsWith("token="));
-    if (part) token = decodeURIComponent(part.slice("token=".length));
-  }
+  if (req.accountViewer) return req.accountViewer;
+  const token=readSessionToken(req);
   if (!token) throw httpError(401, "unauthorized");
 
   const th = sha256(token);
   const { rows } = await pool.query(
-    `SELECT s.id AS session_id, s.user_id, u.username, u.display_name, u.avatar_id, u.banned
+    `SELECT s.id AS session_id, s.user_id, u.username, u.display_name, u.avatar_id, u.banned, u.login_disabled_at
      FROM sessions s
      JOIN users u ON u.id = s.user_id
      WHERE s.token_hash=$1 AND s.expires_at > now()
@@ -576,7 +583,8 @@ async function requireAuth(req) {
     [th],
   );
   if (!rows.length) throw httpError(401, "unauthorized");
-  if (rows[0].banned) throw httpError(403, "account_banned");
+  const expectedAccount=selectedCookieAccount(req);if(expectedAccount&&String(rows[0].user_id).toLowerCase()!==expectedAccount)throw httpError(401,'account_session_unavailable');
+  if (rows[0].banned || rows[0].login_disabled_at) throw httpError(403, "account_banned");
 
   const user = {
     sessionId: rows[0].session_id,
@@ -592,6 +600,7 @@ async function requireAuth(req) {
   pool
     .query(`UPDATE sessions SET last_activity=now() WHERE token_hash=$1`, [th])
     .catch(() => {});
+  req.accountViewer = user;
   return user;
 }
 
@@ -757,7 +766,17 @@ async function getMediaInfo(filePath) {
 const socketsByUser = new Map();
 const socketsByRoom = new Map();
 
-function addSocket(userId, ws) {
+function addSocket(userId, ws, sessionId) {
+  ws.accountSessionId=sessionId;
+  ws.callEndpointId=crypto.randomUUID();
+  if(!ws.accountRawSend){
+    ws.accountRawSend=ws.send.bind(ws);
+    let queue=Promise.resolve();
+    ws.send=(raw,...args)=>{queue=queue.then(async()=>{let payload;try{payload=JSON.parse(String(raw));}catch{return ws.accountRawSend(raw,...args);}
+      const filtered=await account.filterPayload(userId,payload);
+      if(filtered!==null&&ws.readyState===1)ws.accountRawSend(JSON.stringify(filtered),...args);
+    }).catch(error=>log.warn("Private socket delivery failed",{code:error.code||"unavailable"}));};
+  }
   if (!socketsByUser.has(userId)) socketsByUser.set(userId, new Set());
   socketsByUser.get(userId).add(ws);
 }
@@ -775,11 +794,12 @@ function joinRoom(roomId, ws) {
 function leaveAllRooms(ws) {
   for (const set of socketsByRoom.values()) set.delete(ws);
 }
-function broadcastToRoom(roomId, payload) {
+function broadcastToRoom(roomId, payload, excludedUsers = new Set()) {
   const set = socketsByRoom.get(roomId);
   if (!set) return;
   const s = JSON.stringify(payload);
   for (const ws of set) {
+    if([...excludedUsers].some(userId=>socketsByUser.get(userId)?.has(ws)))continue;
     try {
       ws.send(s);
     } catch {}
@@ -795,6 +815,9 @@ function sendToUser(userId, payload) {
     } catch {}
   }
 }
+function sendToSession(userId,sessionId,payload){const raw=JSON.stringify(payload);for(const ws of socketsByUser.get(String(userId))||[])if(ws.accountSessionId===sessionId){try{if(ws.readyState===1)ws.send(raw);}catch{}}}
+function sendToUserExceptSession(userId,sessionId,payload){const raw=JSON.stringify(payload);for(const ws of socketsByUser.get(String(userId))||[])if(ws.accountSessionId!==sessionId){try{if(ws.readyState===1)ws.send(raw);}catch{}}}
+function sendToUserExceptEndpoint(userId,endpointId,payload){const raw=JSON.stringify(payload);for(const ws of socketsByUser.get(String(userId))||[])if(ws.callEndpointId!==endpointId){try{if(ws.readyState===1)ws.send(raw);}catch{}}}
 async function sendToRoomMembersExcept(roomId, excludeUserId, payload) {
   const { rows } = await pool.query(
     `SELECT user_id FROM room_members WHERE room_id=$1 AND user_id <> $2`,
@@ -811,7 +834,42 @@ function isUserOnline(userId) {
 
 // Send FCM push notification
 const sendPushNotification = createPushSender(pool, log);
-const relayCall = installCalls(app, {pool,requireAuth,sendToUser,push:sendPushNotification});
+
+const issueAccountSession=createSessionIssuer({pool,ttlDays:TOKEN_TTL_DAYS,wantsBearer:wantsBearerSession,parseDevice:parseUserAgent,getClientIp,setCookie:(req,reply,token,days,user)=>setBrowserSession(req,reply,token,days,user,authCookieOptions)});
+async function revokeUserSockets(userId,exceptSessionId=null,onlySessionId=null){
+  const sockets=[...(socketsByUser.get(String(userId))||[])];
+  for(const ws of sockets){if(onlySessionId&&ws.accountSessionId!==onlySessionId)continue;if(exceptSessionId&&ws.accountSessionId===exceptSessionId)continue;leaveAllRooms(ws);removeSocket(String(userId),ws);try{ws.accountRawSend?.(JSON.stringify({type:"auth.error",error:"session_revoked"}));ws.close(4401,"Session revoked");}catch{}}
+  if(onlySessionId)await relayCall?.revokeSession?.(String(userId),onlySessionId);
+  else await relayCall?.revokeUser?.(String(userId),{exceptSessionId});
+}
+async function removeAccountMediaFiles(job){
+  const root=path.resolve(UPLOAD_DIR);
+  for(const relative of [job.local_path,job.thumb_path]){if(!relative)continue;const target=path.resolve(root,relative);if(!target.startsWith(root+path.sep))throw Object.assign(Error("Invalid media path"),{code:"unsafe_media_path"});await fs.promises.rm(target,{force:true});}
+  if(job.s3_path){const prefix=S3_ENDPOINT.replace(/\/$/,"")+"/"+S3_BUCKET+"/";if(!job.s3_path.startsWith(prefix))throw Object.assign(Error("Unexpected storage origin"),{code:"unsafe_s3_path"});const object=job.s3_path.slice(prefix.length);await deleteFromS3(object);await deleteFromS3(object.replace(/\/[^\/]+$/,"/thumb.jpg"));}
+}
+const account=await installAccountIntegration(app,{pool,requireAuth,securityKey:crypto.createHmac("sha256",METADATA_ENCRYPTION_KEY).update("67chat-account-security-v1").digest(),verifyPassword:verifyPasswordHash,issueSession:issueAccountSession,getSessionDevice:null,sendToUser:(userId,event)=>{sendToUser(userId,event);void sendPushNotification(userId,"67chat","Новый вход или подтверждение устройства",{account_event:event.type});},revokeUserSessions:async userId=>{await revokeUserSockets(userId);await account.runMediaPurge();},revokeSession:(user,session)=>revokeUserSockets(user,null,session),deleteMediaFiles:removeAccountMediaFiles});
+await installQualityFeatures(app,{pool,requireAuth});
+
+let mapGeoJSON=null;try{mapGeoJSON=loadMapBundle();}catch{app.log.warn('Offline map bundle unavailable');}
+const expressive=await installExpressiveFeatures(app,{pool,requireAuth,isRoomMember,getRoomRole,broadcastToRoom,mapGeoJSON});
+const insertFeatureMessage=createMessageInserter(pool,()=>expressive);
+const conversation=await installConversationFeatures(app,{pool,requireAuth,isRoomMember,getRoomRole,broadcastToRoom,notifyRoomListUpdate,
+  canWrite:(from,to)=>account.canWrite(from,to),
+  getMessage:id=>getMobileMessage(pool,id,decryptMetadata),
+  evictRoomUser:async(roomId,userId)=>{await callFeatures.revokeMembership(roomId,userId);for(const ws of socketsByUser.get(String(userId))||[])socketsByRoom.get(roomId)?.delete(ws);sendToUser(userId,{type:'room.access_revoked',room_id:roomId});},
+  onReminder:async job=>{sendToUser(job.user_id,{type:'reminder.due',room_id:job.room_id,reminder_id:job.id});await sendPushNotification(job.user_id,'67chat','Напоминание',{room_id:job.room_id,reminder_id:job.id});},
+});
+const sfuEnabled=process.env.LIVEKIT_ENABLE_GROUP_CALLS==='true'&&!!process.env.LIVEKIT_URL&&!!process.env.LIVEKIT_API_URL&&!!process.env.LIVEKIT_API_KEY&&!!process.env.LIVEKIT_API_SECRET;
+const sfuGateway=installSfuGateway(app,{pool,key:process.env.LIVEKIT_API_KEY,secret:process.env.LIVEKIT_API_SECRET,upstream:process.env.LIVEKIT_API_URL,enabled:sfuEnabled});
+const callFeatures=installCallFeatures(app,{pool,requireAuth,sendToUser,broadcastToRoom,notifyRoomListUpdateForRoom,getMessage:id=>getMobileMessage(pool,id,decryptMetadata),sfu:createLiveKitService({gateway:sfuGateway})});
+const relayCall = installCalls(app, {pool,requireAuth,sendToUser,sendToSession,sendToUserExceptSession,sendToUserExceptEndpoint,push:sendPushNotification,history:callFeatures.history,canCall:(from,to)=>account.canWrite(from,to)});
+callFeatures.setRelay(relayCall);
+await callFeatures.history.recover();
+installBrowserAccounts(app,{pool,cookieOptions:authCookieOptions,ttlDays:Number(TOKEN_TTL_DAYS),revokeSession:(user,session)=>revokeUserSockets(user,null,session)});
+let featureJob=null;
+const featureTimer=setInterval(()=>{if(featureJob)return;featureJob=conversation.processJobs().catch(error=>log.error('Conversation background jobs failed',{code:error.code||'unavailable'})).finally(()=>{featureJob=null;});},5000);
+featureTimer.unref();
+app.addHook('onClose',async()=>{clearInterval(featureTimer);await featureJob;});
 
 // Admin if the username is listed in ADMIN_USERNAMES (or is the bootstrap admin)
 // OR the users.is_admin flag is set.
@@ -859,8 +917,7 @@ async function getDmPeerUserId(roomId, userId) {
 }
 
 async function canUsersExchangeDm(viewerId, targetId) {
-  const blockState = await getBlockState(viewerId, targetId);
-  return !(blockState.blocked_by_me || blockState.blocks_me);
+  return account.canWrite(viewerId,targetId);
 }
 
 function normalizePublicName(value) {
@@ -1270,7 +1327,7 @@ async function mergeSecondaryAccountIntoPrimary(
 async function notifyRoomListUpdate(userId) {
   const { rows } = await pool.query(
     `
-    SELECT r.id, r.is_saved, coalesce((SELECT to_jsonb(p) FROM room_preferences p WHERE p.room_id=r.id AND p.user_id=$1),'{}'::jsonb) AS preferences, rm.role AS my_role, r.kind, r.title, r.avatar_id, r.created_by, r.created_at,
+    SELECT r.id, r.pinned_message_id, r.is_saved, coalesce((SELECT to_jsonb(p) FROM room_preferences p WHERE p.room_id=r.id AND p.user_id=$1),'{}'::jsonb) AS preferences, rm.role AS my_role, r.kind, r.title, r.avatar_id, r.created_by, r.created_at,
            lm.id as last_msg_id, lm.type as last_msg_type, lm.text as last_msg_text, lm.meta as last_msg_meta, lm.encrypted_content as last_msg_encrypted_content,
            lm.sender_id as last_msg_sender_id, lmu.username as last_msg_sender_username, lmu.display_name as last_msg_sender_name,
            lm.created_at as last_msg_at,
@@ -1278,13 +1335,14 @@ async function notifyRoomListUpdate(userId) {
            (SELECT COUNT(*)::int FROM messages m
             WHERE m.room_id = r.id
             AND m.sender_id <> $1
+            AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$1)
             AND (m.read_by IS NULL OR NOT m.read_by @> $2::jsonb)
            ) as unread_count
     FROM rooms r
     JOIN room_members rm ON rm.room_id=r.id
     LEFT JOIN LATERAL (
       SELECT m.id, m.type, m.text, m.meta, m.encrypted_content, m.sender_id, m.created_at
-      FROM messages m WHERE m.room_id = r.id ORDER BY m.created_at DESC LIMIT 1
+      FROM messages m WHERE m.room_id = r.id AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$1) ORDER BY m.created_at DESC,m.id DESC LIMIT 1
     ) lm ON true
     LEFT JOIN users lmu ON lmu.id = lm.sender_id
     LEFT JOIN LATERAL (
@@ -1628,7 +1686,7 @@ app.post(
       }
 
       await client.query("COMMIT");
-      reply.setCookie("token", token, authCookieOptions(req, ttlDays));
+      setBrowserSession(req,reply,token,ttlDays,rows[0],authCookieOptions);
       return wantsBearerSession(req)
         ? { user: rows[0], token }
         : { user: rows[0] };
@@ -1680,33 +1738,9 @@ app.post(
     if (!ok) return reply.code(401).send({ error: "bad_credentials" });
     await upgradeLegacyPasswordIfNeeded(pool, rows[0].id, storedHash, password);
 
-    const token = randToken();
-    const token_hash = sha256(token);
-    const ttlDays = Number(TOKEN_TTL_DAYS) || 30;
-
-    // Get device info
-    const userAgent = req.headers["user-agent"] || "";
-    const { deviceName, deviceType } = parseUserAgent(userAgent);
-    const ipAddress = getClientIp(req);
-
-    await pool.query(
-      `INSERT INTO sessions(user_id, token_hash, expires_at, device_name, device_type, ip_address, user_agent, last_activity)
-     VALUES ($1, $2, now() + ($3::int || ' days')::interval, $4, $5, $6, $7, now())`,
-      [
-        rows[0].id,
-        token_hash,
-        ttlDays,
-        deviceName,
-        deviceType,
-        ipAddress,
-        userAgent,
-      ],
-    );
-
-    reply.setCookie("token", token, authCookieOptions(req, ttlDays));
-    return wantsBearerSession(req)
-      ? { user: { id: rows[0].id, username: rows[0].username }, token }
-      : { user: { id: rows[0].id, username: rows[0].username } };
+    const gate=await account.authGate(rows[0],{code:body.totp||body.code,backup_code:body.backup_code,device_key:body.device_key,device_name:parseUserAgent(req.headers["user-agent"]||"").deviceName,ip:getClientIp(req)});
+    if(!gate.allowed)return reply.code(202).send({error:"account_challenge_required",challenge:gate.challenge});
+    return issueAccountSession(rows[0],req,reply);
   },
 );
 
@@ -1714,7 +1748,8 @@ app.post("/auth/logout", async (req, reply) => {
   const me = await requireAuth(req);
   const th = sha256(me.token);
   await pool.query(`DELETE FROM sessions WHERE token_hash=$1`, [th]);
-  reply.clearCookie("token", { path: "/" });
+  await revokeUserSockets(me.id, null, me.sessionId);
+  clearBrowserSession(req,reply,me.id,me.token);
   return { ok: true };
 });
 
@@ -1759,6 +1794,7 @@ app.delete("/auth/sessions/:sessionId", async (req, reply) => {
   }
 
   await pool.query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
+  await revokeUserSockets(me.id,null,sessionId);
   return { ok: true };
 });
 
@@ -1772,6 +1808,7 @@ app.post("/auth/sessions/terminate-others", async (req, reply) => {
     [me.id, currentTokenHash],
   );
 
+  await revokeUserSockets(me.id,me.sessionId);
   return { ok: true, terminated: rowCount };
 });
 
@@ -1784,7 +1821,8 @@ app.post("/auth/sessions/terminate-all", async (req, reply) => {
     [me.id],
   );
 
-  reply.clearCookie("token", { path: "/" });
+  clearBrowserSession(req,reply,me.id,me.token);
+  await revokeUserSockets(me.id);
   return { ok: true, terminated: rowCount };
 });
 
@@ -1865,13 +1903,13 @@ app.put("/me/password", async (req, reply) => {
   ]);
 
   // Invalidate all sessions except current
-  const token = req.cookies?.token;
-  const token_hash = token ? sha256(token) : null;
+  const token_hash = sha256(me.token);
   if (token_hash) {
     await pool.query(
       `DELETE FROM sessions WHERE user_id=$1 AND token_hash<>$2`,
       [me.id, token_hash],
     );
+    await revokeUserSockets(me.id, me.sessionId);
   }
 
   return { ok: true };
@@ -1941,7 +1979,7 @@ app.get("/me/public-names", async (req, reply) => {
   };
 });
 
-app.post("/me/public-names/merge", async (req, reply) => {
+app.post("/me/public-names/merge", {config:{rateLimit:{max:5,timeWindow:"1 minute"}}}, async (req, reply) => {
   const me = await requireAuth(req);
   const secondaryUsername = normalizePublicName(req.body?.secondary_username);
   const secondaryPassword = String(req.body?.secondary_password || "");
@@ -1983,6 +2021,7 @@ app.post("/me/public-names/merge", async (req, reply) => {
     secondaryPassword,
   );
 
+  if(!await account.verifyFactor(secondary.id,{code:req.body?.secondary_totp||req.body?.secondary_code,backup_code:req.body?.secondary_backup_code}))return reply.code(403).send({error:"secondary_factor_required"});
   const result = await mergeSecondaryAccountIntoPrimary(
     me.id,
     secondary.id,
@@ -1990,6 +2029,7 @@ app.post("/me/public-names/merge", async (req, reply) => {
   );
   if (!result.ok)
     return reply.code(400).send({ error: result.error || "merge_failed" });
+  await revokeUserSockets(secondary.id);
   const profile = await getUserProfileForViewer(me.id, me.id);
   return { ok: true, profile };
 });
@@ -2197,6 +2237,7 @@ app.put("/admin/users/:id/password", async (req, reply) => {
   ]);
   // Invalidate all sessions for this user
   await pool.query(`DELETE FROM sessions WHERE user_id=$1`, [userId]);
+  await revokeUserSockets(userId);
   return { ok: true };
 });
 
@@ -2212,6 +2253,7 @@ app.put("/admin/users/:id/ban", async (req, reply) => {
   if (banned) {
     // Invalidate all sessions for banned user
     await pool.query(`DELETE FROM sessions WHERE user_id=$1`, [userId]);
+    await revokeUserSockets(userId);
   }
   return { ok: true };
 });
@@ -2240,6 +2282,7 @@ app.delete("/admin/users/:id", async (req, reply) => {
 
   // Delete user (cascade will handle rooms, messages, media, sessions, etc.)
   await pool.query(`DELETE FROM users WHERE id=$1`, [userId]);
+  await revokeUserSockets(userId);
   return { ok: true };
 });
 
@@ -2376,7 +2419,7 @@ app.get("/rooms", async (req, reply) => {
   // Get rooms with last message and other member info for DMs, sorted by last message time
   const { rows } = await pool.query(
     `
-    SELECT r.id, r.is_saved, coalesce((SELECT to_jsonb(p) FROM room_preferences p WHERE p.room_id=r.id AND p.user_id=$1),'{}'::jsonb) AS preferences, rm.role AS my_role, r.kind, r.title, r.avatar_id, r.created_by, r.created_at,
+    SELECT r.id, r.pinned_message_id, r.is_saved, coalesce((SELECT to_jsonb(p) FROM room_preferences p WHERE p.room_id=r.id AND p.user_id=$1),'{}'::jsonb) AS preferences, rm.role AS my_role, r.kind, r.title, r.avatar_id, r.created_by, r.created_at,
            lm.id as last_msg_id, lm.type as last_msg_type, lm.text as last_msg_text, lm.meta as last_msg_meta, lm.encrypted_content as last_msg_encrypted_content,
            lm.sender_id as last_msg_sender_id, lmu.username as last_msg_sender_username, lmu.display_name as last_msg_sender_name,
            lm.created_at as last_msg_at,
@@ -2384,13 +2427,14 @@ app.get("/rooms", async (req, reply) => {
            (SELECT COUNT(*)::int FROM messages m
             WHERE m.room_id = r.id
             AND m.sender_id <> $1
+            AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$1)
             AND (m.read_by IS NULL OR NOT m.read_by @> $2::jsonb)
            ) as unread_count
     FROM rooms r
     JOIN room_members rm ON rm.room_id=r.id
     LEFT JOIN LATERAL (
       SELECT m.id, m.type, m.text, m.meta, m.encrypted_content, m.sender_id, m.created_at
-      FROM messages m WHERE m.room_id = r.id ORDER BY m.created_at DESC LIMIT 1
+      FROM messages m WHERE m.room_id = r.id AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$1) ORDER BY m.created_at DESC,m.id DESC LIMIT 1
     ) lm ON true
     LEFT JOIN users lmu ON lmu.id = lm.sender_id
     LEFT JOIN LATERAL (
@@ -2424,7 +2468,7 @@ app.get("/rooms/:id", async (req, reply) => {
   if (!ok) return reply.code(404).send({ error: "not_found" });
 
   const { rows } = await pool.query(
-    `SELECT id, kind, title, avatar_id, created_by, created_at FROM rooms WHERE id=$1 LIMIT 1`,
+    `SELECT id, kind, title, avatar_id, created_by, created_at, pinned_message_id FROM rooms WHERE id=$1 LIMIT 1`,
     [roomId],
   );
   if (!rows.length) return reply.code(404).send({ error: "not_found" });
@@ -2825,8 +2869,8 @@ app.post(
     if (["media", "voice", "video_note"].includes(type) && !media_id)
       return reply.code(400).send({ error: "media_required" });
 
-    const { rows } = await pool.query(
-      `INSERT INTO messages(room_id, sender_id, type, text, media_id, meta, reply_to, encrypted_content, client_message_id) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9) ON CONFLICT(sender_id,client_message_id) DO NOTHING RETURNING id, created_at`,
+    const { rows } = await insertFeatureMessage(
+      `INSERT INTO messages(room_id, sender_id, type, text, media_id, meta, reply_to, encrypted_content, client_message_id,is_post) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10) ON CONFLICT(sender_id,client_message_id) DO NOTHING RETURNING id, created_at`,
       [
         roomId,
         me.id,
@@ -2837,7 +2881,9 @@ app.post(
         reply_to ? JSON.stringify(reply_to) : null,
         encrypted_content,
         clientId,
+        roomKind[0]?.kind==='channel',
       ],
+      {roomId,userId:me.id,text,encrypted:!!encrypted_content||meta.encrypted===true},
     );
     if (!rows.length) {
       const { rows: prior } = await pool.query(
@@ -2915,6 +2961,7 @@ app.post(
 
 app.put("/rooms/:roomId/messages/:msgId", async (req, reply) => {
   const me = await requireAuth(req);
+  const peer=await getDmPeerUserId(String(req.params.roomId),me.id);if(peer&&!await canUsersExchangeDm(me.id,peer))return reply.code(403).send({error:"privacy_write_denied"});
   const roomId = String(req.params.roomId);
   const msgId = String(req.params.msgId);
   const ok = await isRoomMember(roomId, me.id);
@@ -2951,12 +2998,13 @@ app.put("/rooms/:roomId/messages/:msgId", async (req, reply) => {
   }
 
   const { rows: currentRows } = await pool.query(
-    `SELECT id, meta, type, encrypted_content FROM messages WHERE id=$1 AND room_id=$2 AND sender_id=$3 LIMIT 1`,
+    `SELECT id, meta, type, text, encrypted_content FROM messages WHERE id=$1 AND room_id=$2 AND sender_id=$3 LIMIT 1`,
     [msgId, roomId, me.id],
   );
   if (!currentRows.length) return reply.code(404).send({ error: "not_found" });
   if (String(currentRows[0].type) !== "text")
     return reply.code(400).send({ error: "edit_not_supported" });
+  if(!expressive.canEditText(currentRows[0].text)||!expressive.canEditText(nextText))return reply.code(400).send({error:'message_immutable'});
 
   // E2E messages: the server must never receive/store plaintext. Editing is only
   // possible by supplying a freshly encrypted payload.
@@ -3022,7 +3070,8 @@ app.put("/rooms/:roomId/messages/:msgId", async (req, reply) => {
     edited_at: new Date().toISOString(),
     reactions,
   };
-  broadcastToRoom(roomId, { type: "message.update", message: updated });
+  const {rows:hiddenReaders}=await pool.query('SELECT user_id FROM hidden_messages WHERE message_id=$1',[msgId]);
+  broadcastToRoom(roomId, { type: "message.update", message: updated },new Set(hiddenReaders.map(row=>row.user_id)));
   await notifyRoomListUpdateForRoom(roomId);
   return updated;
 });
@@ -3081,9 +3130,12 @@ app.delete("/rooms/:roomId/messages/:msgId/hide", async (req, reply) => {
   if (!rows.length) return reply.code(404).send({ error: "not_found" });
 
   await pool.query(
-    `INSERT INTO hidden_messages(user_id, message_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,
-    [me.id, msgId],
+    `WITH locked AS MATERIALIZED (SELECT pg_advisory_xact_lock(670024)),
+     inserted AS (INSERT INTO hidden_messages(user_id,message_id) SELECT $1,$2 FROM locked ON CONFLICT DO NOTHING RETURNING message_id)
+     INSERT INTO message_changes(room_id,message_id,operation) SELECT $3,message_id,'hide' FROM inserted`,
+    [me.id, msgId, roomId],
   );
+  sendToUser(me.id,{type:'message.hide',room_id:roomId,message_id:msgId});
   await notifyRoomListUpdate(me.id);
   return { ok: true };
 });
@@ -3408,14 +3460,7 @@ app.get("/media/:id", async (req, reply) => {
   if (!rows.length) return reply.code(404).send({ error: "not_found" });
 
   const m = rows[0];
-  // Check access: owner, avatar user, avatar room, or room member with message
-  if (m.owner_id !== me.id && m.kind !== "avatar") {
-    const { rows: ok } = await pool.query(
-      `SELECT 1 FROM messages msg JOIN room_members rm ON rm.room_id = msg.room_id WHERE msg.media_id=$1 AND rm.user_id=$2 LIMIT 1`,
-      [mediaId, me.id],
-    );
-    if (!ok.length) return reply.code(403).send({ error: "forbidden" });
-  }
+  if(!await canAccessMedia(pool,m,me.id,{canReadCatalogMedia:expressive.canReadCatalogMedia}))return reply.code(404).send({error:'not_found'});
 
   // If S3 path exists, redirect to S3
   if (m.s3_path) {
@@ -3431,7 +3476,7 @@ app.get("/media/:id", async (req, reply) => {
 
   // Add caching headers
   const maxAge = m.kind === "avatar" ? 86400 : 3600; // 24h for avatars, 1h for others
-  reply.header("Cache-Control", "public, max-age=" + maxAge);
+  reply.header("Cache-Control", m.kind==='avatar'?"private, max-age="+maxAge:"private, no-store");
   reply.header(
     "ETag",
     '"' + mediaId + "-" + stat.size + "-" + stat.mtime.getTime() + '"',
@@ -3444,10 +3489,9 @@ app.get("/media/:id", async (req, reply) => {
     );
 
   if (range) {
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
-    const chunksize = end - start + 1;
+    const parsed=mediaByteRange(range,stat.size);
+    if(!parsed)return reply.code(416).header('Content-Range',`bytes */${stat.size}`).send();
+    const {start,end,length:chunksize}=parsed;
 
     reply.header(
       "Content-Range",
@@ -3467,14 +3511,16 @@ app.get("/media/:id", async (req, reply) => {
 });
 
 app.get("/media/:id/thumb", async (req, reply) => {
+  const me=await requireAuth(req);
   const mediaId = String(req.params.id);
   const { rows } = await pool.query(
-    `SELECT thumb_path, s3_path FROM media WHERE id=$1 AND (thumb_path IS NOT NULL OR s3_path IS NOT NULL) LIMIT 1`,
+    `SELECT id,owner_id,kind,thumb_path,s3_path FROM media WHERE id=$1 AND (thumb_path IS NOT NULL OR s3_path IS NOT NULL) LIMIT 1`,
     [mediaId],
   );
   if (!rows.length) return reply.code(404).send({ error: "not_found" });
 
   const m = rows[0];
+  if(!await canAccessMedia(pool,m,me.id,{canReadCatalogMedia:expressive.canReadCatalogMedia}))return reply.code(404).send({error:'not_found'});
 
   // If S3 path exists, construct thumb URL from S3 path
   if (m.s3_path) {
@@ -3487,7 +3533,7 @@ app.get("/media/:id/thumb", async (req, reply) => {
     return reply.code(404).send({ error: "file_missing" });
 
   reply.header("Content-Type", "image/jpeg");
-  reply.header("Cache-Control", "public, max-age=31536000");
+  reply.header("Cache-Control", "private, no-store");
   reply.header("X-Content-Type-Options", "nosniff");
   return reply.send(fs.createReadStream(abs));
 });
@@ -3525,10 +3571,11 @@ app.post("/posts/:postId/comments", async (req, reply) => {
     return reply.code(400).send({ error: "empty_comment" });
 
   // Create comment message
-  const { rows: commentRows } = await pool.query(
+  const { rows: commentRows } = await insertFeatureMessage(
     `INSERT INTO messages(room_id, sender_id, type, text, meta, reply_to, is_post)
      VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,false) RETURNING id`,
     [channelId, me.id, type, text, JSON.stringify({}), null],
+    {roomId:channelId,userId:me.id,text,encrypted:false},
   );
 
   const commentId = commentRows[0].id;
@@ -3643,10 +3690,11 @@ app.get("/ws", { websocket: true }, (socket, req) => {
   let me = null;
   installSocketSession(socket, req, {
     authenticate: requireAuth,
-    onAuthenticated(user) { me = user; addSocket(user.id, socket); },
+    onAuthenticated(user) { me = user; addSocket(user.id, socket, user.sessionId); },
     async onMessage(msg) {
       const t = String(msg.type || "");
       try {
+      try {await account.requireSession(me);} catch {socket.close(4401,"Session revoked");return;}
       if (t === "rooms.join") {
         const roomId = String(msg.room_id || msg.roomId || "");
         const ok = await isRoomMember(roomId, me.id);
@@ -3663,6 +3711,7 @@ app.get("/ws", { websocket: true }, (socket, req) => {
 
       if (t === "typing") {
         const roomId = String(msg.room_id || "");
+        const peer=await getDmPeerUserId(roomId,me.id);if(peer&&!await canUsersExchangeDm(me.id,peer))return;
         const isTyping = !!msg.is_typing;
         if (!roomId) return;
         const ok = await isRoomMember(roomId, me.id);
@@ -3765,7 +3814,7 @@ app.get("/ws", { websocket: true }, (socket, req) => {
           );
           return;
         }
-        const { rows } = await pool.query(
+        const { rows } = await insertFeatureMessage(
           `INSERT INTO messages(room_id, sender_id, type, text, media_id, meta, reply_to, is_post, encrypted_content, client_message_id) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10) ON CONFLICT(sender_id,client_message_id) DO NOTHING RETURNING id`,
           [
             roomId,
@@ -3779,6 +3828,7 @@ app.get("/ws", { websocket: true }, (socket, req) => {
             encrypted_content,
             clientId,
           ],
+          {roomId,userId:me.id,text,encrypted:!!encrypted_content||meta.encrypted===true},
         );
         if (!rows.length) {
           const { rows: prior } = await pool.query(
@@ -3885,9 +3935,14 @@ app.get("/ws", { websocket: true }, (socket, req) => {
         t === "call.offer" ||
         t === "call.answer" ||
         t === "call.ice" ||
-        t === "call.hangup"
+        t === "call.hangup" ||
+        t === "call.waiting.accept" ||
+        t === "call.waiting.reject" ||
+        t === "call.renegotiate" ||
+        t === "call.renegotiate.answer" ||
+        t === "call.resume"
       ) {
-        await relayCall(msg, me);
+        await relayCall(msg, me,{id:socket.callEndpointId,send:payload=>{try{if(socket.readyState===1)socket.send(JSON.stringify(payload));}catch{}}});
         return;
       }
       } catch (e) {
@@ -3895,7 +3950,7 @@ app.get("/ws", { websocket: true }, (socket, req) => {
         socket.send(JSON.stringify({ type: "error", error: "server_error" }));
       }
     },
-    onClose(user) { leaveAllRooms(socket); if (user?.id) removeSocket(user.id, socket); },
+    onClose(user) { leaveAllRooms(socket); if (user?.id) removeSocket(user.id, socket);if(socket.callEndpointId)void relayCall.endpointClosed(socket.callEndpointId).catch(error=>log.warn('Call endpoint cleanup failed',{code:error.code||'unavailable'})); },
     onError(error) { log.error("WebSocket session error", error); },
   });
 });
@@ -4001,15 +4056,21 @@ app.post(
         .send({ error: "rate_limited", retry_after: retryAfter });
     }
 
+    const publication=await pool.connect();
+    try{
+    await publication.query("BEGIN");
+    await publication.query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE",[me.sessionId]);
+    await publication.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",[me.id+":"+deviceId]);
+    await account.validatePublishedDevice(me,deviceId,identityKey,publication);
     // Store identity key
-    await pool.query(
+    await publication.query(
       `INSERT INTO user_identity_keys(user_id, public_key, updated_at) VALUES ($1, $2, now())
      ON CONFLICT (user_id) DO UPDATE SET public_key = EXCLUDED.public_key, updated_at = now()`,
       [me.id, identityKey],
     );
 
     // Store device
-    const { rows: deviceRows } = await pool.query(
+    const { rows: deviceRows } = await publication.query(
       `INSERT INTO user_devices(user_id, device_id, public_key, signed_pre_key_id, signed_pre_key_public, signed_pre_key_signature, registration_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (user_id, device_id) DO UPDATE
@@ -4031,6 +4092,7 @@ app.post(
     );
 
     const dbDeviceId = deviceRows[0].id;
+    if(body.device_proof)await account.bindPublishedDevice(me,deviceId,publication,body.device_proof);
 
     // Store pre-keys. Use ?? (not ||) so key_id = 0 is preserved — 0 is falsy and
     // the old `||` fallback silently dropped the first pre-key into a NOT NULL error.
@@ -4038,13 +4100,15 @@ app.post(
       const keyId = preKey.key_id ?? preKey.keyId;
       const publicKey = preKey.public_key ?? preKey.publicKey;
       if (keyId == null || !publicKey) continue;
-      await pool.query(
+      await publication.query(
         `INSERT INTO user_prekeys(device_id, key_id, public_key) VALUES ($1, $2, $3)
        ON CONFLICT (device_id, key_id) DO NOTHING`,
         [dbDeviceId, keyId, publicKey],
       );
     }
 
+    await publication.query("COMMIT");
+    }catch(error){await publication.query("ROLLBACK");throw error;}finally{publication.release();}
     return { ok: true };
   },
 );

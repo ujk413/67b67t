@@ -21,11 +21,11 @@ Opt-in end-to-end encryption for **group** chats (not DMs, not channels). Enable
 - **Messages sent before a removal stay readable by the removed member.** They already held the key. Nothing can revoke past access.
 - **Removal re-key is immediate only for online members.** When someone leaves or is removed, the server broadcasts `room.members_changed`, and online members generate and distribute a new sender key at once. An offline sender does not need to rotate in advance: it cannot post while offline, and on its next send it fetches the current member list and rotates before encrypting if a former recipient is gone.
 - **Metadata is visible to the server:** who writes, when, room membership, message sizes.
-- **Attachments and media are not encrypted** by this mode.
+- **Attachments:** current web/Android clients encrypt media separately and put the file key in an encrypted text envelope (`meta.media_encryption.key_message`). Legacy plaintext attachments remain legacy plaintext; enabling group E2E does not re-encrypt old history.
 - **No per-message forward secrecy on the device.** The chain state is stored in IndexedDB, the same trust boundary as the identity key.
-- **Mobile app cannot read or write E2E groups.** It shows a placeholder for them and refuses to send into them. Use the web client.
-- **Per-device:** sender keys belong to a browser profile. A new device without a backup does not get group keys, so older group messages show "ключ отправителя недоступен". The passphrase key backup (`exportKeys`/`importKeys`) includes group keys, so restoring from it brings them back.
-- **Editing and deleting** E2E messages is not supported (editing is blocked in the web client).
+- **Android and web:** the Android sender-key implementation shares the web envelope/protocol and protects local state in the account SQLCipher repository. The group screen exposes the mode and explains history/key availability. Cross-client interoperability is covered by group-interop tests; a new APK must be installed before mobile support is available.
+- **Per-device:** sender keys belong to an individual browser/Android device. A new device without a backup does not get group keys, so older group messages show "ключ отправителя недоступен". The passphrase key backup (`exportKeys`/`importKeys`) includes group keys, so restoring from it brings them back.
+- **Edit history:** the server stores encrypted versions; clients must retain the corresponding key state to decrypt them. Deletion cannot revoke copies already decrypted or exported by a recipient.
 - **Size cap:** at most 500 members per E2E group. Each distribution payload is capped at 16 KB, and a sender is limited to 60 distributions per hour.
 
 ## Endpoints
@@ -44,4 +44,4 @@ Removing a member, or a member leaving, deletes their pending distributions for 
 
 - `node --test tests/groupcrypto.test.mjs`: 13 tests covering round-trip, out-of-order delivery, replay refusal, tamper detection, forged far-future envelopes not advancing the chain, delta cap, late joiners, rotation, removal-driven re-keying (`planSend`), re-added members, and malformed distributions.
 - `scripts/smoke_live.sh` against a running API and Postgres: 32 checks, including enable/disable permissions, plaintext rejection, the key inbox round trip, member removal and non-member rejection.
-- Not exercised: two real browsers exchanging keys through the UI, group key backup/restore, and the mobile typing indicator on a device. A two-browser run was started (two accounts registered, group created) but did not reach message exchange.
+- Not exercised: two real browsers exchanging keys through the UI, group key backup/restore, and the mobile typing indicator on a device. Automated interoperability tests do not replace physical Android-to-browser acceptance of the newly built APK.

@@ -18,6 +18,7 @@ type Environment = {
   WebSocket: typeof WebSocket;
   wsUrlFromApi: (base: string) => string;
   setConnection: (status: string) => void;
+  onAuthenticated?: () => void;
 };
 export function startConnection(environment: Environment) {
   const {
@@ -32,7 +33,7 @@ export function startConnection(environment: Environment) {
     AppState,
     WebSocket,
     wsUrlFromApi,
-    setConnection,
+    setConnection,onAuthenticated,
   } = environment;
 
   if (!token) {
@@ -117,6 +118,7 @@ export function startConnection(environment: Environment) {
         setConnection('connected');
         const roomId = activeRoomIdRef.current;
         if (roomId) ws.send(JSON.stringify({ type: 'rooms.join', room_id: roomId }));
+        onAuthenticated?.();
         if (needsResync) void resyncRef.current?.();
         return;
       }

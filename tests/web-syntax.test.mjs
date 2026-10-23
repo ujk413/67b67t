@@ -8,7 +8,7 @@ test('every browser module parses explicitly as ESM before release',()=>{
 });
 test('JSON headers are sent only with a JSON body, including DELETE and multipart requests',async()=>{
  const source=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),start=source.indexOf('async function api('),end=source.indexOf('// Login/register/logout',start),requests=[];
- const scope={API:'/api',AbortController,FormData,setTimeout,clearTimeout,isAuthEntryPath:()=>false,handleUnauthorized(){},fetch:async(url,options)=>{requests.push(options);return{ok:true,status:200,json:async()=>({ok:true})};}};
+ const scope={API:'/api',AbortController,FormData,setTimeout,clearTimeout,browserSessionGeneration:()=>0,selectedBrowserAccount:()=>null,browserAccountHeaders:()=>({}),isAuthEntryPath:()=>false,handleUnauthorized(){},fetch:async(url,options)=>{requests.push(options);return{ok:true,status:200,json:async()=>({ok:true})};}};
  vm.runInNewContext(source.slice(start,end)+'\nthis.call=api;',scope);
  await scope.call('/message',{method:'DELETE'});assert.equal(requests.at(-1).headers['Content-Type'],undefined);
  await scope.call('/upload',{method:'POST',body:new FormData()});assert.equal(requests.at(-1).headers['Content-Type'],undefined);

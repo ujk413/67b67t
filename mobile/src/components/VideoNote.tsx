@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { useVideoPlayer, VideoView } from "expo-video";
@@ -5,6 +6,7 @@ import Svg, { Circle } from "react-native-svg";
 import { useTheme } from "../ThemeProvider";
 import { useMediaHeaders } from "../MediaSession";
 import { Icon } from "./Icon";
+import { ownVideoPlayer, type PlaybackOwner } from "../playbackOwnership";
 
 const SIZE = 200;
 const RADIUS = SIZE / 2 - 4;
@@ -35,6 +37,7 @@ export function VideoNote({
   const { colors } = useTheme();
   const headers = useMediaHeaders();
   const player = useVideoPlayer({ uri, headers }, (instance) => {
+    instance.timeUpdateEventInterval = 0.1;
     // Start muted: a tap should not blast audio unexpectedly, and the mute
     // button is the explicit opt-in, as in Telegram.
     instance.muted = true;
@@ -43,7 +46,8 @@ export function VideoNote({
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(true);
   const [progress, setProgress] = useState(0);
-  const started = useRef(false);
+  const started = useRef(false), owner = useRef<PlaybackOwner|null>(null);
+  useEffect(()=>{const lease=ownVideoPlayer(player);owner.current=lease;return()=>{owner.current=null;lease.dispose();};},[player]);
 
   useEffect(() => {
     const timeSub = player.addListener("timeUpdate", ({ currentTime }) => {
@@ -62,7 +66,7 @@ export function VideoNote({
 
   const toggle = () => {
     if (playing) player.pause();
-    else player.play();
+    else void owner.current?.claim().then(allowed=>{if(allowed)player.play();});
   };
 
   const shownDuration = durationSec && durationSec > 0 ? clock(durationSec) : "";
@@ -73,14 +77,16 @@ export function VideoNote({
         onPress={toggle}
         onLongPress={onLongPress}
         accessibilityRole="button"
-        accessibilityLabel={`Видеокружок${shownDuration ? `, ${shownDuration}` : ""}`}
+        accessibilityLabel={uiText("Видеокружок{0}",shownDuration ? `, ${shownDuration}` : "")}
         style={styles.circle}
       >
-        <VideoView
+          <VideoView
+            allowsPictureInPicture
           player={player}
           style={styles.video}
           nativeControls={false}
           contentFit="cover"
+          surfaceType="textureView"
         />
 
         <Svg width={SIZE} height={SIZE} style={StyleSheet.absoluteFill} pointerEvents="none">
@@ -127,7 +133,7 @@ export function VideoNote({
             setMuted(!muted);
           }}
           accessibilityRole="button"
-          accessibilityLabel={muted ? "Включить звук" : "Выключить звук"}
+          accessibilityLabel={muted ? uiText("Включить звук") : uiText("Выключить звук")}
           accessibilityState={{ selected: !muted }}
           hitSlop={8}
           style={[styles.sideButton, !muted && { backgroundColor: colors.text.blue }]}
@@ -136,9 +142,9 @@ export function VideoNote({
         </Pressable>
         {onOpenViewer ? (
           <Pressable
-            onPress={onOpenViewer}
+            onPress={()=>{player.pause();owner.current?.release();onOpenViewer();}}
             accessibilityRole="button"
-            accessibilityLabel="Открыть на весь экран"
+            accessibilityLabel={uiText("Открыть на весь экран")}
             hitSlop={8}
             style={styles.sideButton}
           >

@@ -1,0 +1,7 @@
+<resources>
+  <string name="expressive_widget_empty">Нет непрочитанных</string>
+  <string name="expressive_shortcut_chats">Чаты</string>
+  <string name="expressive_shortcut_open">Открыть 67chat</string>
+  <string name="expressive_shortcut_compose">Написать</string>
+  <string name="expressive_shortcut_saved">Избранное</string>
+</resources>

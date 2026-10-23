@@ -5,16 +5,19 @@ export class Outbox {
   private stopped = false;
   private rerun = false;
   private cancelled = new Set<string>();
+  private current: {id:string;abort:AbortController}|null = null;
   constructor(
     private repository: AccountRepository,
-    private send: (item: Outgoing) => Promise<Message>,
+    private send: (item: Outgoing, signal:AbortSignal) => Promise<Message>,
     private update: (item: Outgoing, message?: Message) => void,
   ) {}
   stop() {
     this.stopped = true;
+    this.current?.abort.abort();
   }
   async cancel(id: string) {
     this.cancelled.add(id);
+    if(this.current?.id===id)this.current.abort.abort();
     await this.repository.removeOutgoing(id);
   }
   async retry(id: string) {
@@ -42,16 +45,19 @@ export class Outbox {
         await this.repository.putOutgoing(item);
         this.update(item);
         try {
-          const message = await this.send(item);
+          const controller=new AbortController();this.current={id:item.id,abort:controller};
+          const message = await this.send(item,controller.signal);
           if (this.stopped) break;
+          if(this.cancelled.has(item.id))continue;
           await this.repository.saveMessages([message]);
           await this.repository.removeOutgoing(item.id);
           this.update(item, message);
         } catch (e) {
           if (this.stopped) break;
+          if(this.cancelled.has(item.id))continue;
           const error = e as Error & { status?: number };
           const transient =
-            /network|fetch|timeout|offline|соединен/i.test(
+            /network|fetch|timeout|offline|соединен|не ответил|временн/i.test(
               error.message || "",
             ) ||
             (error.status || 0) >= 500 ||
@@ -64,7 +70,7 @@ export class Outbox {
             this.rerun = false;
             break;
           }
-        }
+        } finally {this.current=null;}
       }
     } finally {
       this.running = false;

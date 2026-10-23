@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { useEffect, useRef, useState } from "react";
 import { Audio, type AVPlaybackStatus } from "expo-av";
 import { Pressable, Text, View } from "react-native";
@@ -5,30 +6,9 @@ import { useTheme } from "../ThemeProvider";
 import { ensurePlaybackMode } from "../audioSession";
 import { useMediaHeaders } from "../MediaSession";
 import { Icon } from "./Icon";
-let current: Audio.Sound | null = null;
+import { registerPlayback, type PlaybackOwner } from "../playbackOwnership";
 
-// Stable pseudo-waveform per media URI: same message always draws the same
-// bars, without shipping or decoding an actual waveform.
-const WAVE_BARS = 30;
-function waveformFor(seed: string): number[] {
-  let hash = 2166136261;
-  for (let i = 0; i < seed.length; i += 1) {
-    hash ^= seed.charCodeAt(i);
-    hash = Math.imul(hash, 16777619) >>> 0;
-  }
-  const bars: number[] = [];
-  for (let i = 0; i < WAVE_BARS; i += 1) {
-    hash ^= hash << 13;
-    hash ^= hash >>> 17;
-    hash ^= hash << 5;
-    hash >>>= 0;
-    // 0.18..1 keeps the shape readable but never a flat line.
-    bars.push(0.18 + (hash % 1000) / 1000 * 0.82);
-  }
-  return bars;
-}
-
-export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDuration?:number }) {
+export function VoicePlayer({ uri, initialDuration=0, waveform:actualWaveform, onListened }: { uri: string; initialDuration?:number;waveform?:number[];onListened?:()=>void }) {
   const { colors } = useTheme(),
     headers = useMediaHeaders();
   const sound = useRef<Audio.Sound | null>(null),
@@ -38,7 +18,9 @@ export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDu
     [duration, setDuration] = useState(initialDuration),
     [rate, setRate] = useState(1),
     [error, setError] = useState("");
-  const waveform = useRef(waveformFor(uri)).current;
+  const waveform=actualWaveform?.length?actualWaveform:Array(30).fill(0.12);
+  const peak=Math.max(0.001,...waveform);
+  const listened=useRef(false),latestListen=useRef(onListened);latestListen.current=onListened;
   const update = (status: AVPlaybackStatus) => {
     if (!status.isLoaded) {
       setPlaying(false);
@@ -47,66 +29,33 @@ export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDu
     setPlaying(status.isPlaying);
     setPosition(status.positionMillis);
     setDuration(status.durationMillis || 0);
+    if(status.isPlaying && status.positionMillis>250 && !listened.current){listened.current=true;latestListen.current?.();}
   };
-  const busy=useRef(false),generation=useRef(0);
-  useEffect(
-    () => () => {
-      generation.current++;
-      const instance = sound.current;
-      sound.current = null;
-      if (current === instance) current = null;
-      void instance?.unloadAsync().catch(() => {});
-    },
-    [uri],
-  );
+  const busy=useRef(false),generation=useRef(0),owner=useRef<PlaybackOwner|null>(null);
+  useEffect(() => {
+    const lease=registerPlayback(async()=>{generation.current++;await sound.current?.pauseAsync().catch(()=>{});});owner.current=lease;
+    return()=>{generation.current++;owner.current=null;lease.dispose();const instance=sound.current;sound.current=null;void instance?.unloadAsync().catch(()=>{});};
+  },[uri]);
   const toggle = async () => {
     if(busy.current)return;
-    busy.current=true;const mine=generation.current;
+    busy.current=true;let mine=generation.current;
     try {
       setError("");
-      if (playing) {
-        await sound.current?.pauseAsync();
-        return;
+      if(playing){await sound.current?.pauseAsync();owner.current?.release();return;}
+      const lease=owner.current;if(!lease || !await lease.claim())return;
+      mine=generation.current;
+      const valid=()=>mine===generation.current && lease.isOwner();
+      await ensurePlaybackMode();if(!valid())return;
+      if(!sound.current){
+        const created=await Audio.Sound.createAsync({uri,headers},{shouldPlay:false,progressUpdateIntervalMillis:200,rate,shouldCorrectPitch:true},status=>{if(mine===generation.current)update(status);});
+        if(!valid()){await created.sound.unloadAsync();return;}sound.current=created.sound;
       }
-      if (current && current !== sound.current) {
-        await current.unloadAsync().catch(() => {});
-        current = null;
-      }
-      // A previous call or recording may have left the communication route on.
-      await ensurePlaybackMode();
-      if (!sound.current) {
-        const created = await Audio.Sound.createAsync(
-          { uri, headers },
-          {
-            shouldPlay: true,
-            progressUpdateIntervalMillis: 200,
-            rate,
-            shouldCorrectPitch: true,
-          },
-          update,
-        );
-        if(mine!==generation.current){await created.sound.unloadAsync();return;}
-        sound.current = created.sound;
-      } else {
-        const status = await sound.current.getStatusAsync();
-        if (!status.isLoaded) {
-          sound.current = null;
-          busy.current=false;
-          await toggle();
-          return;
-        }
-        if (
-          status.durationMillis &&
-          status.positionMillis >= status.durationMillis
-        )
-          await sound.current.setPositionAsync(0);
-        await sound.current.playAsync();
-      }
-      current = sound.current;
-    } catch (e) {
-      setError("Не удалось воспроизвести");
-      sound.current = null;
-    }finally{busy.current=false;}
+      const instance=sound.current,status=await instance.getStatusAsync();if(!valid())return;
+      if(!status.isLoaded){sound.current=null;await instance.unloadAsync().catch(()=>{});return;}
+      if(status.durationMillis && status.positionMillis>=status.durationMillis){await instance.setPositionAsync(0);if(!valid())return;}
+      await instance.playAsync();if(!valid())await instance.pauseAsync().catch(()=>{});
+    }catch(e){if(mine===generation.current)setError(uiText("Не удалось воспроизвести"));}
+    finally{busy.current=false;}
   };
   const time = (ms: number) =>
     `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
@@ -117,7 +66,7 @@ export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDu
           onPress={() => void toggle()}
           accessibilityRole="button"
           accessibilityLabel={
-            playing ? "Приостановить голосовое" : "Воспроизвести голосовое"
+            playing ? uiText("Приостановить голосовое") : uiText("Воспроизвести голосовое")
           }
           style={{
             minWidth: 48,
@@ -130,7 +79,7 @@ export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDu
         </Pressable>
         <Pressable
           accessibilityRole="adjustable"
-          accessibilityLabel="Перемотка голосового"
+          accessibilityLabel={uiText("Перемотка голосового")}
           onLayout={(e) => {
             width.current = e.nativeEvent.layout.width;
           }}
@@ -143,9 +92,7 @@ export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDu
           }}
           style={{ flex: 1, paddingVertical: 18, marginHorizontal: 8 }}
         >
-          {/* Waveform instead of a flat bar: bars are derived from the media URI
-              so every message keeps a stable shape, and the played part is
-              tinted — the way Telegram draws a voice message. */}
+          {/* Recorded amplitudes; old messages without samples use a flat track. */}
           <View style={{ flexDirection: "row", alignItems: "center", height: 26, gap: 2 }}>
             {waveform.map((height, index) => {
               const played = duration ? index / waveform.length <= position / duration : false;
@@ -154,7 +101,7 @@ export function VoicePlayer({ uri, initialDuration=0 }: { uri: string; initialDu
                   key={index}
                   style={{
                     flex: 1,
-                    height: Math.max(3, Math.round(height * 26)),
+                    height: Math.max(3, Math.round(Math.sqrt(height/peak) * 26)),
                     borderRadius: 2,
                     backgroundColor: played ? colors.text.blue : colors.divider,
                   }}

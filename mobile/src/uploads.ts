@@ -22,7 +22,7 @@ export function createUploadTask(
         const result = JSON.parse(request.responseText);
         if (request.status === 401) notifyUnauthorized("/media/upload", token);
         if (request.status < 200 || request.status >= 300)
-          throw new Error(result.error || "Загрузка не удалась");
+          throw Object.assign(new Error(result.error || "Загрузка не удалась"),{status:request.status});
         resolve(result.id);
       } catch (error) {
         reject(error);

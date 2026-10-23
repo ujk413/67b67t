@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { useRef, useState } from "react";
 import {
   FlatList,
@@ -16,6 +17,7 @@ import { ChatListItem } from "../components/ChatListItem";
 import type { Room, User } from "../types";
 
 type Props = {
+  drafts?:Record<string,string>;
   folders?: { id: string; title: string; room_ids: string[] }[];
   selectedFolder?: string | null;
   onFolder?: (id: string | null) => void;
@@ -47,17 +49,18 @@ export function ChatListScreen(p: Props) {
   return (
     <View style={{ flex: 1, backgroundColor: colors.windowBackground }}>
       <MainHeader
-        title="Чаты"
+        title={uiText("Чаты")}
         onSearchPress={() => p.onSearch?.()}
         onMenuPress={() => setMenuOpen(true)}
       />
-      {!!p.folders?.length && <ScrollView horizontal style={{ maxHeight: 48 }} contentContainerStyle={{ paddingHorizontal: 8 }}>{[{ id: null, title: "Все чаты" }, ...p.folders].map(folder => <Pressable key={folder.id || "all"} onPress={() => p.onFolder?.(folder.id)} accessibilityRole="tab" accessibilityState={{ selected: p.selectedFolder === folder.id }} style={{ padding: 12, borderBottomWidth: p.selectedFolder === folder.id ? 2 : 0, borderColor: colors.text.blue }}><Text style={{ color: p.selectedFolder === folder.id ? colors.text.blue : colors.text.secondary }}>{folder.title}</Text></Pressable>)}</ScrollView>}
+      {!!p.folders?.length && <ScrollView horizontal style={{ maxHeight: 48 }} contentContainerStyle={{ paddingHorizontal: 8 }}>{[{ id: null, title: uiText("Все чаты") }, ...p.folders].map(folder => <Pressable key={folder.id || "all"} onPress={() => p.onFolder?.(folder.id)} accessibilityRole="tab" accessibilityState={{ selected: p.selectedFolder === folder.id }} style={{ padding: 12, borderBottomWidth: p.selectedFolder === folder.id ? 2 : 0, borderColor: colors.text.blue }}><Text style={{ color: p.selectedFolder === folder.id ? colors.text.blue : colors.text.secondary }}>{folder.title}</Text></Pressable>)}</ScrollView>}
       <FlatList
         ref={list}
         data={p.rooms}
         keyExtractor={(room) => room.id}
         renderItem={({ item }) => (
           <ChatListItem
+            draft={p.drafts?.[item.id]}
             room={item}
             meId={p.user.id}
             baseUrl={p.baseUrl}
@@ -74,8 +77,7 @@ export function ChatListScreen(p: Props) {
               style={[styles.archive, { borderColor: colors.divider }]}
             >
               <Text style={{ color: colors.text.secondary, fontSize: 14 }}>
-                Архив
-              </Text>
+                {uiText("Архив")}</Text>
               <Text style={{ color: colors.text.secondary }}>
                 {p.archivedCount}
               </Text>
@@ -91,8 +93,7 @@ export function ChatListScreen(p: Props) {
                 fontWeight: "600",
               }}
             >
-              Начните общение
-            </Text>
+              {uiText("Начните общение")}</Text>
             <Text
               style={{
                 color: colors.text.secondary,
@@ -100,15 +101,13 @@ export function ChatListScreen(p: Props) {
                 marginTop: 8,
               }}
             >
-              Найдите человека по имени пользователя или создайте группу
-            </Text>
+              {uiText("Найдите человека по имени пользователя или создайте группу")}</Text>
             <Pressable
               onPress={p.onCompose}
               style={{ padding: 16, minHeight: 48 }}
             >
               <Text style={{ color: colors.text.blue, fontWeight: "600" }}>
-                Написать сообщение
-              </Text>
+                {uiText("Написать сообщение")}</Text>
             </Pressable>
           </View>
         }
@@ -126,7 +125,7 @@ export function ChatListScreen(p: Props) {
       <Pressable
         onPress={p.onCompose}
         accessibilityRole="button"
-        accessibilityLabel="Начать новую переписку"
+        accessibilityLabel={uiText("Начать новую переписку")}
         style={({ pressed }) => [
           styles.compose,
           { backgroundColor: colors.text.blue, opacity: pressed ? 0.85 : 1 },
@@ -140,8 +139,7 @@ export function ChatListScreen(p: Props) {
             fontSize: 15,
           }}
         >
-          Написать
-        </Text>
+          {uiText("Написать")}</Text>
       </Pressable>
       <View
         style={[
@@ -158,26 +156,24 @@ export function ChatListScreen(p: Props) {
           }
           accessibilityRole="tab"
           accessibilityState={{ selected: true }}
-          accessibilityLabel="Чаты"
+          accessibilityLabel={uiText("Чаты")}
           style={styles.tab}
         >
           <Icon name="chats" size={23} color={colors.text.blue} />
           <Text
             style={{ color: colors.text.blue, fontSize: 11, fontWeight: "600" }}
           >
-            Чаты
-          </Text>
+            {uiText("Чаты")}</Text>
         </Pressable>
         <Pressable
           onPress={p.onProfilePress}
           accessibilityRole="tab"
-          accessibilityLabel="Настройки"
+          accessibilityLabel={uiText("Настройки")}
           style={styles.tab}
         >
           <Icon name="settings" size={23} color={colors.text.secondary} />
           <Text style={{ color: colors.text.secondary, fontSize: 11 }}>
-            Настройки
-          </Text>
+            {uiText("Настройки")}</Text>
         </Pressable>
       </View>
       <Modal
@@ -198,26 +194,23 @@ export function ChatListScreen(p: Props) {
               onPress={() => action(p.onCompose)}
             >
               <Text style={{ color: colors.text.primary, fontSize: 16 }}>
-                Новая переписка
-              </Text>
+                {uiText("Новая переписка")}</Text>
             </Pressable>
-            <Pressable style={styles.menuItem} onPress={() => action(p.onSaved)}><Text style={{ color: colors.text.primary, fontSize: 16 }}>Избранное</Text></Pressable>
-            <Pressable style={styles.menuItem} onPress={() => action(p.onFolders)}><Text style={{ color: colors.text.primary, fontSize: 16 }}>Папки чатов</Text></Pressable>
+            <Pressable style={styles.menuItem} onPress={() => action(p.onSaved)}><Text style={{ color: colors.text.primary, fontSize: 16 }}>{uiText("Избранное")}</Text></Pressable>
+            <Pressable style={styles.menuItem} onPress={() => action(p.onFolders)}><Text style={{ color: colors.text.primary, fontSize: 16 }}>{uiText("Папки чатов")}</Text></Pressable>
             <Pressable
               style={styles.menuItem}
               onPress={() => action(p.onArchive)}
             >
               <Text style={{ color: colors.text.primary, fontSize: 16 }}>
-                Архив
-              </Text>
+                {uiText("Архив")}</Text>
             </Pressable>
             <Pressable
               style={styles.menuItem}
               onPress={() => action(p.onProfilePress)}
             >
               <Text style={{ color: colors.text.primary, fontSize: 16 }}>
-                Настройки и профиль
-              </Text>
+                {uiText("Настройки и профиль")}</Text>
             </Pressable>
             {p.onLogout && (
               <Pressable
@@ -225,8 +218,7 @@ export function ChatListScreen(p: Props) {
                 onPress={() => action(p.onLogout)}
               >
                 <Text style={{ color: colors.misc.error, fontSize: 16 }}>
-                  Выйти
-                </Text>
+                  {uiText("Выйти")}</Text>
               </Pressable>
             )}
           </View>

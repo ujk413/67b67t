@@ -239,7 +239,7 @@ function Screens() {
           }
         />
       </KeyboardAvoidingView>
-      <MessageActions
+      <MessageActions onPin={async()=>{}} onHide={async()=>{}}
         messages={actions}
         meId={user.id}
         onClose={() => {

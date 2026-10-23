@@ -145,6 +145,19 @@ try {
   assert.ok(ice.turn?.urls?.length);
   assert.equal(ice.turn.credential, crypto.createHmac('sha1', process.env.TURN_SECRET).update(ice.turn.username).digest('base64'));
   console.log('PASS writable uploads, authenticated download and short-lived TURN credentials');
+  const messageId=incoming.message.id;
+  await request(`/rooms/${room.id}/pin`,{token:a.token,method:'PUT',body:{message_id:messageId}});
+  assert.equal((await request('/rooms',{token:b.token})).find(r=>r.id===room.id).pinned_message_id,messageId);
+  assert.equal((await request(`/rooms/${room.id}`,{token:b.token})).pinned_message_id,messageId);
+  await first.wait(event=>event.type==='room.pin' && event.message_id===messageId);
+  await request(`/rooms/${room.id}/messages/${messageId}/hide`,{token:a.token,method:'DELETE'});
+  await first.wait(event=>event.type==='message.hide' && event.message_id===messageId);
+  assert.equal((await request(`/rooms/${room.id}/history`,{token:a.token})).messages.some(m=>m.id===messageId),false);
+  assert.equal((await request(`/rooms/${room.id}/history`,{token:b.token})).messages.some(m=>m.id===messageId),true);
+  assert.equal((await request('/rooms',{token:a.token})).find(r=>r.id===room.id).last_msg_id,null);
+  assert.ok((await request('/sync',{token:a.token})).changes.some(c=>c.message_id===messageId && c.operation==='delete'));
+  await request(`/rooms/${room.id}/pin`,{token:b.token,method:'PUT',body:{message_id:null}});
+  console.log('PASS pin/unpin, both room read paths, private hide realtime, history, sync and preview');
   console.log('NOTE real two-device calls and Firebase push delivery are separate checks');
 } finally {
   for (const ws of sockets) ws.close();

@@ -36,13 +36,12 @@ export async function setLockPreference(enabled: boolean): Promise<void> {
 /** Whether the device can authenticate at all (biometry or passcode). */
 export async function describeLock(): Promise<LockState> {
   if (Platform.OS === "web") return { enabled: false, available: false, biometry: [] };
-  const [enabled, hasHardware, enrolled, biometry] = await Promise.all([
+  const [enabled, level, biometry] = await Promise.all([
     readLockPreference(),
-    LocalAuthentication.hasHardwareAsync().catch(() => false),
-    LocalAuthentication.isEnrolledAsync().catch(() => false),
+    LocalAuthentication.getEnrolledLevelAsync().catch(() => LocalAuthentication.SecurityLevel.NONE),
     LocalAuthentication.supportedAuthenticationTypesAsync().catch(() => []),
   ]);
-  return { enabled, available: hasHardware && enrolled, biometry };
+  return { enabled, available: level !== LocalAuthentication.SecurityLevel.NONE, biometry };
 }
 
 export function lockLabel(biometry: LocalAuthentication.AuthenticationType[]) {

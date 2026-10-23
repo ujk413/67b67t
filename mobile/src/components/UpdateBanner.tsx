@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { ActivityIndicator, Modal, Pressable, Text, View } from "react-native";
 import { useTheme } from "../ThemeProvider";
 import type { UpdateState } from "../hooks/useAppUpdate";
@@ -17,7 +18,7 @@ function percent(progress: number) {
 
 function megabytes(bytes: number) {
   if (!bytes) return "";
-  return `${Math.round(bytes / (1024 * 1024))} МБ`;
+  return uiText("{0} МБ",Math.round(bytes / (1024 * 1024)));
 }
 
 /**
@@ -37,12 +38,13 @@ export function UpdateBanner({
   const release = state.release;
   const label =
     state.phase === "available"
-      ? `Доступна версия ${release.version || release.versionCode}`
+      ? uiText("Доступна версия {0}",release.version || release.versionCode)
       : state.phase === "downloading"
-        ? `Загрузка обновления… ${percent(state.progress)}`
-        : state.phase === "ready" || state.phase === "installing"
-          ? "Открываем установщик…"
-          : "Не удалось обновить";
+        ? uiText("Загрузка обновления… {0}",percent(state.progress))
+        : state.phase === "ready" ? uiText("Файл готов. Можно повторить установку.")
+        : state.phase === "installing"
+          ? uiText("Подтвердите установку в Android или вернитесь в приложение.")
+          : uiText("Не удалось обновить");
 
   if (state.phase === "available") {
     return (
@@ -63,7 +65,7 @@ export function UpdateBanner({
         <Pressable
           onPress={onUpdate}
           accessibilityRole="button"
-          accessibilityLabel="Обновить приложение"
+          accessibilityLabel={uiText("Обновить приложение")}
           style={{
             minHeight: 40,
             paddingHorizontal: 14,
@@ -73,14 +75,13 @@ export function UpdateBanner({
           }}
         >
           <Text style={{ color: colors.text.onAccent, fontWeight: "600" }}>
-            Обновить
-          </Text>
+            {uiText("Обновить")}</Text>
         </Pressable>
         {!release.mandatory && (
           <Pressable
             onPress={onDismiss}
             accessibilityRole="button"
-            accessibilityLabel="Отложить обновление"
+            accessibilityLabel={uiText("Отложить обновление")}
             style={{ minWidth: 40, minHeight: 40, alignItems: "center", justifyContent: "center" }}
           >
             <Text style={{ color: colors.text.secondary }}>✕</Text>
@@ -93,7 +94,7 @@ export function UpdateBanner({
   // Download / install / error: a modal so progress cannot be missed and the
   // installer intent is clearly attributed to a user action.
   return (
-    <Modal transparent animationType="fade" visible onRequestClose={() => {}}>
+    <Modal transparent animationType="fade" visible onRequestClose={onDismiss}>
       <View
         style={{
           flex: 1,
@@ -114,7 +115,7 @@ export function UpdateBanner({
           }}
         >
           <Text style={{ fontSize: 17, fontWeight: "600", color: colors.text.primary }}>
-            {state.phase === "error" ? "Обновление" : "Установка обновления"}
+            {state.phase === "error" ? uiText("Обновление") : uiText("Установка обновления")}
           </Text>
 
           <Text style={{ color: colors.text.secondary }}>
@@ -131,24 +132,33 @@ export function UpdateBanner({
           {state.phase === "error" && (
             <Text style={{ color: colors.misc.error }} accessibilityLiveRegion="polite">
               {state.needsPermission
-                ? "Разрешите установку приложений из этого источника, затем повторите."
+                ? uiText("Разрешите установку приложений из этого источника, затем повторите.")
+                : state.message === "checksum_mismatch"
+                  ? uiText("Проверка файла не пройдена. Повреждённый APK удалён. Скачайте обновление ещё раз.")
+                : state.message === "invalid_release"
+                  ? uiText("На сервере опубликованы неполные данные обновления. Повторите проверку позже.")
+                : state.message === "native_update_unavailable"
+                  ? uiText("Для этой сборки нужна ручная установка новой APK поверх приложения. Данные сохранятся.")
                 : state.message === "incomplete_download"
-                  ? "Файл загрузился не полностью. Проверьте соединение и попробуйте снова."
-                  : "Не удалось скачать обновление. Проверьте соединение и попробуйте снова."}
+                  ? uiText("Файл загрузился не полностью. Проверьте соединение и попробуйте снова.")
+                  : uiText("Не удалось скачать обновление. Проверьте соединение и попробуйте снова.")}
             </Text>
           )}
 
           <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: 10 }}>
+            <Pressable onPress={onDismiss} accessibilityRole="button" style={{minHeight:44,paddingHorizontal:12,justifyContent:'center'}}>
+              <Text style={{color:colors.text.blue}}>{state.phase === 'downloading' ? uiText("Отменить") : uiText("Закрыть")}</Text>
+            </Pressable>
             {state.phase === "error" && state.needsPermission && (
               <Pressable
                 onPress={onOpenPermissionSettings}
                 accessibilityRole="button"
                 style={{ minHeight: 44, paddingHorizontal: 12, justifyContent: "center" }}
               >
-                <Text style={{ color: colors.text.blue }}>Настройки</Text>
+                <Text style={{ color: colors.text.blue }}>{uiText("Настройки")}</Text>
               </Pressable>
             )}
-            {state.phase === "error" && (
+            {(state.phase === "error" || state.phase === "ready") && (
               <Pressable
                 onPress={onRetryInstall}
                 accessibilityRole="button"
@@ -161,8 +171,7 @@ export function UpdateBanner({
                 }}
               >
                 <Text style={{ color: colors.text.onAccent, fontWeight: "600" }}>
-                  Повторить
-                </Text>
+                  {uiText("Повторить")}</Text>
               </Pressable>
             )}
           </View>

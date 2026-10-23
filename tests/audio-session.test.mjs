@@ -32,6 +32,7 @@ function loadAudioSession() {
         },
       };
     }
+    if (name === "./playbackOwnership") return { setMediaCallActive: async () => {}, pauseAllMedia: async () => {} };
     throw new Error(`Unexpected import ${name}`);
   };
   new Function("exports", "require", js)(exports, fakeRequire);
@@ -89,7 +90,7 @@ test("a failing setAudioModeAsync does not throw into the caller", async () => {
     },
   }).outputText;
   const exports = {};
-  const fakeRequire = () => ({
+  const fakeRequire = name => name === "./playbackOwnership" ? { setMediaCallActive: async () => {}, pauseAllMedia: async () => {} } : ({
     Audio: {
       setAudioModeAsync: async () => {
         throw new Error("unsupported");

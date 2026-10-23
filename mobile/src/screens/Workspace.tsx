@@ -1,3 +1,5 @@
+import {locale as uiLocale} from "../../../web/i18n.js";
+import {t as uiText} from "../../../web/i18n.js";
 import { FolderManager } from "../components/FolderManager";
 import { mediaUsage, clearMediaCache, trimMediaCache } from "../mediaFiles";
 import { storage } from "../storage";
@@ -25,16 +27,29 @@ import { useTheme, type ThemeMode } from "../ThemeProvider";
 import { mobileApi, type RoomPreference } from "../mobileApi";
 import type { AccountRepository } from "../data/repository";
 import { newId } from "../data/repository";
-import { api as legacyApi } from "../api";
+import { api as legacyApi, request } from "../api";
 import { encryptRoomText } from "../roomCrypto";
 import { roomTitle } from "../format";
 import type { Message, Room, User } from "../types";
 import { pushNotifications } from "../notifications";
 import { MediaTray } from "../components/MediaTray";
+import { ConnectionDiagnostics } from '../components/ConnectionDiagnostics';
+import {ConversationFeatures} from '../features/ConversationFeatures';
+import {AccountFeatures} from '../features/AccountFeatures';
+import {ExpressiveFeatures} from '../features/ExpressiveFeatures';
+import {QualityFeatures} from '../features/QualityFeatures';
+import {CallFeatures} from '../features/CallFeatures';
+import type {FeatureContext} from '../features/types';
+import {messageLink} from '../../../web/deep-links.js';
 
 import type { ProtectedUploader } from "../protectedUpload";
 type Props = {
+  featureContext:FeatureContext;
   uploader: ProtectedUploader;
+  lockEnabled: boolean;
+  onChangeLock: () => Promise<void>;
+  onCheckUpdates: () => Promise<void>;
+  updateLabel: string;
   embedded?: boolean;
   onMode: (mode: string) => void;
   mode: string | null;
@@ -59,8 +74,9 @@ type Props = {
   onPickFile: () => void;
   onPickVideoNote: () => void;
   forwarding: Message[];
+  forwardOperation:string;
   onForwarded: () => void;
-  enqueueForward: (room: Room, message: Message) => Promise<void>;
+  enqueueForward: (room: Room, message: Message,id?:string) => Promise<void>;
   onSendMedia: (
     text: string,
     body: Record<string, unknown>,
@@ -131,6 +147,9 @@ export function Workspace(p: Props) {
   const [invite, setInvite] = useState(""),
     [searchProgress, setSearchProgress] = useState(""),
     [autoDownload, setAutoDownload] = useState(false);
+  const [forwardComment,setForwardComment]=useState(''),[forwardResults,setForwardResults]=useState<Record<string,string>>({});
+  const completedForwardRooms=useRef(new Set<string>());
+  useEffect(()=>{completedForwardRooms.current.clear();setForwardResults({});},[p.forwardOperation]);
   const searchGeneration = useRef(0),
     cancelSearch = useRef(false);
   const run = async (fn: () => Promise<unknown>) => {
@@ -207,7 +226,7 @@ export function Workspace(p: Props) {
         const items = await api.media(p.room.id, { kind: mediaKind });
         setMedia(items); setMoreMedia(items.length === 100);
       }
-      if (p.mode?.startsWith("room:") || p.mode === "archive")
+      if (p.mode?.startsWith("room:") || p.mode === "archive" || p.mode === 'hidden')
         setPreferences(await api.preferences());
     });
   }, [p.mode, p.room?.id, mediaKind]);
@@ -238,10 +257,17 @@ export function Workspace(p: Props) {
     const { id } = await api.createRoom("dm", [user.username]);
     await p.onOpen(await api.room(id));
   };
-  const forward = async (room: Room) => {
-    for (const message of p.forwarding) await p.enqueueForward(room, message);
-    p.onForwarded();
-    await p.onOpen(room);
+  const forward = async () => {
+    for(const room of p.rooms.filter(room=>selected.includes(room.id))){
+      const completionId=p.forwardOperation+':'+room.id;
+      if(completedForwardRooms.current.has(completionId))continue;
+      try{
+        if(forwardComment.trim()){const body=await p.featureContext.buildText?.(room.id,forwardComment);if(!body)throw Error("Шифрование не готово");await p.featureContext.onSend(room.id,forwardComment,{...body,__queue_id:p.forwardOperation+'_'+room.id+'_comment'});}
+        for(const message of p.forwarding)await p.enqueueForward(room,message,p.forwardOperation+'_'+room.id.replace(/-/g,'')+'_'+message.id.replace(/-/g,''));
+        completedForwardRooms.current.add(completionId);
+        setForwardResults(old=>({...old,[room.id]:uiText("В очереди отправки")}));
+      }catch(e){setForwardResults(old=>({...old,[room.id]:(e as Error).message}));}
+    }
   };
   const scan = async () => {
     cancelSearch.current = false;
@@ -291,7 +317,7 @@ export function Workspace(p: Props) {
           }
           await p.repository?.saveMessages(decoded);
           count += decoded.length;
-          setSearchProgress(`Проверено сообщений: ${count}`);
+          setSearchProgress(uiText("Проверено сообщений: {0}",count));
           setResults(
             (await p.repository?.search(
               query,
@@ -308,8 +334,8 @@ export function Workspace(p: Props) {
       }
       setSearchProgress(
         cancelSearch.current
-          ? "Поиск остановлен"
-          : "Поиск доступной истории завершён",
+          ? uiText("Поиск остановлен")
+          : uiText("Поиск доступной истории завершён"),
       );
     } catch (e) {
       setError(String(e));
@@ -336,20 +362,29 @@ export function Workspace(p: Props) {
   const heading =
     (
       {
-        join: "Вступить в группу",
-        new: "Новая переписка",
-        group: "Новая группа",
-        search: "Поиск",
-        "search-room": "Поиск в переписке",
-        details: "Информация",
-        settings: "Настройки",
-        attachments: "Вложение",
-        circle: "Видеокружок",
-        forward: "Переслать",
-        archive: "Архив",
+        join: uiText("Вступить в группу"),
+        new: uiText("Новая переписка"),
+        group: uiText("Новая группа"),
+        search: uiText("Поиск"),
+        "search-room": uiText("Поиск в переписке"),
+        details: uiText("Информация"),
+        settings: uiText("Настройки"),
+        attachments: uiText("Вложение"),
+        circle: uiText("Видеокружок"),
+        forward: uiText("Переслать"),
+        archive: uiText("Архив"),
       } as Record<string, string>
-    )[p.mode] || "Действия с чатом";
-  const content = (
+    )[p.mode] || uiText("Действия с чатом");
+  const feature = p.mode.startsWith('conversation:')
+    ? <ConversationFeatures mode={p.mode.slice(13)} context={p.featureContext}/>
+    : p.mode.startsWith('account-')
+    ? <AccountFeatures mode={p.mode} context={p.featureContext}/>
+    : p.mode.startsWith('expressive:')
+    ? <ExpressiveFeatures mode={p.mode.slice(11)} context={p.featureContext}/>
+    : p.mode==='quality'
+    ? <QualityFeatures context={p.featureContext}/>
+    : null;
+  const content = feature || (p.mode.startsWith('calls:')?<CallFeatures mode={p.mode.slice(6)} context={p.featureContext}/>:null) || (
     <View
       style={{
         flex: 1,
@@ -359,7 +394,7 @@ export function Workspace(p: Props) {
       }}
     >
       <View style={{ flexDirection: "row", alignItems: "center" }}>
-        <Row label="Назад" onPress={p.onClose} />
+        <Row label={uiText("Назад")} onPress={p.onClose} />
         <Text
           accessibilityRole="header"
           style={{
@@ -383,9 +418,9 @@ export function Workspace(p: Props) {
       {p.mode!=="attachments" && p.mode!=="circle" && <ScrollView keyboardShouldPersistTaps="handled">
         {p.mode === "join" && (
           <>
-            {input(query, setQuery, "Токен приглашения")}
+            {input(query, setQuery, uiText("Токен приглашения"))}
             <Row
-              label="Вступить"
+              label={uiText("Вступить")}
               onPress={() =>
                 void run(async () => {
                   const { id } = await api.joinInvite(query.trim());
@@ -399,24 +434,24 @@ export function Workspace(p: Props) {
           <>
             {p.mode === "new" && (
               <>
-                <Row label="Создать группу" onPress={() => p.onMode("group")} />
+                <Row label={uiText("Создать группу")} onPress={() => p.onMode("group")} />
+                <Row label={uiText("Создать канал")} onPress={() => p.onMode('conversation:channels')}/>
+                <Row label={uiText("Публичные сообщества")} onPress={() => p.onMode('conversation:communities')}/>
                 <Row
-                  label="Вступить по приглашению"
+                  label={uiText("Вступить по приглашению")}
                   onPress={() => p.onMode("join")}
                 />
               </>
             )}
-            {p.mode === "group" && input(title, setTitle, "Название группы")}
-            {input(query, setQuery, "Имя пользователя или текст сообщения")}
+            {p.mode === "group" && input(title, setTitle, uiText("Название группы"))}
+            {input(query, setQuery, uiText("Имя пользователя или текст сообщения"))}
             {query.length > 0 && query.length < 2 && (
               <Text style={{ padding: 12, color: colors.text.secondary }}>
-                Введите хотя бы два символа
-              </Text>
+                {uiText("Введите хотя бы два символа")}</Text>
             )}
             {!!users.length && (
               <Text style={{ padding: 12, color: colors.text.secondary }}>
-                Люди
-              </Text>
+                {uiText("Люди")}</Text>
             )}
             {users.map((user) => (
               <Row
@@ -436,7 +471,7 @@ export function Workspace(p: Props) {
             ))}
             {p.mode === "group" && (
               <Row
-                label={`Создать группу · ${selected.length} участников`}
+                label={uiText("Создать группу · {0} участников",selected.length)}
                 onPress={() =>
                   void run(async () => {
                     if (!title.trim() || !selected.length)
@@ -454,13 +489,10 @@ export function Workspace(p: Props) {
             {(p.mode === "search" || p.mode === "search-room") && (
               <>
                 <Text style={{ padding: 12, color: colors.text.secondary }}>
-                  Сообщения из загруженной истории. Для полной проверки
-                  запустите поиск дальше.
-                </Text>
+                  {uiText("Сообщения из загруженной истории. Для полной проверки\r\n                  запустите поиск дальше.")}</Text>
                 {p.mode === "search" && (
                   <Text style={{ padding: 12, color: colors.text.secondary }}>
-                    Чаты
-                  </Text>
+                    {uiText("Чаты")}</Text>
                 )}
                 {p.rooms
                   .filter(
@@ -478,18 +510,17 @@ export function Workspace(p: Props) {
                     />
                   ))}
                 <Text style={{ padding: 12, color: colors.text.secondary }}>
-                  Сообщения · {results.length}
+                  {uiText("Сообщения ·")}{results.length}
                   {results.length === 100 ? "+" : ""}
                 </Text>
                 {query.length >= 2 && !results.length && (
                   <Text style={{ padding: 12, color: colors.text.secondary }}>
-                    В загруженной истории совпадений нет
-                  </Text>
+                    {uiText("В загруженной истории совпадений нет")}</Text>
                 )}
                 {results.map((message, index) => (
                   <Row
                     key={message.id}
-                    label={message.text || "Вложение"}
+                    label={message.text || uiText("Вложение")}
                     detail={roomTitle(
                       p.rooms.find((r) => r.id === message.room_id) || {
                         id: message.room_id,
@@ -517,7 +548,7 @@ export function Workspace(p: Props) {
                 {!!query && (
                   <Row
                     label={
-                      busy ? "Остановить поиск" : "Искать дальше в истории"
+                      busy ? uiText("Остановить поиск") : uiText("Искать дальше в истории")
                     }
                     onPress={() => {
                       if (busy) cancelSearch.current = true;
@@ -532,18 +563,23 @@ export function Workspace(p: Props) {
             )}
           </>
         )}
-        {p.mode === "forward" &&
-          p.rooms.map((room) => (
+        {p.mode === "forward" && <>
+          {input(forwardComment,setForwardComment,uiText("Комментарий (необязательно)"))}
+          {p.rooms.map((room) => (
             <Row
               key={room.id}
-              label={roomTitle(room, p.user.id)}
-              onPress={() => void run(() => forward(room))}
+              label={(selected.includes(room.id)?'✓ ':'')+roomTitle(room, p.user.id)}
+              detail={forwardResults[room.id]}
+              onPress={() => setSelected(old=>old.includes(room.id)?old.filter(id=>id!==room.id):[...old,room.id])}
             />
           ))}
+          <Row label={uiText("Переслать · {0} чатов",selected.length)} onPress={()=>void run(forward)}/>
+          <Row label={uiText("Готово")} onPress={()=>{p.onForwarded();p.onClose();}}/>
+        </>}
         {p.mode.startsWith("room:") && (
           <>
             <Row
-              label={roomPreference?.pinned ? "Открепить" : "Закрепить"}
+              label={roomPreference?.pinned ? uiText("Открепить") : uiText("Закрепить")}
               onPress={() =>
                 void run(() =>
                   changePreference({ pinned: !roomPreference?.pinned }),
@@ -553,8 +589,8 @@ export function Workspace(p: Props) {
             <Row
               label={
                 roomPreference?.muted
-                  ? "Включить уведомления"
-                  : "Отключить уведомления"
+                  ? uiText("Включить уведомления")
+                  : uiText("Отключить уведомления")
               }
               onPress={() =>
                 void run(() =>
@@ -563,7 +599,7 @@ export function Workspace(p: Props) {
               }
             />
             <Row
-              label={roomPreference?.archived ? "Вернуть из архива" : "В архив"}
+              label={roomPreference?.archived ? uiText("Вернуть из архива") : uiText("В архив")}
               onPress={() =>
                 void run(() =>
                   changePreference({ archived: !roomPreference?.archived }),
@@ -571,22 +607,22 @@ export function Workspace(p: Props) {
               }
             />
             <Row
-              label="Отметить непрочитанным"
+              label={uiText("Отметить непрочитанным")}
               onPress={() =>
                 void run(() => changePreference({ marked_unread: true }))
               }
             />
             <Row
-              label="Удалить из моего списка"
+              label={uiText("Удалить из моего списка")}
               danger
               onPress={() =>
                 Alert.alert(
-                  "Удалить чат из списка?",
-                  "Переписка у собеседника сохранится",
+                  uiText("Удалить чат из списка?"),
+                  uiText("Переписка у собеседника сохранится"),
                   [
-                    { text: "Отмена" },
+                    { text: uiText("Отмена") },
                     {
-                      text: "Удалить",
+                      text: uiText("Удалить"),
                       style: "destructive",
                       onPress: () =>
                         void run(() => changePreference({ hidden: true })),
@@ -609,28 +645,33 @@ export function Workspace(p: Props) {
                 onPress={() => void p.onOpen(room)}
               />
             ))}
+        {p.mode==='hidden' && p.rooms.filter(room=>preferences.some(pref=>pref.room_id===room.id&&pref.hidden)).map(room=><Row key={room.id} label={roomTitle(room,p.user.id)} detail={uiText("Нажмите, чтобы восстановить в списке чатов")} onPress={()=>void run(async()=>{await api.preference(room.id,{hidden:false});setPreferences(prev=>prev.map(pref=>pref.room_id===room.id?{...pref,hidden:false}:pref));await p.onRefresh();})}/>)}
         {p.mode === "details" && p.room && (
           <>
+            <Row label={uiText("Закрепления, дата и отложенные сообщения")} onPress={()=>p.onMode('conversation:conversation')}/>
+            <Row label={p.room.kind==='group'?uiText("Групповой звонок и история"):uiText("История звонков")} onPress={()=>p.onMode('calls:history')}/>
+            <Row label={uiText("Экспорт переписки")} onPress={()=>p.onMode('expressive:export')}/>
+            {p.room.kind!=='dm' && <><Row label={uiText("Управление участниками")} onPress={()=>p.onMode('conversation:members')}/><Row label={uiText("Шифрование и настройки сообщества")} onPress={()=>p.onMode('conversation:settings')}/></>}
             <Row
               label={roomTitle(p.room, p.user.id)}
               detail={
                 p.room.kind === "dm"
                   ? `@${p.room.other_username || ""}`
-                  : `Участников: ${members.length}`
+                  : uiText("Участников: {0}",members.length)
               }
             />
             {p.room.kind === "dm" && p.room.other_user_id && (
               <Row
-                label="Заблокировать собеседника"
+                label={uiText("Заблокировать собеседника")}
                 danger
                 onPress={() =>
                   Alert.alert(
-                    "Заблокировать?",
-                    "Личные сообщения будут недоступны",
+                    uiText("Заблокировать?"),
+                    uiText("Личные сообщения будут недоступны"),
                     [
-                      { text: "Отмена" },
+                      { text: uiText("Отмена") },
                       {
-                        text: "Заблокировать",
+                        text: uiText("Заблокировать"),
                         onPress: () =>
                           void run(() =>
                             api.block(p.room!.other_user_id!, true),
@@ -643,7 +684,7 @@ export function Workspace(p: Props) {
             )}
             {p.room.kind === "dm" && p.room.other_user_id && (
               <Row
-                label="Разблокировать собеседника"
+                label={uiText("Разблокировать собеседника")}
                 onPress={() =>
                   void run(() => api.block(p.room!.other_user_id!, false))
                 }
@@ -656,21 +697,21 @@ export function Workspace(p: Props) {
                 detail={
                   (
                     {
-                      owner: "Владелец",
-                      admin: "Администратор",
-                      member: "Участник",
+                      owner: uiText("Владелец"),
+                      admin: uiText("Администратор"),
+                      member: uiText("Участник"),
                     } as Record<string, string>
-                  )[member.role] || "Участник"
+                  )[member.role] || uiText("Участник")
                 }
                 onPress={() => {
                   if (!canManage || member.id === p.room!.created_by) return;
-                  Alert.alert(member.username, "Управление участником", [
-                    { text: "Отмена" },
+                  Alert.alert(member.username, uiText("Управление участником"), [
+                    { text: uiText("Отмена") },
                     {
                       text:
                         member.role === "admin"
-                          ? "Снять права администратора"
-                          : "Назначить администратором",
+                          ? uiText("Снять права администратора")
+                          : uiText("Назначить администратором"),
                       onPress: () =>
                         void run(async () => {
                           await api.role(
@@ -688,7 +729,7 @@ export function Workspace(p: Props) {
                         }),
                     },
                     {
-                      text: "Удалить",
+                      text: uiText("Удалить"),
                       style: "destructive",
                       onPress: () =>
                         void run(async () => {
@@ -705,7 +746,7 @@ export function Workspace(p: Props) {
             {p.room.kind === "group" && canManage && (
               <>
                 <Row
-                  label="Изменить аватар группы"
+                  label={uiText("Изменить аватар группы")}
                   onPress={() =>
                     void run(async () => {
                       if (
@@ -740,9 +781,9 @@ export function Workspace(p: Props) {
                     })
                   }
                 />
-                {input(title, setTitle, "Название группы")}
+                {input(title, setTitle, uiText("Название группы"))}
                 <Row
-                  label="Сохранить название"
+                  label={uiText("Сохранить название")}
                   onPress={() =>
                     void run(async () => {
                       await api.updateRoom(p.room!.id, title);
@@ -750,9 +791,9 @@ export function Workspace(p: Props) {
                     })
                   }
                 />
-                {input(query, setQuery, "Username нового участника")}
+                {input(query, setQuery, uiText("Username нового участника"))}
                 <Row
-                  label="Добавить участника"
+                  label={uiText("Добавить участника")}
                   onPress={() =>
                     void run(async () => {
                       await api.member(p.room!.id, query);
@@ -767,20 +808,20 @@ export function Workspace(p: Props) {
                   }
                 />
                 <Row
-                  label="Создать приглашение"
+                  label={uiText("Создать приглашение")}
                   onPress={() =>
                     void run(async () => {
                       const result = await api.invite(p.room!.id);
                       setInvite(result.token);
                       await Share.share({
-                        message: `Приглашение в Messenger67: ${result.token}`,
+                        message: uiText("Приглашение в Messenger67: {0}",result.token),
                       });
                     })
                   }
                 />
                 {!!invite && (
                   <Row
-                    label="Отозвать приглашение"
+                    label={uiText("Отозвать приглашение")}
                     onPress={() =>
                       void run(async () => {
                         await api.revokeInvite(p.room!.id, invite);
@@ -792,55 +833,63 @@ export function Workspace(p: Props) {
               </>
             )}
             <Text style={{ padding: 16, color: colors.text.secondary }}>
-              Общие медиа и файлы
-            </Text>
+              {uiText("Общие медиа и файлы")}</Text>
             <ScrollView horizontal contentContainerStyle={{ paddingHorizontal: 12 }}>
-              {Object.entries({ all: "Все", image: "Фото", video: "Видео", file: "Файлы" }).map(([key, title]) => <Pressable key={key} onPress={() => setMediaKind(key)} accessibilityRole="button" accessibilityState={{ selected: mediaKind === key }} style={{ padding: 12, minHeight: 48 }}><Text style={{ color: mediaKind === key ? colors.text.blue : colors.text.secondary }}>{title}</Text></Pressable>)}
-              <Pressable onPress={() => p.onMode("search-room")} style={{ padding: 12, minHeight: 48 }}><Text style={{ color: colors.text.blue }}>Ссылки · поиск</Text></Pressable>
+              {Object.entries({ all: uiText("Все"), image: uiText("Фото"), video: uiText("Видео"), file: uiText("Файлы") }).map(([key, title]) => <Pressable key={key} onPress={() => setMediaKind(key)} accessibilityRole="button" accessibilityState={{ selected: mediaKind === key }} style={{ padding: 12, minHeight: 48 }}><Text style={{ color: mediaKind === key ? colors.text.blue : colors.text.secondary }}>{title}</Text></Pressable>)}
+              <Pressable onPress={() => p.onMode("search-room")} style={{ padding: 12, minHeight: 48 }}><Text style={{ color: colors.text.blue }}>{uiText("Ссылки · поиск")}</Text></Pressable>
             </ScrollView>
             {media.map((message) => (
               <Row
                 key={message.id}
-                label={message.text || message.media_mime || "Вложение"}
+                label={message.text || message.media_mime || uiText("Вложение")}
                 detail={new Date(message.created_at).toLocaleDateString(
-                  "ru-RU",
+                  uiLocale(),
                 )}
                 onPress={() => p.onOpenMedia(message)}
               />
             ))}
-            {moreMedia && <Row label={busy ? "Загрузка…" : "Загрузить ещё вложения"} onPress={() => { if (busy || !p.room) return; void run(async () => { const next = await api.media(p.room!.id, { kind: mediaKind, before: media.at(-1)!.id }); setMedia(prev => [...prev, ...next]); setMoreMedia(next.length === 100); }); }} />}
+            {moreMedia && <Row label={busy ? uiText("Загрузка…") : uiText("Загрузить ещё вложения")} onPress={() => { if (busy || !p.room) return; void run(async () => { const next = await api.media(p.room!.id, { kind: mediaKind, before: media.at(-1)!.id }); setMedia(prev => [...prev, ...next]); setMoreMedia(next.length === 100); }); }} />}
           </>
         )}
+        {p.mode === 'diagnostics' && <ConnectionDiagnostics baseUrl={p.baseUrl} token={p.token}/>}
         {p.mode === "settings" && (
           <>
-            <Row label="Профиль" onPress={p.onProfile} />
-            <Row label="Папки чатов" onPress={() => p.onMode("folders")} />
-            <Row label="Избранное" onPress={() => void run(async () => { const room = await api.saved(); await p.onRefresh(); await p.onOpen(await api.room(room.id)); })} />
+            <Row label={uiText("Профиль")} onPress={p.onProfile} />
+            <Row label={uiText("История звонков")} onPress={()=>p.onMode('calls:history')}/>
+            {Object.entries({contacts:uiText("Контакты"),privacy:uiText("Приватность"),blocked:uiText("Заблокированные"),backup:uiText("Защищённая копия ключей"),security:uiText("Защита и история входов"),aliases:uiText("Публичные имена"),accounts:uiText("Аккаунты"),qr:uiText("Вход по QR"),transport:uiText("Прокси и Tor"),secret:uiText("Секретные чаты"),delete:uiText("Удаление аккаунта")}).map(([mode,label])=><Row key={mode} label={label} onPress={()=>p.onMode('account-'+mode)}/>)}
+            <Row label={uiText("Прочитать все чаты")} onPress={()=>void run(async()=>{await request(p.baseUrl,'/me/read-all',{token:p.token,method:'POST',body:{}});await p.onRefresh();})}/>
+            <Row label={uiText("Скрытые чаты")} onPress={()=>p.onMode('hidden')}/>
+            <Row label={uiText("Проверить соединение и звонки")} onPress={()=>p.onMode('diagnostics')}/>
+            <Row label={uiText("Качество и оформление · Quality")} onPress={()=>p.onMode('quality')}/>
+            <Row label={uiText("Проверить обновления")} detail={p.updateLabel} onPress={() => void run(p.onCheckUpdates)} />
+            <Row label={uiText("Блокировка приложения")} detail={p.lockEnabled ? uiText("Включена · отпечаток, лицо или код устройства") : uiText("Выключена")} onPress={() => void run(p.onChangeLock)} />
+            <Row label={uiText("Папки чатов")} onPress={() => p.onMode("folders")} />
+            <Row label={uiText("Избранное")} onPress={() => void run(async () => { const room = await api.saved(); await p.onRefresh(); await p.onOpen(await api.room(room.id)); })} />
             <Row
-              label="Уведомления"
-              detail={pushStatus.message}
+              label={uiText("Уведомления")}
+              detail={uiText(pushStatus.message)}
               onPress={() => void Linking.openSettings()}
             />
             {pushNotifications.configured && (
               <>
                 {pushStatus.status !== "enabled" && (
-                  <Row label="Подключить уведомления" onPress={() => void run(() => pushNotifications.retry())} />
+                  <Row label={uiText("Подключить уведомления")} onPress={() => void run(() => pushNotifications.retry())} />
                 )}
-                <Row label="Проверить уведомления" onPress={() => void run(async () => {
+                <Row label={uiText("Проверить уведомления")} onPress={() => void run(async () => {
                   await pushNotifications.test(p.baseUrl, p.token);
-                  Alert.alert("67chat", "Проверочное уведомление отправлено");
+                  Alert.alert("67chat", uiText("Проверочное уведомление отправлено"));
                 })} />
               </>
             )}
             {(["light", "dark", "system"] as ThemeMode[]).map((mode) => (
               <Row
                 key={mode}
-                label={`${theme.mode === mode ? "✓ " : ""}${{ light: "Светлая тема", dark: "Тёмная тема", system: "Как в системе" }[mode]}`}
+                label={`${theme.mode === mode ? "✓ " : ""}${{ light: uiText("Светлая тема"), dark: uiText("Тёмная тема"), system: uiText("Как в системе") }[mode]}`}
                 onPress={() => theme.setMode(mode)}
               />
             ))}
             <Row
-              label={`Размер текста: ${theme.fontSize}`}
+              label={uiText("Размер текста: {0}",theme.fontSize)}
               onPress={() =>
                 theme.setFontSize(
                   theme.fontSize >= 24 ? 14 : theme.fontSize + 2,
@@ -855,8 +904,7 @@ export function Workspace(p: Props) {
               }}
             >
               <Text style={{ color: colors.text.primary }}>
-                Автозагрузка медиа
-              </Text>
+                {uiText("Автозагрузка медиа")}</Text>
               <Switch
                 value={autoDownload}
                 onValueChange={(value) => {
@@ -866,21 +914,21 @@ export function Workspace(p: Props) {
               />
             </View>
             <Row
-              label={`Локальное хранилище: ${(cacheBytes / 1048576).toFixed(1)} МБ`}
+              label={uiText("Локальное хранилище: {0} МБ",(cacheBytes / 1048576).toFixed(1))}
             />
-            <Row label={`Лимит кеша медиа: ${cacheLimit} МБ`} onPress={() => void run(async () => { const values = [64,128,256,512,1024], next = values[(values.indexOf(cacheLimit) + 1) % values.length]; await storage.set("media.cacheLimitMB", String(next)); setCacheLimit(next); await trimMediaCache(); if (p.repository) setCacheBytes((await mediaUsage(p.repository)).total); })} />
-            <Row label="Очистить кеш медиа" detail="Черновики, записи и очередь сохранятся" onPress={() => Alert.alert("Очистить кеш медиа?", "Загруженные файлы можно будет открыть заново", [{ text: "Отмена" }, { text: "Очистить", onPress: () => void run(async () => { await clearMediaCache(); if (p.repository) setCacheBytes((await mediaUsage(p.repository)).total); }) }])} />
+            <Row label={uiText("Лимит кеша медиа: {0} МБ",cacheLimit)} onPress={() => void run(async () => { const values = [64,128,256,512,1024], next = values[(values.indexOf(cacheLimit) + 1) % values.length]; await storage.set("media.cacheLimitMB", String(next)); setCacheLimit(next); await trimMediaCache(); if (p.repository) setCacheBytes((await mediaUsage(p.repository)).total); })} />
+            <Row label={uiText("Очистить кеш медиа")} detail={uiText("Черновики, записи и очередь сохранятся")} onPress={() => Alert.alert(uiText("Очистить кеш медиа?"), uiText("Загруженные файлы можно будет открыть заново"), [{ text: uiText("Отмена") }, { text: uiText("Очистить"), onPress: () => void run(async () => { await clearMediaCache(); if (p.repository) setCacheBytes((await mediaUsage(p.repository)).total); }) }])} />
             <Row
-              label="Очистить кеш истории"
-              detail="Черновики и очередь отправки сохранятся"
+              label={uiText("Очистить кеш истории")}
+              detail={uiText("Черновики и очередь отправки сохранятся")}
               onPress={() =>
                 Alert.alert(
-                  "Очистить кеш?",
-                  "Историю можно будет загрузить заново",
+                  uiText("Очистить кеш?"),
+                  uiText("Историю можно будет загрузить заново"),
                   [
-                    { text: "Отмена" },
+                    { text: uiText("Отмена") },
                     {
-                      text: "Очистить",
+                      text: uiText("Очистить"),
                       onPress: () => void run(() => p.repository!.clearCache()),
                     },
                   ],
@@ -888,24 +936,23 @@ export function Workspace(p: Props) {
               }
             />
             <Text style={{ padding: 16, color: colors.text.secondary }}>
-              Активные устройства
-            </Text>
+              {uiText("Активные устройства")}</Text>
             {sessions.map((session) => (
               <Row
                 key={session.id}
-                label={String(session.deviceName || session.deviceType || 'Устройство').replace(/^Unknown on /,'').replace(/^Unknown(?: Device)?$/,'Неизвестное устройство')}
+                label={String(session.deviceName || session.deviceType || uiText("Устройство")).replace(/^Unknown on /,'').replace(/^Unknown(?: Device)?$/,uiText("Неизвестное устройство"))}
                 detail={
-                  session.isCurrent ? "Это устройство" : session.lastActivity ? new Date(session.lastActivity).toLocaleString('ru-RU') : 'Нет данных о последней активности'
+                  session.isCurrent ? uiText("Это устройство") : session.lastActivity ? new Date(session.lastActivity).toLocaleString(uiLocale()) : uiText("Нет данных о последней активности")
                 }
                 onPress={() => {
                   if (session.isCurrent) return;
                   Alert.alert(
-                    "Завершить сеанс?",
-                    "Устройству потребуется войти заново",
+                    uiText("Завершить сеанс?"),
+                    uiText("Устройству потребуется войти заново"),
                     [
-                      { text: "Отмена" },
+                      { text: uiText("Отмена") },
                       {
-                        text: "Завершить",
+                        text: uiText("Завершить"),
                         onPress: () =>
                           void run(async () => {
                             await api.terminate(session.id);
@@ -920,17 +967,17 @@ export function Workspace(p: Props) {
               />
             ))}
             <Row
-              label="Удалить локальные данные"
+              label={uiText("Удалить локальные данные")}
               danger
-              detail="Включая черновики и неотправленные сообщения"
+              detail={uiText("Включая черновики и неотправленные сообщения")}
               onPress={() =>
                 Alert.alert(
-                  "Удалить локальные данные?",
-                  "Черновики и очередь будут потеряны. Потребуется войти заново.",
+                  uiText("Удалить локальные данные?"),
+                  uiText("Черновики и очередь будут потеряны. Потребуется войти заново."),
                   [
-                    { text: "Отмена" },
+                    { text: uiText("Отмена") },
                     {
-                      text: "Удалить",
+                      text: uiText("Удалить"),
                       style: "destructive",
                       onPress: () => void run(p.onClearData),
                     },
@@ -939,7 +986,7 @@ export function Workspace(p: Props) {
               }
             />
             <Row
-              label="Выйти"
+              label={uiText("Выйти")}
               danger
               onPress={() => {
                 p.onClose();
@@ -950,7 +997,7 @@ export function Workspace(p: Props) {
         )}
       </ScrollView>}
       {(p.mode === "attachments" || p.mode === "circle") && (
-        <MediaTray
+        <>{p.mode==='attachments' && <ScrollView horizontal style={{flexGrow:0}}>{Object.entries({emoji:uiText("Эмодзи"),stickers:uiText("Стикеры и GIF"),poll:uiText("Опрос"),dice:uiText("Кубик"),contact:uiText("Контакт"),location:uiText("Геолокация")}).map(([mode,title])=><Pressable key={mode} accessibilityRole="button" onPress={()=>p.onMode('expressive:'+mode)} style={{padding:14,minHeight:48}}><Text style={{color:colors.text.blue}}>{title}</Text></Pressable>)}</ScrollView>}<MediaTray
           uploader={p.uploader}
           key={p.user.id + ":" + p.room?.id}
           initialCircle={p.mode === "circle"}
@@ -960,7 +1007,7 @@ export function Workspace(p: Props) {
           roomId={p.room?.id || ""}
           onSent={p.onClose}
           onSend={p.onSendMedia}
-        />
+        /></>
       )}
     </View>
   );
@@ -983,6 +1030,10 @@ export function MessageActions({
   onEdit,
   onForward,
   onDelete,
+  onPin,
+  onHide,
+  onHistory,
+  onComments,
   onError,
 }: {
   messages: Message[];
@@ -994,6 +1045,10 @@ export function MessageActions({
   onEdit: (m: Message) => void;
   onForward: (items: Message[]) => void;
   onDelete: (items: Message[]) => Promise<void>;
+  onPin?: (message: Message) => Promise<void>;
+  onHide: (items: Message[]) => Promise<void>;
+  onHistory?:(message:Message)=>void;
+  onComments?:(message:Message)=>void;
   onError: (error: string) => void;
 }) {
   const { colors, fontSize } = useTheme();
@@ -1041,8 +1096,7 @@ export function MessageActions({
                   fontWeight: "600",
                 }}
               >
-                Текст сообщения
-              </Text>
+                {uiText("Текст сообщения")}</Text>
               <Pressable
                 onPress={onClose}
                 style={{
@@ -1052,7 +1106,7 @@ export function MessageActions({
                   justifyContent: "center",
                 }}
               >
-                <Text style={{ color: colors.text.blue }}>Готово</Text>
+                <Text style={{ color: colors.text.blue }}>{uiText("Готово")}</Text>
               </Pressable>
             </View>
             <ScrollView>
@@ -1097,18 +1151,21 @@ export function MessageActions({
             {messages.length === 1 && (
               <>
                 <Row
-                  label="Ответить"
+                  label={uiText("Ответить")}
                   onPress={() => action(() => onReply(first))}
                 />
                 <Row
-                  label="Реакция"
+                  label={uiText("Реакция")}
                   onPress={() => action(() => onReact(first))}
                 />
               </>
             )}
-            <Row label="Выделить несколько" onPress={onSelectMore} />
+            <Row label={uiText("Выделить несколько")} onPress={onSelectMore} />
+            {messages.length===1&&!first.delivery&&<><Row label={uiText("Копировать ссылку")} onPress={()=>action(()=>{void Clipboard.setStringAsync(messageLink(first.room_id,first.id)).catch(e=>onError(String(e)));})}/>{onHistory&&<Row label={uiText("История правок")} onPress={()=>action(()=>onHistory(first))}/>}{first.is_post&&onComments&&<Row label={uiText('Комментарии')} onPress={()=>action(()=>onComments(first))}/>}</>}
+            {messages.length === 1 && !first.delivery && onPin && <Row label={uiText("Закрепить сообщение")} onPress={() => action(() => { void onPin(first).catch(e => onError(String(e))); })} />}
+            {messages.every(m => !m.delivery) && <Row label={uiText("Удалить у себя")} danger onPress={() => Alert.alert(uiText("Удалить только у себя?"), uiText("У собеседника сообщения останутся"), [{text:uiText("Отмена")},{text:uiText("Удалить"),style:"destructive",onPress:()=>action(()=>{void onHide(messages).catch(e=>onError(String(e)));})}])} />}
             <Row
-              label="Копировать"
+              label={uiText("Копировать")}
               onPress={() =>
                 action(() => {
                   void Clipboard.setStringAsync(
@@ -1119,12 +1176,12 @@ export function MessageActions({
             />
             {messages.length === 1 && first.text && (
               <Row
-                label="Выделить текст"
+                label={uiText("Выделить текст")}
                 onPress={() => setSelectingText(true)}
               />
             )}
             <Row
-              label="Переслать"
+              label={uiText("Переслать")}
               onPress={() => action(() => onForward(messages))}
             />
             {messages.length === 1 &&
@@ -1133,22 +1190,22 @@ export function MessageActions({
               !first.delivery &&
               !first.meta?.e2e_group && (
                 <Row
-                  label="Изменить"
+                  label={uiText("Изменить")}
                   onPress={() => action(() => onEdit(first))}
                 />
               )}
             {messages.every((m) => m.sender_id === meId && !m.delivery) && (
               <Row
-                label="Удалить у всех"
+                label={uiText("Удалить у всех")}
                 danger
                 onPress={() =>
                   Alert.alert(
-                    "Удалить сообщения?",
-                    "Это действие нельзя отменить",
+                    uiText("Удалить сообщения?"),
+                    uiText("Это действие нельзя отменить"),
                     [
-                      { text: "Отмена" },
+                      { text: uiText("Отмена") },
                       {
-                        text: "Удалить",
+                        text: uiText("Удалить"),
                         style: "destructive",
                         onPress: () => {
                           onClose();

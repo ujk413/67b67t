@@ -1,0 +1,37 @@
+# Optional Linux production overlay. Set a reviewed, pinned image and new service
+# credentials in the existing server environment; never replace its .env file.
+services:
+  api:
+    environment:
+      LIVEKIT_URL: wss://${SITE_DOMAIN:?Set the messenger domain}/api/livekit
+      LIVEKIT_API_URL: http://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Generate a LiveKit API key}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Generate a separate LiveKit secret}
+      LIVEKIT_ENABLE_GROUP_CALLS: ${LIVEKIT_ENABLE_GROUP_CALLS:-false}
+  livekit:
+    image: ${LIVEKIT_IMAGE:?Set a reviewed pinned livekit/livekit-server image}
+    # Signaling7880 is reachable ONLY on the private Compose network.
+    # Every public /rtc request goes through the API lease/session gateway.
+    ports:
+      - "7881:7881/tcp"
+      - "7882:7882/udp"
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: 1.25
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7880
+        rtc:
+          tcp_port: 7881
+          udp_port: 7882
+          use_external_ip: true
+        keys:
+          ${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}
+        logging:
+          level: warn
+    security_opt: ["no-new-privileges:true"]

@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { useTheme } from "../ThemeProvider";
 import { Icon } from "./Icon";
 import { Pressable, StyleSheet, Text, View } from "react-native";
@@ -39,14 +40,14 @@ export function ChatHeader({
   const { colors: telegramColors } = useTheme();
 
   const title =
-    room.is_saved ? 'Избранное' : room.title || room.other_display_name || room.other_username || "Переписка";
+    room.is_saved ? uiText("Избранное") : room.title || room.other_display_name || room.other_username || uiText("Переписка");
 
   return (
     <View style={styles.container}>
       <Pressable
         onPress={onBack}
         accessibilityRole="button"
-        accessibilityLabel="Назад к чатам"
+        accessibilityLabel={uiText("Назад к чатам")}
         hitSlop={8}
         style={styles.backButton}
       >
@@ -65,7 +66,7 @@ export function ChatHeader({
         style={styles.info}
         onPress={onDetails}
         accessibilityRole="button"
-        accessibilityLabel="Сведения о переписке"
+        accessibilityLabel={uiText("Сведения о переписке")}
       >
         <Text style={styles.title} numberOfLines={1}>
           {title}
@@ -88,7 +89,7 @@ export function ChatHeader({
               <Pressable
                 onPress={onAudioCall}
                 accessibilityRole="button"
-                accessibilityLabel="Аудиозвонок"
+                accessibilityLabel={uiText("Аудиозвонок")}
                 hitSlop={8}
                 style={styles.iconButton}
               >
@@ -101,7 +102,7 @@ export function ChatHeader({
               <Pressable
                 onPress={onVideoCall}
                 accessibilityRole="button"
-                accessibilityLabel="Видеозвонок"
+                accessibilityLabel={uiText("Видеозвонок")}
                 hitSlop={8}
                 style={styles.iconButton}
               >
@@ -117,7 +118,7 @@ export function ChatHeader({
             onPress={onMenuPress}
             style={styles.iconButton}
             accessibilityRole="button"
-            accessibilityLabel="Меню переписки"
+            accessibilityLabel={uiText("Меню переписки")}
           >
             <Icon name="more" size={22} />
           </Pressable>

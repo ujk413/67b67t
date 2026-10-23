@@ -1,0 +1,6 @@
+import test from 'node:test';import assert from 'node:assert/strict';
+import {videoDimensions,transcodeVideo,waitForMediaMetadata} from '../web/media-editor.js';
+test('video target preserves portrait and never upscales',()=>{assert.deepEqual(videoDimensions(1080,1920,720),{width:720,height:1280});assert.deepEqual(videoDimensions(1920,1080,480),{width:852,height:480});assert.deepEqual(videoDimensions(320,240,720),{width:320,height:240});assert.throws(()=>videoDimensions(0,1080,480));});
+test('cancelled processing does not open media or request permissions',async()=>{const controller=new AbortController();controller.abort();await assert.rejects(transcodeVideo(null,480,{signal:controller.signal}),{name:'AbortError'});});
+test('cancel while waiting for metadata rejects immediately and removes event handlers',async()=>{const controller=new AbortController(),item={};const task=waitForMediaMetadata(item,'blob:video',{signal:controller.signal});controller.abort();await assert.rejects(task,{name:'AbortError'});assert.equal(item.onloadedmetadata,null);assert.equal(item.onerror,null);});
+test('malformed media cannot keep the preparation screen waiting forever',async()=>{await assert.rejects(waitForMediaMetadata({},'blob:broken',{timeoutMs:1}),/Превышено время/);});

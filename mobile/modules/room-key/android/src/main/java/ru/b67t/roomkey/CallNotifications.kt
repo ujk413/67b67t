@@ -40,7 +40,7 @@ internal object CallNotifications {
   fun channel(context: Context, incoming: Boolean): String {
     val id=if(incoming) "incoming-calls-v1" else "active-calls-v1"
     if(Build.VERSION.SDK_INT>=26) {
-      val channel=NotificationChannel(id,if(incoming) "Входящие звонки" else "Текущий звонок",if(incoming) NotificationManager.IMPORTANCE_HIGH else NotificationManager.IMPORTANCE_LOW)
+      val channel=NotificationChannel(id,if(incoming) NativeUi.text(context,"Входящие звонки","Incoming calls") else NativeUi.text(context,"Текущий звонок","Current call"),if(incoming) NotificationManager.IMPORTANCE_HIGH else NotificationManager.IMPORTANCE_LOW)
       if(incoming) { channel.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE).build());channel.enableVibration(true) }
       context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     };return id
@@ -61,21 +61,22 @@ internal object CallNotifications {
     val answerIntent=context.packageManager.getLaunchIntentForPackage(context.packageName)!!.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP).putExtra("67chat_call_id",id).putExtra("67chat_call_action","answer")
     val answer=PendingIntent.getActivity(context,id.hashCode()+1,answerIntent,flags)
     val decline=PendingIntent.getBroadcast(context,id.hashCode(),Intent(context,DeclineCallReceiver::class.java).putExtra("call_id",id).putExtra("nonce",data["decline_nonce"]),flags)
-    val caller=(data["caller"] ?: "Абонент").take(100)
-    val notification=builder(context,true).setContentText(if(data["is_video"]=="true") "Входящий видеозвонок" else "Входящий звонок").setContentIntent(open).setFullScreenIntent(open,true).setOngoing(true)
+    val caller=(data["caller"] ?: NativeUi.text(context,"Абонент","Caller")).take(100)
+    val notification=builder(context,true).setContentText(if(data["is_video"]=="true") NativeUi.text(context,"Входящий видеозвонок","Incoming video call") else NativeUi.text(context,"Входящий звонок","Incoming call")).setContentIntent(open).setFullScreenIntent(open,true).setOngoing(true)
     if(Build.VERSION.SDK_INT>=26)notification.setTimeoutAfter((expires-System.currentTimeMillis()).coerceAtLeast(1))
     if(Build.VERSION.SDK_INT>=31) notification.setStyle(Notification.CallStyle.forIncomingCall(Person.Builder().setName(caller).build(),decline,answer))
-    else notification.setContentTitle(caller).setPriority(Notification.PRIORITY_MAX).addAction(0,"Отклонить",decline).addAction(0,"Ответить",answer)
+    else notification.setContentTitle(caller).setPriority(Notification.PRIORITY_MAX).addAction(0,NativeUi.text(context,"Отклонить","Decline"),decline).addAction(0,NativeUi.text(context,"Ответить","Answer"),answer)
     try {context.getSystemService(NotificationManager::class.java).notify(INCOMING,notification.build())}catch(_:SecurityException){}
   }
 }
 
 class CallMessagingService : ExpoFirebaseMessagingService() {
   override fun onMessageReceived(message: RemoteMessage) {
+    if(!AccountTransport.allowsPush())return
     when(message.data["call_event"]) {
       "ring" -> CallNotifications.show(this,message.data)
       "cancel" -> CallNotifications.clear(this,message.data["call_id"])
-      else -> super.onMessageReceived(message)
+      else -> if (message.data["quality_message"] == "true") QuickReplyNotifications.show(this,message.data) else super.onMessageReceived(message)
     }
   }
 }
@@ -101,10 +102,10 @@ class IncomingCallActivity : Activity() {
     val data=CallNotifications.pending(this)?.let {JSONObject(it)}
     if(data==null || data.optLong("expires_at")<=System.currentTimeMillis()){finish();return}
     val layout=LinearLayout(this).apply {orientation=LinearLayout.VERTICAL;gravity=Gravity.CENTER;setPadding(36,36,36,36);setBackgroundColor(Color.rgb(23,33,43))}
-    layout.addView(TextView(this).apply {text=data.optString("caller","Абонент");textSize=30f;setTextColor(Color.WHITE);gravity=Gravity.CENTER})
-    layout.addView(TextView(this).apply {text=if(data.optString("is_video")=="true") "Видеозвонок · 67chat" else "Входящий звонок · 67chat";textSize=18f;setTextColor(Color.LTGRAY);setPadding(0,20,0,70)})
-    layout.addView(Button(this).apply {text="Ответить";setOnClickListener {CallNotifications.launch(this@IncomingCallActivity,data.getString("call_id"),"answer");finish()}})
-    layout.addView(Button(this).apply {text="Отклонить";setOnClickListener {sendBroadcast(Intent(this@IncomingCallActivity,DeclineCallReceiver::class.java).putExtra("call_id",data.getString("call_id")).putExtra("nonce",data.optString("decline_nonce")));finish()}})
+    layout.addView(TextView(this).apply {text=data.optString("caller",NativeUi.text(this@IncomingCallActivity,"Абонент","Caller"));textSize=30f;setTextColor(Color.WHITE);gravity=Gravity.CENTER})
+    layout.addView(TextView(this).apply {text=if(data.optString("is_video")=="true") NativeUi.text(this@IncomingCallActivity,"Видеозвонок · 67chat","Video call · 67chat") else NativeUi.text(this@IncomingCallActivity,"Входящий звонок · 67chat","Incoming call · 67chat");textSize=18f;setTextColor(Color.LTGRAY);setPadding(0,20,0,70)})
+    layout.addView(Button(this).apply {text=NativeUi.text(this@IncomingCallActivity,"Ответить","Answer");setOnClickListener {CallNotifications.launch(this@IncomingCallActivity,data.getString("call_id"),"answer");finish()}})
+    layout.addView(Button(this).apply {text=NativeUi.text(this@IncomingCallActivity,"Отклонить","Decline");setOnClickListener {sendBroadcast(Intent(this@IncomingCallActivity,DeclineCallReceiver::class.java).putExtra("call_id",data.getString("call_id")).putExtra("nonce",data.optString("decline_nonce")));finish()}})
     setContentView(layout)
     android.os.Handler(mainLooper).postDelayed({finish()},(data.optLong("expires_at")-System.currentTimeMillis()).coerceAtLeast(1))
   }
@@ -141,7 +142,7 @@ class ActiveCallService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     val open = PendingIntent.getActivity(this, 6702, packageManager.getLaunchIntentForPackage(packageName), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-    val note = CallNotifications.builder(this, false).setContentText("Звонок идёт · нажмите, чтобы вернуться").setOngoing(true).setContentIntent(open).build()
+    val note = CallNotifications.builder(this, false).setContentText(NativeUi.text(this,"Звонок идёт · нажмите, чтобы вернуться","Call in progress · tap to return")).setOngoing(true).setContentIntent(open).build()
     if (Build.VERSION.SDK_INT >= 29) startForeground(6702, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or if (intent?.getBooleanExtra("video", false) == true) ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0) else startForeground(6702, note)
     return START_NOT_STICKY
   }

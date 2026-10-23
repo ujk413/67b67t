@@ -12,6 +12,19 @@ const DB_VERSION = 1;
 const STORE = 'records';
 
 let _dbPromise = null;
+const erasedAccounts=new Set();
+function erasedRecord(id){for(const user of erasedAccounts)if(id===NS+'backup:'+user||id===NS+'restore:'+user||id.startsWith(NS+'signal:'+user+':')||id.startsWith(NS+'gk:'+user+':'))return true;return false;}
+function assertRecord(id){if(erasedRecord(id))throw Error('Аккаунт удалён с этого устройства');}
+function recordOwner(id){const match=/^sig:(?:signal:([^:]+):|gk:([^:]+):|(?:backup|restore):([^:]+)$)/.exec(id);return match?.[1]||match?.[2]||match?.[3]||null;}
+async function guardedRecord(mode,id,action){
+ assertRecord(id);const db=await openDb(),user=recordOwner(id);
+ return new Promise((resolve,reject)=>{
+  const transaction=db.transaction(STORE,mode),records=transaction.objectStore(STORE);let value,error;
+  const perform=()=>{const request=action(records);if(request)request.onsuccess=()=>{value=request.result;};};
+  if(user){const check=records.get('sig:erased:'+user);check.onsuccess=()=>{if(check.result?.value){erasedAccounts.add(user);error=Error('Аккаунт удалён с этого устройства');transaction.abort();}else perform();};}else perform();
+  transaction.oncomplete=()=>resolve(value);transaction.onerror=()=>reject(error||transaction.error);transaction.onabort=()=>reject(error||transaction.error||Error('Операция отменена'));
+ });
+}
 
 function openDb() {
   if (_dbPromise) return _dbPromise;
@@ -47,14 +60,13 @@ function reqToPromise(req) {
 // --- Generic key/value (record id = string) ---
 
 export async function idbGet(id) {
-  const db = await openDb();
-  const row = await reqToPromise(tx(db, 'readonly').get(id));
+  const row=await guardedRecord('readonly',id,store=>store.get(id));
+  assertRecord(id);
   return row ? row.value : undefined;
 }
 
 export async function idbSet(id, value) {
-  const db = await openDb();
-  await reqToPromise(tx(db, 'readwrite').put({ id, value }));
+  await guardedRecord('readwrite',id,store=>store.put({id,value}));
 }
 
 export async function idbRemove(id) {
@@ -121,6 +133,15 @@ export const SigStore = {
   put: recordPut,
   remove: recordRemove,
   keys: recordKeys,
+  async eraseAccount(userId){
+    if(!userId)throw Error('Не указан аккаунт');erasedAccounts.add(String(userId));
+    const db=await openDb();await new Promise((resolve,reject)=>{
+      const transaction=db.transaction(STORE,'readwrite'),records=transaction.objectStore(STORE);
+      records.put({id:NS+'erased:'+userId,value:true});
+      for(const prefix of [NS+'signal:'+userId+':',NS+'gk:'+userId+':'])records.delete(IDBKeyRange.bound(prefix,prefix+'\uffff'));
+      records.delete(NS+'backup:'+userId);records.delete(NS+'restore:'+userId);transaction.oncomplete=resolve;transaction.onerror=()=>reject(transaction.error);transaction.onabort=()=>reject(transaction.error||Error('Не удалось удалить ключи'));
+    });
+  },
   forAccount(userId) {
     const prefix = `signal:${userId}:`;
     return {

@@ -5,6 +5,8 @@ const native=requireOptionalNativeModule<{
   startCallServiceAsync(video:boolean):Promise<void>;
   stopCallServiceAsync():Promise<void>;
   speakerAsync(speaker:boolean):Promise<void>;
+  audioOutputsAsync():Promise<{id:number;label:string}[]>;
+  routeAudioAsync(id:number):Promise<void>;
   addListener(name:string,callback:()=>void):{remove():void};
 }>('RoomKey');
 export const nativeCalls={
@@ -13,5 +15,7 @@ export const nativeCalls={
   start:(video:boolean)=>native?.startCallServiceAsync(video),
   stop:()=>native?.stopCallServiceAsync(),
   speaker:(speaker:boolean)=>native?.speakerAsync(speaker),
+  outputs:()=>native?.audioOutputsAsync(),
+  route:(id:number)=>native?.routeAudioAsync(id),
   listen:(callback:()=>void)=>native?.addListener('callAction',callback),
 };

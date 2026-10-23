@@ -18,6 +18,14 @@ import Constants from "expo-constants";
 import * as Application from "expo-application";
 import * as IntentLauncher from "expo-intent-launcher";
 import * as Files from "expo-file-system/legacy";
+import { requireOptionalNativeModule } from "expo";
+
+const updater = requireOptionalNativeModule<{
+  downloadApkAsync(url:string,identity:string,size:number,hash:string,id:string):Promise<string>;
+  cancelApkDownload(id:string):void;
+  apkSha256Async(uri:string):Promise<string>;
+  addListener(event:string,callback:(event:{id:string;bytes:number;total:number})=>void):{remove():void};
+}>("RoomKey");
 
 export type AppRelease = {
   version: string;
@@ -33,6 +41,7 @@ export type AppRelease = {
 
 export type UpdateCheck =
   | { status: "unsupported" }
+  | { status: "unavailable"; current: number }
   | { status: "up-to-date"; current: number }
   | { status: "available"; release: AppRelease; current: number; url: string };
 
@@ -57,8 +66,7 @@ export function currentVersionName(): string {
 
 /**
  * Ask the server which build is current. Never throws: any network or parse
- * failure is reported as "up-to-date" so a flaky connection cannot nag the user
- * with an update prompt.
+ * failure is distinct from a successful check, so it can be retried after reconnect.
  */
 export async function checkForUpdate(baseUrl: string): Promise<UpdateCheck> {
   if (Platform.OS !== "android") return { status: "unsupported" };
@@ -74,14 +82,15 @@ export async function checkForUpdate(baseUrl: string): Promise<UpdateCheck> {
     });
     // 204 = nothing published yet.
     if (res.status === 204) return { status: "up-to-date", current };
-    if (!res.ok) return { status: "up-to-date", current };
+    if (!res.ok) return { status: "unavailable", current };
     const release = (await res.json()) as Partial<AppRelease>;
     const versionCode = Number(release.versionCode);
-    if (!Number.isInteger(versionCode) || versionCode <= current) {
+    if (!Number.isInteger(versionCode) || versionCode <= 0) return { status: "unavailable", current };
+    if (versionCode <= current) {
       return { status: "up-to-date", current };
     }
-    if (!release.path || typeof release.path !== "string") {
-      return { status: "up-to-date", current };
+    if (typeof release.path !== "string" || !/^\/(?!\/)[^\s?#]*$/.test(release.path)) {
+      return { status: "unavailable", current };
     }
     return {
       status: "available",
@@ -100,7 +109,7 @@ export async function checkForUpdate(baseUrl: string): Promise<UpdateCheck> {
       },
     };
   } catch {
-    return { status: "up-to-date", current };
+    return { status: "unavailable", current };
   } finally {
     clearTimeout(timer);
   }
@@ -113,24 +122,35 @@ export async function checkForUpdate(baseUrl: string): Promise<UpdateCheck> {
 export async function downloadRelease(
   url: string,
   onProgress?: (fraction: number) => void,
+  signal?: AbortSignal,
+  release?: AppRelease,
 ): Promise<string> {
-  const target = `${Files.cacheDirectory}${APK_FILE}`;
-  // A previous attempt may have left a partial file behind.
-  await Files.deleteAsync(target, { idempotent: true });
+  if(!updater?.downloadApkAsync)throw Error('native_update_unavailable');
+  if(!release || !/^[a-f0-9]{64}$/i.test(release.sha256) || !(release.size>0))throw Error('invalid_release');
+  const id=`${Date.now()}-${Math.random()}`;
+  const subscription=updater.addListener('apkProgress',event=>{
+    if(event.id===id && !signal?.aborted)onProgress?.(event.total>0?event.bytes/event.total:-1);
+  });
+  const cancel=()=>updater.cancelApkDownload(id);
+  signal?.addEventListener('abort',cancel,{once:true});
+  try {
+    if(signal?.aborted)throw Error('download_cancelled');
+    const result = await updater.downloadApkAsync(url,String(release.versionCode),release.size,release.sha256,id);
+    if(signal?.aborted)throw Error('download_cancelled');
+    return result;
+  } catch(error) {
+    const message=error instanceof Error?error.message:String(error);
+    throw Error(message.match(/checksum_mismatch|incomplete_download|download_cancelled|invalid_release|invalid_download_range|download_http_\d+/)?.[0] || message);
+  } finally {signal?.removeEventListener('abort',cancel);subscription.remove();}
+}
 
-  const download = Files.createDownloadResumable(
-    url,
-    target,
-    {},
-    (progress) => {
-      if (!onProgress) return;
-      const total = progress.totalBytesExpectedToWrite;
-      onProgress(total > 0 ? progress.totalBytesWritten / total : -1);
-    },
-  );
-  const result = await download.downloadAsync();
-  if (!result?.uri) throw new Error("download_failed");
-  return result.uri;
+/** Re-check even a previously downloaded APK before every installer handoff. */
+export async function verifyRelease(uri:string,release:AppRelease,signal?:AbortSignal):Promise<void> {
+  if(signal?.aborted)throw Error('download_cancelled');
+  if(!/^[a-f0-9]{64}$/i.test(release.sha256) || !updater?.apkSha256Async)throw Error('invalid_release');
+  const actual=await updater.apkSha256Async(uri);
+  if(signal?.aborted)throw Error('download_cancelled');
+  if(actual.toLowerCase()!==release.sha256.toLowerCase())throw Error('checksum_mismatch');
 }
 
 /** Delete a downloaded APK (after install, or when the user dismisses). */
@@ -147,8 +167,9 @@ export async function discardDownload(uri?: string | null) {
  * Hand the APK to the system installer. Rejects with `install_permission_required`
  * when the user has not allowed this app to install unknown apps yet.
  */
-export async function installRelease(fileUri: string): Promise<void> {
+export async function installRelease(fileUri: string,signal?:AbortSignal): Promise<void> {
   const contentUri = await Files.getContentUriAsync(fileUri);
+  if(signal?.aborted)throw Error('install_cancelled');
   await IntentLauncher.startActivityAsync("android.intent.action.VIEW", {
     data: contentUri,
     type: ANDROID_PACKAGE_MIME,
@@ -166,6 +187,6 @@ export async function downloadedSize(fileUri: string): Promise<number> {
 export async function openInstallPermissionSettings(): Promise<void> {
   await IntentLauncher.startActivityAsync(
     "android.settings.MANAGE_UNKNOWN_APP_SOURCES",
-    { data: `package:${Constants.expoConfig?.android?.package || ""}` },
+    { data: `package:${Application.applicationId || Constants.expoConfig?.android?.package || ""}` },
   );
 }

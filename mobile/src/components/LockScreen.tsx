@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import { useTheme } from "../ThemeProvider";
 import { Icon } from "./Icon";
@@ -20,9 +21,9 @@ export function LockScreen({
       <View style={[styles.badge, { backgroundColor: colors.text.blue }]}>
         <Text style={styles.badgeText}>67</Text>
       </View>
-      <Text style={[styles.title, { color: colors.text.primary }]}>Приложение заблокировано</Text>
+      <Text style={[styles.title, { color: colors.text.primary }]}>{uiText("Приложение заблокировано")}</Text>
       <Text style={[styles.subtitle, { color: colors.text.secondary }]}>
-        {error || "Подтвердите, что это вы"}
+        {error || uiText("Подтвердите, что это вы")}
       </Text>
       <Pressable
         onPress={onUnlock}

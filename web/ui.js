@@ -1,3 +1,4 @@
+import {t as uiText,locale,getLanguage} from "./i18n.js";
 // Presentation helpers shared by the web messenger and its UI checks.
 export const html = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 const icons = new Set(['attach','back','chats','close','compose','down','mic','more','phone','search','send','settings','video','check','checks']);
@@ -19,16 +20,17 @@ export function groupWith(previous, message) {
     a.toDateString() === b.toDateString() && b - a >= 0 && b - a < 300000;
 }
 export function presenceLabel(peer) {
-  if (!peer) return 'Обновление статуса…';
-  if (peer.online) return 'онлайн';
+  if (!peer) return uiText("Обновление статуса…");
+  if (peer.online) return uiText("онлайн");
   const seen = new Date(peer.last_seen);
-  if (!peer.last_seen || Number.isNaN(seen.getTime())) return 'не в сети';
+  if (!peer.last_seen || Number.isNaN(seen.getTime())) return uiText("не в сети");
   const today = seen.toDateString() === new Date().toDateString();
-  const time = seen.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-  return `был(а) ${today ? 'сегодня' : seen.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' })} в ${time}`;
+  const time = seen.toLocaleTimeString(locale(), { hour: '2-digit', minute: '2-digit' });
+  return uiText('был(а) {0} в {1}',today?uiText('сегодня'):seen.toLocaleDateString(locale(), { day: 'numeric', month: 'short' }),time);
 }
 // Russian plural form: plural(5,'участник','участника','участников') -> 'участников'.
 export function plural(count, one, few, many) {
+  if(getLanguage()==='en')return Math.abs(Number(count)||0)===1?uiText(one):uiText(many);
   const n = Math.abs(Number(count) || 0) % 100, last = n % 10;
   if (n > 10 && n < 20) return many;
   if (last > 1 && last < 5) return few;
@@ -43,13 +45,13 @@ export function listTime(value, now = new Date()) {
   if (Number.isNaN(date.getTime())) return '';
   const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
   const days = Math.round((startOfDay(now) - startOfDay(date)) / 86400000);
-  if (days <= 0) return date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-  if (days === 1) return 'Вчера';
-  if (days < 7) return date.toLocaleDateString('ru-RU', { weekday: 'short' });
-  return date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: '2-digit' });
+  if (days <= 0) return date.toLocaleTimeString(locale(), { hour: '2-digit', minute: '2-digit' });
+  if (days === 1) return uiText("Вчера");
+  if (days < 7) return date.toLocaleDateString(locale(), { weekday: 'short' });
+  return date.toLocaleDateString(locale(), { day: '2-digit', month: '2-digit', year: '2-digit' });
 }
 
 export function reactionPeople(users, participants) {
   const byId = new Map(participants.filter(Boolean).map(person => [String(person.id || person.user_id), person]));
-  return [...new Set((Array.isArray(users) ? users : []).map(user => String(user?.id || user)))].map(id => byId.get(id) || { id, username: 'Участник' });
+  return [...new Set((Array.isArray(users) ? users : []).map(user => String(user?.id || user)))].map(id => byId.get(id) || { id, username: uiText("Участник") });
 }

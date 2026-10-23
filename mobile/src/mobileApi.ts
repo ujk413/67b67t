@@ -18,7 +18,8 @@ export function mobileApi(base: string, token: string) {
   const call = <T>(path: string, method = "GET", body?: unknown) =>
     request<T>(base, path, { method, body, token });
   return {
-    folders: () => call<{ id: string; title: string; room_ids: string[] }[]>("/me/folders"),
+    folders: () => call<{ id: string; title: string; room_ids: string[];revision:number;unread_count:number }[]>("/me/folders"),
+    reorderFolders:(items:{id:string;revision:number}[])=>call('/me/folders/order','PUT',{items}),
     saveFolder: (title: string, room_ids: string[], id?: string) => call(`/me/folders${id ? '/' + id : ''}`, id ? "PUT" : "POST", { title, room_ids }),
     removeFolder: (id: string) => call(`/me/folders/${id}`, "DELETE"),
     saved: () => call<{ id: string }>("/me/saved", "POST", {}),
@@ -80,10 +81,13 @@ export function mobileApi(base: string, token: string) {
         "POST",
         {},
       ),
-    registerPush: (id: string, pushToken: string, roomId: string | null) =>
+    pushInstallation:(id:string,secret:string)=>call<{epoch:number;paused:boolean}>('/me/account/push-installation','POST',{installation_id:id,secret}),
+    registerPush: (id: string, pushToken: string, roomId: string | null,policy?:{installation_secret:string;installation_epoch:number;resume_push:boolean}) =>
       call(`/me/push-devices/${id}`, "PUT", {
         token: pushToken,
         active_room_id: roomId,
+        quick_reply: true,
+        ...policy,
       }),
     unregisterPush: (id: string) => call(`/me/push-devices/${id}`, "DELETE"),
     pushStatus: () => call<{ available: boolean; registered: boolean }>("/me/push-status"),

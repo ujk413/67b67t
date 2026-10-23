@@ -61,7 +61,7 @@ input:focus-visible,textarea:focus-visible { outline:2px solid var(--accent); ou
 .chatTitle small.online { color:var(--accent); }
 .chat-actions { display:flex; align-items:center; gap:0; flex-shrink:0; }
 .chat-actions .icon-button { width:38px; }
-.messages { background:var(--wallpaper); gap:3px; padding:14px max(20px,calc((100% - 760px)/2)); overscroll-behavior:contain; }
+.messages { background:var(--wallpaper); background-image:var(--quality-wallpaper-image,none); background-size:var(--quality-wallpaper-size,auto); gap:3px; padding:14px max(20px,calc((100% - 760px)/2)); overscroll-behavior:contain; }
 .bubble,.bubble.dm,.bubble.dm:not(.me) { align-self:flex-start; max-width:min(560px,85%); padding:7px 11px 6px; border:0; border-radius:22px; background:var(--bubble); color:var(--text); position:relative; box-shadow:0 1px 1px #00000006; margin-bottom:4px; }
 .bubble.me,.bubble.dm.me { align-self:flex-end; background:var(--bubble2); }
 .bubble.group-after { margin-bottom:0; border-bottom-left-radius:8px; }
@@ -257,3 +257,13 @@ dialog::backdrop{background:#0009}.media-dialog h2{margin:0 0 8px}.media-destina
   .modal,.modal-content{width:100%;max-width:100%;max-height:92dvh;border-radius:20px 20px 0 0;border-bottom:0;padding-bottom:env(safe-area-inset-bottom)}
   .modal-footer{padding-bottom:calc(14px + env(safe-area-inset-bottom))}
 }
+.voice-note{display:grid;grid-template-columns:44px minmax(100px,1fr) 44px;align-items:center;gap:6px;min-width:210px;max-width:300px}
+.voice-note button{min-height:44px;border:0;background:transparent;color:var(--accent);cursor:pointer}
+.voice-wave{display:flex;align-items:center;gap:2px;padding:8px 0}
+.voice-wave i{flex:1;min-width:2px;border-radius:2px;background:var(--muted);opacity:.5}
+.voice-wave i.played{background:var(--accent);opacity:1}
+.voice-note audio{display:none}.voice-status{grid-column:2/4;color:var(--muted);min-height:14px;font-size:11px}
+.message-album{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px;max-width:420px;overflow:hidden;border-radius:16px}
+.album-tile{min-width:0;min-height:100px;overflow:hidden}.album-tile .media-image{width:100%;height:160px;object-fit:cover;border-radius:0}.album-tile .encrypted-media{min-height:120px;width:100%}
+
+.pinned-bar-all{border:0;border-radius:10px;background:var(--panel);color:var(--accent);font:inherit;font-size:13px;padding:7px 10px;cursor:pointer}.pinned-bar-all:focus-visible{outline:2px solid var(--accent);outline-offset:2px}

@@ -1,7 +1,9 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { VoicePlayer } from "./VoicePlayer";
 import { VideoNote } from "./VideoNote";
 import { useTheme } from "../ThemeProvider";
 import { Alert, Image, Pressable, StyleSheet, Text, View } from "react-native";
+import {useContext} from 'react';
 import { Video, ResizeMode } from "./Video";
 import { telegramColors, telegramMetrics, nameColorFor } from "../theme";
 import { Avatar } from "./Avatar";
@@ -10,8 +12,12 @@ import { reactionPeople } from "../presentation";
 import { Icon } from "./Icon";
 import { messageStatus } from "../data/messages";
 import { RichText } from "./RichText";
-import { useMediaHeaders, useProtectedMedia } from "../MediaSession";
+import { useMediaHeaders, useProtectedMedia,MediaDecoder } from "../MediaSession";
 import type { Message, User } from "../types";
+import {FeatureProvider} from '../features/FeatureProvider';
+import {ExpressiveMessage,ProtectedExpressiveMedia} from '../features/ExpressiveFeatures';
+import {parseMessagePayload} from '../features/messagePayloads';
+import {useMediaAutoDownload} from '../features/qualityPolicy';
 
 const MAX_MEDIA_SIDE = 280;
 const MIN_MEDIA_SIDE = 96;
@@ -79,13 +85,14 @@ export function MessageBubble({
   mediaThumbUrl,
 }: MessageBubbleProps) {
   const styles = useStyles();
+  const feature=useContext(FeatureProvider);
   const { colors: telegramColors } = useTheme();
 
   const isOwn = message.sender_id === meId;
   const url = mediaUrl(baseUrl, message.media_id);
   const thumb = mediaThumbUrl(baseUrl, message.media_id) || url;
   const senderName =
-    message.sender_display_name || message.sender_username || "Пользователь";
+    message.sender_display_name || message.sender_username || uiText("Пользователь");
   const nameColorStyle = { color: nameColorFor(message.sender_id) };
   const time = shortTime(message.created_at);
   const read = !!message.read_by?.some((id) => id !== message.sender_id);
@@ -166,7 +173,7 @@ export function MessageBubble({
               <Text style={styles.replyName} numberOfLines={1}>
                 {message.reply_to.sender_display_name ||
                   message.reply_to.sender_username ||
-                  "Пользователь"}
+                  uiText("Пользователь")}
               </Text>
               <Text style={styles.replyText} numberOfLines={2}>
                 {message.reply_to.text}
@@ -181,7 +188,7 @@ export function MessageBubble({
             paddingBottom: message.type === "text" ? 0 : 18,
           }}
         >
-          <MessageContent
+          {feature && parseMessagePayload(message.text) ? <ExpressiveMessage message={message} events={feature.events} context={feature.context}/> : <MessageContent
             message={message}
             url={url}
             thumb={thumb}
@@ -192,7 +199,7 @@ export function MessageBubble({
             onUsername={onUsername}
             onLongPress={onLongPress}
             reserveMeta={reserve}
-          />
+          />}
           {message.type !== "text" && !!message.text && <RichText text={message.text} onUsername={onUsername} onLongPress={onLongPress} reserveMeta={reserve} />}
           <View
             style={styles.metaRow}
@@ -200,7 +207,7 @@ export function MessageBubble({
             accessibilityLabel={`${time}, ${isOwn ? messageStatus(message) : ""}`}
           >
             <Text style={[styles.time, isOwn ? styles.timeOwn : styles.timeIn]}>
-              {message.edited_at ? "изменено · " : ""}
+              {message.edited_at ? (""+uiText("изменено ·")+" ") : ""}
               {time}
               {status ? ` · ${status}` : ""}
             </Text>
@@ -257,8 +264,11 @@ function MessageContent({
   onUsername?: (username: string) => void;
 }) {
   const headers = useMediaHeaders();
-  const { autoDownload } = useTheme();
-  const protectedUri = useProtectedMedia(message, message.type==='voice' || autoDownload);
+  const session=useContext(MediaDecoder);
+  const contentMime=String((message.meta?.media_encryption as {mime?:string}|undefined)?.mime||message.media_mime||'');
+  const mediaType=message.type==='voice'?'voice':contentMime.startsWith('image/')?'image':message.type==='video_note'||contentMime.startsWith('video/')?'video':'file';
+  const autoDownload=useMediaAutoDownload(mediaType,session?.userId);
+  const protectedUri = useProtectedMedia(message, autoDownload);
   const styles = useStyles();
   const { colors: telegramColors } = useTheme();
 
@@ -269,11 +279,18 @@ function MessageContent({
   if (message.meta?.media_encryption) {
     if(protectedUri) {
       const info=message.meta.media_encryption as {mime:string;name:string};
+      if(message._mediaDetails?.expressive)return <Pressable accessibilityRole="button" onPress={()=>onOpenMedia?.(message)} onLongPress={onLongPress}><ProtectedExpressiveMedia uri={protectedUri} mime={info.mime} label={message._mediaDetails.expressive.label}/></Pressable>;
       return <MessageContent message={{...message,media_mime:info.mime,meta:{...message.meta,media_encryption:undefined,filename:info.name}}} url={protectedUri} thumb={protectedUri} isOwn={isOwn} onOpenMedia={()=>onOpenMedia?.(message)} onLongPress={onLongPress} />;
     }
-    return <Pressable onPress={() => onOpenMedia?.(message)} onLongPress={onLongPress} style={{ padding: 14, minHeight: 48 }}><Text style={{ color: textColor }}>{String((message.meta.media_encryption as { name?: string }).name || "Вложение")} · Открыть</Text></Pressable>;
+    const file=message.meta.media_encryption as {name?:string;mime?:string};
+    return <Pressable accessibilityRole="button" accessibilityLabel={(""+uiText("Скачать и открыть")+" ")+(file.name||uiText("вложение"))} onPress={() => onOpenMedia?.(message)} onLongPress={onLongPress} style={{ padding: 14, minHeight: 48 }}><Text style={{ color: textColor }}>{file.name||uiText("Вложение")}</Text><Text style={{color:textColor,opacity:.7,fontSize:12,marginTop:5}}>{file.mime||uiText("Файл")}{message.media_size?uiText(" · {0} МБ",(message.media_size/1048576).toFixed(1)):''} {uiText("· Скачать и открыть")}</Text></Pressable>;
   }
 
+  if(message.type==='call'){
+    const status=String(message.meta?.status||'completed'),labels:Record<string,string>={completed:uiText("Звонок завершён"),missed:uiText("Пропущенный звонок"),rejected:uiText("Звонок отклонён"),busy:uiText("Абонент занят"),cancelled:uiText("Вызов отменён"),interrupted:uiText("Звонок прерван")};
+    const duration=Math.floor(Number(message.meta?.duration_ms||0)/1000);
+    return <View style={{padding:8,gap:5}}><Text style={{color:textColor}}>{message.meta?.is_video?uiText("Видеозвонок"):uiText("Аудиозвонок")}</Text><Text style={{color:textColor,fontSize:13}}>{labels[status]||uiText("Звонок")}{duration>0?` · ${Math.floor(duration/60)}:${String(duration%60).padStart(2,'0')}`:''}</Text></View>;
+  }
   if (message.type === "text") {
     return (
       <RichText
@@ -285,7 +302,7 @@ function MessageContent({
     );
   }
 
-  if (message.type === "voice" && url) return <VoicePlayer uri={url} initialDuration={Number(message.meta?.duration_ms) || (message.duration_sec || 0)*1000} />;
+  if (message.type === "voice" && url) return <View><VoicePlayer uri={url} initialDuration={message._mediaDetails?.duration_ms || Number(message.meta?.duration_ms) || (message.duration_sec || 0)*1000} waveform={message._mediaDetails?.waveform} onListened={()=>session?.onListened?.(message)} />{!!message.listened_by?.some(id=>id!==message.sender_id) && <Text style={{fontSize:11,color:textColor}}>{uiText("Прослушано")}</Text>}</View>;
 
   if (
     (message.type === "video_note" ||
@@ -300,7 +317,7 @@ function MessageContent({
         onLongPress={onLongPress}
         style={{ padding: 16, minHeight: 48 }}
       >
-        <Text style={{ color: textColor }}>Видео · Нажмите для просмотра</Text>
+        <Text style={{ color: textColor }}>{uiText("Видео · Нажмите для просмотра")}</Text>
       </Pressable>
     );
 
@@ -356,9 +373,9 @@ function MessageContent({
         style={styles.fileCard}
       >
         <Text style={[styles.fileTitle, { color: textColor }]}>
-          {String(message.meta?.filename || "Файл")}
+          {String(message.meta?.filename || uiText("Файл"))}
         </Text>
-        <Text style={styles.fileMime}>{mime || "Вложение"}</Text>
+        <Text style={styles.fileMime}>{mime || uiText("Вложение")}</Text>
       </Pressable>
     );
   }
@@ -395,15 +412,15 @@ function ReactionBar({
         const users = reactionPeople(ids, people);
         const names = users.map((user) =>
           user.id === meId
-            ? "Вы"
-            : user.display_name || user.username || "Участник",
+            ? uiText("Вы")
+            : user.display_name || user.username || uiText("Участник"),
         );
         return (
           <Pressable
             key={emoji}
             onPress={onReact}
             onLongPress={() =>
-              Alert.alert(`Реакция ${emoji}`, names.join("\n"))
+              Alert.alert(uiText("Реакция {0}",emoji), names.join("\n"))
             }
             accessibilityRole="button"
             accessibilityLabel={`${emoji}: ${names.join(", ")}`}

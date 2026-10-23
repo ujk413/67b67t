@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 import { createRequire } from "node:module";
+import { t as uiText, locale as uiLocale } from "../web/i18n.js";
+import {eraseSecretVault} from '../web/secret-vault.js';
 
 const require = createRequire(import.meta.url);
 const ts = require("../mobile/node_modules/typescript");
@@ -33,7 +35,7 @@ function evaluate(expression, scope) {
       },
     },
   ).outputText;
-  return vm.runInNewContext(code, scope);
+  return vm.runInNewContext(code, Object.assign(scope, { uiText, uiLocale }));
 }
 
 function effectContaining(marker, scope) {
@@ -55,6 +57,13 @@ function appFunction(name, scope) {
   assert.ok(fn, `Missing production function: ${name}`);
   return evaluate(fn.getText(appSource), scope);
 }
+
+test('a rooms refresh finishing after switching accounts cannot replace the current user or rooms',async()=>{
+ let finish;const pending=new Promise(resolve=>{finish=resolve;}),tokenRef={current:'original'},writes=[];
+ const refresh=appFunction('refreshRooms',{token:'original',tokenRef,baseUrl:'https://67chat.ru',api:{rooms:()=>pending,me:async()=>({id:'original'})},prepareRooms:async rows=>rows,setRefreshingRooms:value=>writes.push(['busy',value]),setError:()=>{},setRooms:value=>writes.push(['rooms',value]),setMe:value=>writes.push(['me',value]),errorText:String});
+ const running=refresh();tokenRef.current='new-account';finish([{id:'private-original-room'}]);await running;
+ assert.deepEqual(writes,[['busy',true]]);
+});
 
 function loadModule(relativePath, scope = {}, dependencies = {}) {
   const source = fs.readFileSync(
@@ -396,6 +405,7 @@ test("failed migration keeps the legacy token so it can be retried without data 
 function startupHarness(restoreSessionToken, bootstrap = async () => {}) {
   const state = { loading: true },
     tokenRef = { current: null };
+  const sessionGenerationRef = { current: 0 };
   const environment = {
     storage: { get: async () => null },
     restoreSessionToken,
@@ -409,7 +419,9 @@ function startupHarness(restoreSessionToken, bootstrap = async () => {}) {
       state.baseUrl = value;
     },
     setToken(value) {
-      state.token = value;
+      appFunction('activateNativeSession',{
+        tokenRef,sessionGenerationRef,setSessionGeneration:generation=>{state.generation=generation;},setToken:token=>{state.token=token;},
+      })(value);
     },
     setLoading(value) {
       state.loading = value;
@@ -440,6 +452,7 @@ test("restored token is available to the 401 handler before bootstrap can fail",
   );
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(state.token, "restored");
+  assert.equal(state.generation, 1);
   assert.equal(state.loading, false);
 });
 
@@ -477,13 +490,19 @@ test("logout immediately detaches signaling, cancels typing and deletes both ses
   const roomSecretCache = { current: new Map([["room-a", "secret"]]) };
   const clearedState = {};
   const scope = {
-    endCall() { clearedState.callEnded = true; },
+    endCall() { assert.equal(scope.sessionGenerationRef.current,2);assert.equal(tokenRef.current,null);clearedState.callEnded = true; },
     ...h.scope,
     tokenRef,
     typingTimersRef,
+    sessionGenerationRef: { current: 1 },
     roomSecretCache,
-    clearDerivedRoomKeys() {},
-    local: { outbox: { current: { stop() {} } } },
+    signalSession:{current:{engine:{}}},
+    pendingNativeCall:{current:{call_id:'old',recipient_id:'current-account',action:'answer'}},callAccountPrompt:{current:'old'},
+    stopExpressiveLiveLocations(){clearedState.locationStopped=true;},
+    me:{id:"current-account"},cancelDecryptedMedia:async id=>{assert.equal(id,"current-account");clearedState.mediaCancelled=true;},
+    accountRegistry:{active:async()=> 'current-account',remove:async id=>{assert.equal(id,'current-account');assert.equal(h.scope.wsRef.current,null);clearedState.registryRemoved=true;}},
+    clearDerivedRoomKeys() {},eraseSecretVault,removeIncomingAccountShares:()=>{},
+    local: { outbox: { current: { stop() {clearedState.queueStopped=true;} } },repository:{current:{set:async(key,value)=>{assert.equal(key,'secret-vault:v1');assert.equal(value,null);clearedState.secretErased=true;},close:async()=>{assert.equal(clearedState.secretErased,true);clearedState.repositoryClosed=true;}}} },
     pushNotifications: { disconnect: async () => {} },
     storage: { del: async () => {} },
     removeSessionTokens: storage.removeSessionTokens,
@@ -496,14 +515,17 @@ test("logout immediately detaches signaling, cancels typing and deletes both ses
     "ActiveRoomId",
     "ActiveRoomMembers",
     "TypingUsers",
+    "Composer","Workspace","Forwarding","Editing","AuthChallenge","ViewerMessage","AutoAnswerId",
   ]) {
     scope[`set${name}`] = (value) => {
       clearedState[name] = value;
     };
   }
   await appFunction("clearSession", scope)();
-  assert.equal(clearedState.callEnded, true);
+  assert.equal(clearedState.callEnded, true);assert.equal(clearedState.ViewerMessage,null);assert.equal(clearedState.mediaCancelled,true);
+  assert.equal(clearedState.locationStopped,true);assert.equal(clearedState.queueStopped,true);assert.equal(clearedState.repositoryClosed,true);assert.equal(clearedState.registryRemoved,true);
   assert.equal(tokenRef.current, null);
+  assert.equal(scope.pendingNativeCall.current,null);assert.equal(scope.callAccountPrompt.current,null);assert.equal(clearedState.AutoAnswerId,null);
   assert.equal(h.scope.wsRef.current, null);
   assert.equal(h.timers.size, 0);
   assert.equal(roomSecretCache.current.size, 0);
