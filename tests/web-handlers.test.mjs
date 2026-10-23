@@ -29,6 +29,23 @@ const browserFiles = [
   "auth-flow.js",
 ];
 
+test('pin and unpin use the actual API client and preserve their captured room',async()=>{
+  const source=read('app.js');const window={};const calls=[];
+  const state={activeRoomId:'original-room'};
+  const block=source.slice(source.indexOf('window.pinMessage ='),source.indexOf('window.scrollToMessage ='));
+  new Function('window','state','api','toast','loadRooms','mountPreservingInput','mount',block)(window,state,async(...args)=>calls.push(args),()=>{},async()=>{},async()=>{},async()=>{});
+  await window.pinMessage('message');await window.unpinMessage();
+  assert.deepEqual(calls.map(c=>c[0]),['/rooms/original-room/pin','/rooms/original-room/pin']);
+});
+
+test('room fanout excludes the sockets of users who hid an edited message',()=>{
+ const source=fs.readFileSync(new URL('../api/server.js',import.meta.url),'utf8');
+ const body=source.slice(source.indexOf('function broadcastToRoom('),source.indexOf('function sendToUser('));
+ const deliveries=[],alice={send:()=>deliveries.push('alice')},bob={send:()=>deliveries.push('bob')};
+ const send=new Function('socketsByRoom','socketsByUser',body+';return broadcastToRoom;')(new Map([['room',new Set([alice,bob])]]),new Map([['alice',new Set([alice])],['bob',new Set([bob])]]));
+ send('room',{type:'message.update'},new Set(['alice']));assert.deepEqual(deliveries,['bob']);
+});
+
 function read(file) {
   return fs.readFileSync(path.join(webDir, file), "utf8");
 }
@@ -105,4 +122,13 @@ test("the dead legacy renderers are gone", () => {
   // The live path must still be intact.
   assert.match(app, /function buildRenderedMessagesHtml\s*\(/);
   assert.match(app, /function renderMessageBody\s*\(/);
+});
+
+// Exercise the real initialization callback: without a nonzero interval Expo
+// never emits timeUpdate, even though a listener has been registered.
+test('native video notes enable progress events',()=>{
+  const source=fs.readFileSync(new URL('../mobile/src/components/VideoNote.tsx',import.meta.url),'utf8');
+  const body=source.match(/useVideoPlayer\([\s\S]*?\(instance\) => \{([\s\S]*?)\n  \}\)/)[1];
+  const player={timeUpdateEventInterval:0};new Function('instance',body)(player);
+  assert.ok(player.timeUpdateEventInterval>0);
 });

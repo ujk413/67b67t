@@ -35,6 +35,7 @@ export function VideoNote({
   const { colors } = useTheme();
   const headers = useMediaHeaders();
   const player = useVideoPlayer({ uri, headers }, (instance) => {
+    instance.timeUpdateEventInterval = 0.1;
     // Start muted: a tap should not blast audio unexpectedly, and the mute
     // button is the explicit opt-in, as in Telegram.
     instance.muted = true;
@@ -81,6 +82,7 @@ export function VideoNote({
           style={styles.video}
           nativeControls={false}
           contentFit="cover"
+          surfaceType="textureView"
         />
 
         <Svg width={SIZE} height={SIZE} style={StyleSheet.absoluteFill} pointerEvents="none">

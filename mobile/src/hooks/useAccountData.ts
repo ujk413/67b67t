@@ -29,9 +29,12 @@ type Params = {
 };
 export function useAccountData(params: Params) {
   const latest = useRef(params);
-  latest.current = params;
   const repository = useRef<AccountRepository | null>(null),
     outbox = useRef<Outbox | null>(null);
+  latest.current = {...params,onMessages: update=>params.onMessages(previous=>{
+    const messages=typeof update==='function'?update(previous):update;
+    return messages.filter(message=>!repository.current?.isHidden(message.id));
+  })};
   const generation = useRef(0),
     syncing = useRef(false);
   const [ready, setReady] = useState(false),
@@ -193,13 +196,14 @@ export function useAccountData(params: Params) {
             const message = await latest.current.decode(change.message);
             if (repository.current !== repo) return;
             await repo.saveMessages([message]);
+            if(!(await repo.visibleMessages([message])).length)continue;
             if (repository.current !== repo) return;
             if (latest.current.activeRoomId === message.room_id)
               latest.current.onMessages((prev) =>
                 prev.some(m => m.id === message.id) || !prev.length || message.created_at >= (prev.filter(m => !m.delivery).at(-1)?.created_at || "") ? mergeMessages(prev, [message]) : prev,
               );
           } else {
-            await repo.removeMessage(change.message_id);
+            await repo.hideMessage(change.message_id);
             if (latest.current.activeRoomId === change.room_id)
               latest.current.onMessages((prev) =>
                 prev.filter((m) => m.id !== change.message_id),
@@ -246,11 +250,12 @@ export function useAccountData(params: Params) {
             around: anchor,
           });
         } catch {}
-      const decoded = await Promise.all(
+      let decoded = await Promise.all(
         page.messages.map((m) => latest.current.decode(m)),
       );
       if (mine !== generation.current) return;
       await repo?.saveMessages(decoded);
+      if(repo)decoded=await repo.visibleMessages(decoded);
       const outgoing = ((await repo?.outgoing()) || [])
         .filter((x) => x.roomId === room.id)
         .map((x) => pendingMessage(x, p.me!.id));
@@ -282,9 +287,10 @@ export function useAccountData(params: Params) {
     const mine = generation.current;
     try {
       const page = await mobileApi(p.baseUrl, p.token).history(id, { before });
-      const decoded = await Promise.all(page.messages.map(p.decode));
+      let decoded = await Promise.all(page.messages.map(p.decode));
       if (mine !== generation.current) return;
       await repo?.saveMessages(decoded);
+      if(repo)decoded=await repo.visibleMessages(decoded);
       p.onMessages((prev) => mergeMessages(decoded, prev));
       setHistory((prev) =>
         prev ? { ...prev, has_older: page.has_older } : page,
@@ -340,9 +346,10 @@ export function useAccountData(params: Params) {
     const page = await mobileApi(p.baseUrl, p.token).history(roomId, {
       around: id,
     });
-    const decoded = await Promise.all(page.messages.map(p.decode));
+    let decoded = await Promise.all(page.messages.map(p.decode));
     if (latest.current.activeRoomId !== roomId) return;
     await repository.current?.saveMessages(decoded);
+    if(repository.current)decoded=await repository.current.visibleMessages(decoded);
     setHistory({ ...page, messages: decoded });
     p.onMessages(decoded);
     return id;
@@ -353,9 +360,10 @@ export function useAccountData(params: Params) {
     if (!id || !p.token) return;
     const mine = generation.current;
     const page = await mobileApi(p.baseUrl, p.token).history(id, { after });
-    const decoded = await Promise.all(page.messages.map(p.decode));
+    let decoded = await Promise.all(page.messages.map(p.decode));
     if (mine !== generation.current) return;
     await repository.current?.saveMessages(decoded);
+    if(repository.current)decoded=await repository.current.visibleMessages(decoded);
     p.onMessages((prev) => mergeMessages(prev, decoded));
     setHistory((prev) =>
       prev ? { ...prev, has_newer: page.has_newer } : page,

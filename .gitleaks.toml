@@ -1,0 +1,34 @@
+title = "67chat secret scanning"
+
+[extend]
+useDefault = true
+
+# Narrow exceptions for reviewed non-secrets. Do not allow whole source files.
+[[allowlists]]
+description = "Names of local Docker services in the legacy smoke test"
+condition = "AND"
+paths = ['''(^|/)test\.ps1$''']
+regexTarget = "secret"
+regexes = ['''^messenger67-caddy$''']
+
+[[allowlists]]
+description = "Google IAM public key-generation enum names, not key material"
+condition = "AND"
+paths = ['''(^|/)scripts/configure_firebase\.cjs$''']
+regexTarget = "line"
+regexes = ['''^\s*const key=await request\('iam\.googleapis\.com',accountPath\+'/keys','POST',\{privateKeyType:'TYPE_GOOGLE_CREDENTIALS_FILE',keyAlgorithm:'KEY_ALG_RSA_2048'\}\);$''']
+
+[[allowlists]]
+description = "Public hCaptcha sitekey in the login form, not a server secret"
+condition = "AND"
+paths = ['''(^|/)web/(views|app)\.js$''']
+regexTarget = "line"
+regexes = ['''^\s*<div id="captcha-container" style="display:none"><div class="h-captcha" data-sitekey="[0-9a-fA-F-]{36}" data-callback="onCaptchaSuccess"></div></div>\r?$''']
+
+# The original login form used the same public widget without an outer div.
+[[allowlists]]
+description = "Historical public hCaptcha widget"
+condition = "AND"
+paths = ['''(^|/)web/app\.js$''']
+regexTarget = "line"
+regexes = ['''^\s*<div class="h-captcha" data-sitekey="[0-9a-fA-F-]{36}" data-callback="onCaptchaSuccess"></div>\r?$''']

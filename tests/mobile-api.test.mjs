@@ -86,6 +86,53 @@ test("mobile routes require authentication and room membership", async () => {
     404,
   );
 });
+
+test('personal tombstones filter pages, unread anchors and sync without hiding messages from other members',async()=>{
+  await db.exec(`CREATE TABLE IF NOT EXISTS hidden_messages(user_id uuid REFERENCES users(id),message_id uuid REFERENCES messages(id),created_at timestamptz DEFAULT now(),PRIMARY KEY(user_id,message_id));`);
+  const id='00000000-0000-4000-8000-000000009991';
+  await db.query('INSERT INTO messages(id,room_id,sender_id,type,text) VALUES($1,$2,$3,$4,$5)',[id,R,B,'text','hidden test']);
+  await db.query('INSERT INTO hidden_messages(user_id,message_id) VALUES($1,$2)',[A,id]);
+  await db.query("INSERT INTO message_changes(room_id,message_id,operation)VALUES($1,$2,'hide')",[R,id]);
+  const history=(await call(`/rooms/${R}/history`)).json();
+  assert.equal(history.messages.some(m=>m.id===id),false);
+  assert.notEqual(history.first_unread_id,id);
+  assert.equal((await call(`/rooms/${R}/history?around=${id}`)).statusCode,404);
+  assert.equal((await call(`/rooms/${R}/history`,B)).json().messages.some(m=>m.id===id),true);
+  const hidden=(await call('/sync')).json().changes.filter(c=>c.message_id===id);
+  assert.ok(hidden.length);assert.ok(hidden.every(c=>c.operation==='delete' && c.message===null));
+  assert.ok((await call('/sync',B)).json().changes.some(c=>c.message_id===id && c.message));
+  await db.query('DELETE FROM hidden_messages WHERE message_id=$1',[id]);
+  await db.query('DELETE FROM messages WHERE id=$1',[id]);
+});
+
+test('production chat lists include the pinned message and omit hidden previews and unread counts',async()=>{
+  await db.exec('ALTER TABLE rooms ADD COLUMN IF NOT EXISTS avatar_id uuid; ALTER TABLE rooms ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();');
+  const room=(await db.query("INSERT INTO rooms(kind)VALUES('dm') RETURNING id")).rows[0].id;
+  await db.query("INSERT INTO room_members VALUES($1,$2,'owner'),($1,$3,'member')",[room,A,B]);
+  const visible=(await db.query("INSERT INTO messages(room_id,sender_id,type,text,created_at)VALUES($1,$2,'text','visible',now()-interval '1 minute') RETURNING id",[room,B])).rows[0].id;
+  const hidden=(await db.query("INSERT INTO messages(room_id,sender_id,type,text)VALUES($1,$2,'text','hidden') RETURNING id",[room,B])).rows[0].id;
+  await db.query('INSERT INTO hidden_messages(user_id,message_id)VALUES($1,$2)',[A,hidden]);
+  await db.query('UPDATE rooms SET pinned_message_id=$2 WHERE id=$1',[room,visible]);
+  const source=fs.readFileSync(new URL('../api/server.js',import.meta.url),'utf8');
+  const block=source.slice(source.indexOf('async function notifyRoomListUpdate(userId)'),source.indexOf('async function notifyRoomListUpdateForRoom'));
+  const sql=block.match(/`([\s\S]*?)`/)[1];
+  const rows=(await db.query(sql,[A,JSON.stringify([A])])).rows;
+  const result=rows.find(r=>r.id===room);
+  assert.equal(result.pinned_message_id,visible);
+  assert.equal(result.last_msg_id,visible);assert.equal(result.unread_count,1);
+});
+
+test('hidden attachments are private in media pages and tombstone catch-up',async()=>{
+ const mediaId='00000000-0000-4000-8000-000000009992',id='00000000-0000-4000-8000-000000009993';
+ await db.query("INSERT INTO media(id,kind,mime)VALUES($1,'image','image/png')",[mediaId]);
+ await db.query("INSERT INTO messages(id,room_id,sender_id,type,media_id)VALUES($1,$2,$3,'media',$4)",[id,R,B,mediaId]);
+ await db.query('INSERT INTO hidden_messages(user_id,message_id)VALUES($1,$2)',[A,id]);
+ assert.equal((await call(`/rooms/${R}/media`)).json().some(m=>m.id===id),false);
+ assert.equal((await call(`/rooms/${R}/media`,B)).json().some(m=>m.id===id),true);
+ const catchup=await call('/me/hidden-messages');assert.equal(catchup.statusCode,200);
+ assert.ok(catchup.json().items.some(m=>m.message_id===id));
+ assert.equal((await call('/me/hidden-messages',B)).json().items.some(m=>m.message_id===id),false);
+});
 test("production insert SQL deduplicates the same sender/client ID and keeps the original payload", async () => {
   const source = fs.readFileSync(
     new URL("../api/server.js", import.meta.url),

@@ -20,7 +20,8 @@ import { ConnectionBanner } from "./src/components/ConnectionBanner";
 import { UpdateBanner } from "./src/components/UpdateBanner";
 import { useAppUpdate } from "./src/hooks/useAppUpdate";
 import { beginCall as beginAudioCall, endCall as endAudioCall } from "./src/audioSession";
-import { describeLock, lockLabel, unlockApp, watchBackground } from "./src/appLock";
+import { describeLock, lockLabel, unlockApp, watchBackground, setLockPreference } from "./src/appLock";
+import { currentVersionName } from "./src/updates";
 import { LockScreen } from "./src/components/LockScreen";
 import { ThemeProvider, useTheme } from "./src/ThemeProvider";
 import "react-native-get-random-values";
@@ -195,6 +196,7 @@ function App() {
   const appUpdate = useAppUpdate(baseUrl, true);
   // --- App lock -------------------------------------------------------------
   const [lockEnabled, setLockEnabled] = useState(false);
+  const [lockReady,setLockReady] = useState(false);
   const [unlocked, setUnlocked] = useState(true);
   const [unlocking, setUnlocking] = useState(false);
   const [lockError, setLockError] = useState<string | null>(null);
@@ -205,10 +207,11 @@ function App() {
     void (async () => {
       const state = await describeLock();
       if (!live) return;
-      setLockEnabled(state.enabled && state.available);
+      setLockEnabled(state.enabled);
       setLockButtonLabel(lockLabel(state.biometry));
       // Locked on a cold start; a session already open in this run stays open.
-      if (state.enabled && state.available) setUnlocked(false);
+      if (state.enabled) setUnlocked(false);
+      setLockReady(true);
     })();
     return () => {
       live = false;
@@ -439,7 +442,11 @@ function App() {
         token,
       );
       if (tokenRef.current !== receivingToken) return;
-      void local.repository.current?.saveMessages([incoming]).catch(() => {});
+      const repository=local.repository.current;
+      await repository?.saveMessages([incoming]);
+      if(tokenRef.current!==receivingToken || repository!==local.repository.current)return;
+      if(repository && !(await repository.visibleMessages([incoming])).length)return;
+      if(repository?.isHidden(incoming.id))return;
       setRooms((prev) =>
         reorderRooms(
           updateRoomPreview(prev, incoming, me?.id || null),
@@ -447,7 +454,7 @@ function App() {
         ),
       );
       if (incoming.room_id === activeRoomIdRef.current && tokenRef.current) {
-        setMessages((prev) => mergeMessages(prev, [incoming]));
+        setMessages((prev) => mergeMessages(prev, [incoming]).filter(message=>!repository?.isHidden(message.id)));
         try {
           // Read receipts are sent by the visible-message callback.
         } catch {}
@@ -458,9 +465,13 @@ function App() {
       try { await groupEncryption?.inbox(data.room_id); if (data.room_id === activeRoomIdRef.current) await local.open(rooms.find(room => room.id === data.room_id)!); } catch {}
       return;
     }
-    if (data.type === "message.delete" && data.message_id) {
+    if (data.type === 'room.pin' && data.room_id) {
+      setRooms(prev=>prev.map(room=>room.id===data.room_id?{...room,pinned_message_id:data.message_id || null}:room));
+      return;
+    }
+    if ((data.type === "message.delete" || data.type === "message.hide") && data.message_id) {
       void local.repository.current
-        ?.removeMessage(data.message_id)
+        ?.hideMessage(data.message_id)
         .catch(() => {});
       setMessages((prev) => prev.filter((item) => item.id !== data.message_id));
       return;
@@ -1397,6 +1408,7 @@ function App() {
 
   // App lock: gate the whole UI until the device authenticates. Shown before
   // the login screen so a locked app never reveals cached chats either.
+  if (!lockReady) return <SafeAreaView style={styles.screen}><ActivityIndicator /></SafeAreaView>;
   if (lockEnabled && !unlocked) {
     return (
       <>
@@ -1415,6 +1427,7 @@ function App() {
     return (
       <>
         <StatusBar style={theme.dark ? "light" : "dark"} />
+        {appUpdate.visible && <UpdateBanner state={appUpdate.state} onUpdate={appUpdate.start} onDismiss={appUpdate.dismiss} onRetryInstall={appUpdate.retryInstall} onOpenPermissionSettings={appUpdate.openPermissionSettings} />}
         <AuthScreen
           authMode={authMode}
           username={username}
@@ -1436,6 +1449,15 @@ function App() {
     !workspace.startsWith("room:");
   const renderWorkspace = () => (
     <Workspace
+      lockEnabled={lockEnabled}
+      onChangeLock={async()=>{
+        const lock=await describeLock();
+        if(!lock.available)throw Error('Сначала настройте код блокировки или биометрию в Android');
+        if(!await unlockApp('Подтвердите изменение блокировки 67chat'))throw Error('Изменение отменено');
+        await setLockPreference(!lockEnabled);setLockEnabled(!lockEnabled);setUnlocked(true);
+      }}
+      onCheckUpdates={appUpdate.recheck}
+      updateLabel={`${currentVersionName()} · ${{checking:'Проверка…','up-to-date':'Установлена последняя версия',unavailable:'Не удалось проверить. Повторите при подключении к сети',available:'Доступно обновление',unsupported:'Обновление недоступно для этой сборки'}[appUpdate.checkStatus] || 'Проверка при запуске'}`}
       uploader={protectedUploader(baseUrl,token,encodeText)}
       decode={prepareMessage}
       embedded={nativeWorkspace}
@@ -1606,6 +1628,7 @@ function App() {
             chat={() =>
               activeRoom ? (
                 <ChatScreen
+                  onUnpin={activeRoom.kind==='dm' || ['owner','admin'].includes(activeRoom.my_role || '') ? ()=>{void request(baseUrl,`/rooms/${activeRoom.id}/pin`,{token,method:'PUT',body:{message_id:null}}).catch(e=>setError(userError(e)));}:undefined}
                   room={activeRoom}
                   messages={messages}
                   meId={me.id}
@@ -1775,6 +1798,17 @@ function App() {
         {!nativeWorkspace && renderWorkspace()}
 
         <MessageActions
+          onPin={activeRoom?.kind==='dm' || ['owner','admin'].includes(activeRoom?.my_role || '') ? async(message)=>{
+            await request(baseUrl,`/rooms/${message.room_id}/pin`,{token,method:'PUT',body:{message_id:message.id}});
+            setRooms(prev=>prev.map(room=>room.id===message.room_id?{...room,pinned_message_id:message.id}:room));
+          }:undefined}
+          onHide={async(items)=>{
+            for(const message of items){
+              await request(baseUrl,`/rooms/${message.room_id}/messages/${message.id}/hide`,{token,method:'DELETE'});
+              await local.repository.current?.hideMessage(message.id);
+              setMessages(prev=>prev.filter(m=>m.id!==message.id));
+            }
+          }}
           messages={actionMessages}
           meId={me.id}
           onSelectMore={() => setActionMessages([])}

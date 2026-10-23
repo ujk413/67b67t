@@ -775,11 +775,12 @@ function joinRoom(roomId, ws) {
 function leaveAllRooms(ws) {
   for (const set of socketsByRoom.values()) set.delete(ws);
 }
-function broadcastToRoom(roomId, payload) {
+function broadcastToRoom(roomId, payload, excludedUsers = new Set()) {
   const set = socketsByRoom.get(roomId);
   if (!set) return;
   const s = JSON.stringify(payload);
   for (const ws of set) {
+    if([...excludedUsers].some(userId=>socketsByUser.get(userId)?.has(ws)))continue;
     try {
       ws.send(s);
     } catch {}
@@ -1270,7 +1271,7 @@ async function mergeSecondaryAccountIntoPrimary(
 async function notifyRoomListUpdate(userId) {
   const { rows } = await pool.query(
     `
-    SELECT r.id, r.is_saved, coalesce((SELECT to_jsonb(p) FROM room_preferences p WHERE p.room_id=r.id AND p.user_id=$1),'{}'::jsonb) AS preferences, rm.role AS my_role, r.kind, r.title, r.avatar_id, r.created_by, r.created_at,
+    SELECT r.id, r.pinned_message_id, r.is_saved, coalesce((SELECT to_jsonb(p) FROM room_preferences p WHERE p.room_id=r.id AND p.user_id=$1),'{}'::jsonb) AS preferences, rm.role AS my_role, r.kind, r.title, r.avatar_id, r.created_by, r.created_at,
            lm.id as last_msg_id, lm.type as last_msg_type, lm.text as last_msg_text, lm.meta as last_msg_meta, lm.encrypted_content as last_msg_encrypted_content,
            lm.sender_id as last_msg_sender_id, lmu.username as last_msg_sender_username, lmu.display_name as last_msg_sender_name,
            lm.created_at as last_msg_at,
@@ -1278,13 +1279,14 @@ async function notifyRoomListUpdate(userId) {
            (SELECT COUNT(*)::int FROM messages m
             WHERE m.room_id = r.id
             AND m.sender_id <> $1
+            AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$1)
             AND (m.read_by IS NULL OR NOT m.read_by @> $2::jsonb)
            ) as unread_count
     FROM rooms r
     JOIN room_members rm ON rm.room_id=r.id
     LEFT JOIN LATERAL (
       SELECT m.id, m.type, m.text, m.meta, m.encrypted_content, m.sender_id, m.created_at
-      FROM messages m WHERE m.room_id = r.id ORDER BY m.created_at DESC LIMIT 1
+      FROM messages m WHERE m.room_id = r.id AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$1) ORDER BY m.created_at DESC,m.id DESC LIMIT 1
     ) lm ON true
     LEFT JOIN users lmu ON lmu.id = lm.sender_id
     LEFT JOIN LATERAL (
@@ -2376,7 +2378,7 @@ app.get("/rooms", async (req, reply) => {
   // Get rooms with last message and other member info for DMs, sorted by last message time
   const { rows } = await pool.query(
     `
-    SELECT r.id, r.is_saved, coalesce((SELECT to_jsonb(p) FROM room_preferences p WHERE p.room_id=r.id AND p.user_id=$1),'{}'::jsonb) AS preferences, rm.role AS my_role, r.kind, r.title, r.avatar_id, r.created_by, r.created_at,
+    SELECT r.id, r.pinned_message_id, r.is_saved, coalesce((SELECT to_jsonb(p) FROM room_preferences p WHERE p.room_id=r.id AND p.user_id=$1),'{}'::jsonb) AS preferences, rm.role AS my_role, r.kind, r.title, r.avatar_id, r.created_by, r.created_at,
            lm.id as last_msg_id, lm.type as last_msg_type, lm.text as last_msg_text, lm.meta as last_msg_meta, lm.encrypted_content as last_msg_encrypted_content,
            lm.sender_id as last_msg_sender_id, lmu.username as last_msg_sender_username, lmu.display_name as last_msg_sender_name,
            lm.created_at as last_msg_at,
@@ -2384,13 +2386,14 @@ app.get("/rooms", async (req, reply) => {
            (SELECT COUNT(*)::int FROM messages m
             WHERE m.room_id = r.id
             AND m.sender_id <> $1
+            AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$1)
             AND (m.read_by IS NULL OR NOT m.read_by @> $2::jsonb)
            ) as unread_count
     FROM rooms r
     JOIN room_members rm ON rm.room_id=r.id
     LEFT JOIN LATERAL (
       SELECT m.id, m.type, m.text, m.meta, m.encrypted_content, m.sender_id, m.created_at
-      FROM messages m WHERE m.room_id = r.id ORDER BY m.created_at DESC LIMIT 1
+      FROM messages m WHERE m.room_id = r.id AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$1) ORDER BY m.created_at DESC,m.id DESC LIMIT 1
     ) lm ON true
     LEFT JOIN users lmu ON lmu.id = lm.sender_id
     LEFT JOIN LATERAL (
@@ -2424,7 +2427,7 @@ app.get("/rooms/:id", async (req, reply) => {
   if (!ok) return reply.code(404).send({ error: "not_found" });
 
   const { rows } = await pool.query(
-    `SELECT id, kind, title, avatar_id, created_by, created_at FROM rooms WHERE id=$1 LIMIT 1`,
+    `SELECT id, kind, title, avatar_id, created_by, created_at, pinned_message_id FROM rooms WHERE id=$1 LIMIT 1`,
     [roomId],
   );
   if (!rows.length) return reply.code(404).send({ error: "not_found" });
@@ -3022,7 +3025,8 @@ app.put("/rooms/:roomId/messages/:msgId", async (req, reply) => {
     edited_at: new Date().toISOString(),
     reactions,
   };
-  broadcastToRoom(roomId, { type: "message.update", message: updated });
+  const {rows:hiddenReaders}=await pool.query('SELECT user_id FROM hidden_messages WHERE message_id=$1',[msgId]);
+  broadcastToRoom(roomId, { type: "message.update", message: updated },new Set(hiddenReaders.map(row=>row.user_id)));
   await notifyRoomListUpdateForRoom(roomId);
   return updated;
 });
@@ -3081,9 +3085,12 @@ app.delete("/rooms/:roomId/messages/:msgId/hide", async (req, reply) => {
   if (!rows.length) return reply.code(404).send({ error: "not_found" });
 
   await pool.query(
-    `INSERT INTO hidden_messages(user_id, message_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,
-    [me.id, msgId],
+    `WITH locked AS MATERIALIZED (SELECT pg_advisory_xact_lock(670024)),
+     inserted AS (INSERT INTO hidden_messages(user_id,message_id) SELECT $1,$2 FROM locked ON CONFLICT DO NOTHING RETURNING message_id)
+     INSERT INTO message_changes(room_id,message_id,operation) SELECT $3,message_id,'hide' FROM inserted`,
+    [me.id, msgId, roomId],
   );
+  sendToUser(me.id,{type:'message.hide',room_id:roomId,message_id:msgId});
   await notifyRoomListUpdate(me.id);
   return { ok: true };
 });

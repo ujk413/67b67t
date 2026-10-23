@@ -10,6 +10,7 @@ export type User = {
 };
 
 export type Room = {
+  pinned_message_id?: string | null;
   is_saved?: boolean;
   my_role?: string;
   preferences?: {

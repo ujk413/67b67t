@@ -9,7 +9,7 @@
     "web": "expo start --web",
     "postinstall": "node scripts/patch-expo-notifications.cjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --test ../tests/mobile-runtime.test.mjs ../tests/groupcrypto.test.mjs ../tests/mobile-data.test.mjs ../tests/room-crypto.test.mjs ../tests/mobile-push.test.mjs ../tests/group-interop.test.mjs ../tests/mobile-update.test.mjs ../tests/audio-session.test.mjs",
+    "test": "node --test ../tests/mobile-runtime.test.mjs ../tests/groupcrypto.test.mjs ../tests/mobile-data.test.mjs ../tests/room-crypto.test.mjs ../tests/mobile-push.test.mjs ../tests/group-interop.test.mjs ../tests/mobile-update.test.mjs ../tests/audio-session.test.mjs ../tests/update-flow.test.mjs ../tests/app-lock.test.mjs",
     "icons:prepare": "node ../scripts/prepare_icons.cjs"
   },
   "dependencies": {

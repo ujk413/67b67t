@@ -215,3 +215,9 @@ CREATE TABLE IF NOT EXISTS group_sender_keys (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS group_sender_keys_inbox_idx ON group_sender_keys(room_id, to_user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS hidden_messages (user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, message_id uuid NOT NULL REFERENCES messages(id) ON DELETE CASCADE, created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(user_id,message_id));
+CREATE INDEX IF NOT EXISTS hidden_messages_user_idx ON hidden_messages(user_id);
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_message_id uuid REFERENCES messages(id) ON DELETE SET NULL;
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_at timestamptz;
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_by uuid REFERENCES users(id) ON DELETE SET NULL;

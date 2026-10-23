@@ -33,6 +33,7 @@ export type AppRelease = {
 
 export type UpdateCheck =
   | { status: "unsupported" }
+  | { status: "unavailable"; current: number }
   | { status: "up-to-date"; current: number }
   | { status: "available"; release: AppRelease; current: number; url: string };
 
@@ -57,8 +58,7 @@ export function currentVersionName(): string {
 
 /**
  * Ask the server which build is current. Never throws: any network or parse
- * failure is reported as "up-to-date" so a flaky connection cannot nag the user
- * with an update prompt.
+ * failure is distinct from a successful check, so it can be retried after reconnect.
  */
 export async function checkForUpdate(baseUrl: string): Promise<UpdateCheck> {
   if (Platform.OS !== "android") return { status: "unsupported" };
@@ -74,14 +74,15 @@ export async function checkForUpdate(baseUrl: string): Promise<UpdateCheck> {
     });
     // 204 = nothing published yet.
     if (res.status === 204) return { status: "up-to-date", current };
-    if (!res.ok) return { status: "up-to-date", current };
+    if (!res.ok) return { status: "unavailable", current };
     const release = (await res.json()) as Partial<AppRelease>;
     const versionCode = Number(release.versionCode);
-    if (!Number.isInteger(versionCode) || versionCode <= current) {
+    if (!Number.isInteger(versionCode) || versionCode <= 0) return { status: "unavailable", current };
+    if (versionCode <= current) {
       return { status: "up-to-date", current };
     }
     if (!release.path || typeof release.path !== "string") {
-      return { status: "up-to-date", current };
+      return { status: "unavailable", current };
     }
     return {
       status: "available",
@@ -100,7 +101,7 @@ export async function checkForUpdate(baseUrl: string): Promise<UpdateCheck> {
       },
     };
   } catch {
-    return { status: "up-to-date", current };
+    return { status: "unavailable", current };
   } finally {
     clearTimeout(timer);
   }
@@ -113,6 +114,7 @@ export async function checkForUpdate(baseUrl: string): Promise<UpdateCheck> {
 export async function downloadRelease(
   url: string,
   onProgress?: (fraction: number) => void,
+  signal?: AbortSignal,
 ): Promise<string> {
   const target = `${Files.cacheDirectory}${APK_FILE}`;
   // A previous attempt may have left a partial file behind.
@@ -128,9 +130,15 @@ export async function downloadRelease(
       onProgress(total > 0 ? progress.totalBytesWritten / total : -1);
     },
   );
-  const result = await download.downloadAsync();
-  if (!result?.uri) throw new Error("download_failed");
-  return result.uri;
+  const cancel=()=>{void download.pauseAsync().catch(()=>{});};
+  signal?.addEventListener('abort',cancel,{once:true});
+  try {
+    if(signal?.aborted)throw Error('download_cancelled');
+    const result = await download.downloadAsync();
+    if(signal?.aborted)throw Error('download_cancelled');
+    if (!result?.uri || result.status!==200) throw new Error("download_failed");
+    return result.uri;
+  } finally {signal?.removeEventListener('abort',cancel);}
 }
 
 /** Delete a downloaded APK (after install, or when the user dismisses). */
@@ -147,8 +155,9 @@ export async function discardDownload(uri?: string | null) {
  * Hand the APK to the system installer. Rejects with `install_permission_required`
  * when the user has not allowed this app to install unknown apps yet.
  */
-export async function installRelease(fileUri: string): Promise<void> {
+export async function installRelease(fileUri: string,signal?:AbortSignal): Promise<void> {
   const contentUri = await Files.getContentUriAsync(fileUri);
+  if(signal?.aborted)throw Error('install_cancelled');
   await IntentLauncher.startActivityAsync("android.intent.action.VIEW", {
     data: contentUri,
     type: ANDROID_PACKAGE_MIME,
@@ -166,6 +175,6 @@ export async function downloadedSize(fileUri: string): Promise<number> {
 export async function openInstallPermissionSettings(): Promise<void> {
   await IntentLauncher.startActivityAsync(
     "android.settings.MANAGE_UNKNOWN_APP_SOURCES",
-    { data: `package:${Constants.expoConfig?.android?.package || ""}` },
+    { data: `package:${Application.applicationId || Constants.expoConfig?.android?.package || ""}` },
   );
 }

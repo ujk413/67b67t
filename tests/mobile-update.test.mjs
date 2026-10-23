@@ -125,14 +125,14 @@ test("nothing published (204) is up to date, and so is a broken answer", async (
     buildVersion: 10,
     fetchImpl: async () => ({ ok: false, status: 503, json: async () => ({}) }),
   });
-  assert.equal((await serverError.checkForUpdate("https://67chat.ru/api")).status, "up-to-date");
+  assert.equal((await serverError.checkForUpdate("https://67chat.ru/api")).status, "unavailable");
 
   // A release without a download path cannot be installed, so it is ignored.
   const noPath = loadUpdates({
     buildVersion: 10,
     fetchImpl: async () => jsonResponse(200, { versionCode: 99 }),
   });
-  assert.equal((await noPath.checkForUpdate("https://67chat.ru/api")).status, "up-to-date");
+  assert.equal((await noPath.checkForUpdate("https://67chat.ru/api")).status, "unavailable");
 });
 
 test("a network failure or timeout never surfaces as an update prompt", async () => {
@@ -142,7 +142,7 @@ test("a network failure or timeout never surfaces as an update prompt", async ()
       throw new Error("network down");
     },
   });
-  assert.equal((await offline.checkForUpdate("https://67chat.ru/api")).status, "up-to-date");
+  assert.equal((await offline.checkForUpdate("https://67chat.ru/api")).status, "unavailable");
 
   const hanging = loadUpdates({
     buildVersion: 10,
@@ -153,7 +153,7 @@ test("a network failure or timeout never surfaces as an update prompt", async ()
   });
   // The client gives up after 8s instead of blocking the UI.
   const originalSetTimeout = globalThis.setTimeout;
-  assert.equal((await hanging.checkForUpdate("https://67chat.ru/api")).status, "up-to-date");
+  assert.equal((await hanging.checkForUpdate("https://67chat.ru/api")).status, "unavailable");
   assert.equal(typeof originalSetTimeout, "function");
 });
 

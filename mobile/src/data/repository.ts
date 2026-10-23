@@ -23,6 +23,7 @@ export class AccountRepository {
   private closed = false;
   private closing: Promise<void> | null = null;
   private sequence: Promise<unknown> = Promise.resolve();
+  private tombstones = new Set<string>();
   private access<T>(
     action: (db: SQLite.SQLiteDatabase) => Promise<T>,
   ): Promise<T> {
@@ -74,10 +75,12 @@ export class AccountRepository {
       }
       await db.execAsync(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS hidden_messages_local(id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,room_id TEXT NOT NULL,created_at TEXT NOT NULL,data TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS messages_order ON messages(room_id,created_at,id);
         CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(id UNINDEXED,room_id UNINDEXED,text,tokenize='unicode61');
         CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,data TEXT NOT NULL);`);
+      for(const row of await db.getAllAsync<{id:string}>('SELECT id FROM hidden_messages_local'))this.tombstones.add(row.id);
       if (this.closed) {
         await db.closeAsync();
         throw new Error("Хранилище закрыто");
@@ -123,6 +126,8 @@ export class AccountRepository {
     return this.access(async (db) => {
       await this.transaction(db, async (tx) => {
         for (const m of items) {
+          if(this.tombstones.has(m.id))continue;
+          if(await tx.getFirstAsync('SELECT id FROM hidden_messages_local WHERE id=?',m.id))continue;
           await tx.runAsync(
             "INSERT OR REPLACE INTO messages VALUES(?,?,?,?)",
             m.id,
@@ -164,6 +169,21 @@ export class AccountRepository {
         await tx.runAsync("DELETE FROM messages WHERE id=?", id);
         await tx.runAsync("DELETE FROM search WHERE id=?", id);
       });
+    });
+  }
+  async hideMessage(id:string) {
+    this.tombstones.add(id);
+    return this.access(async db=>this.transaction(db,async tx=>{
+      await tx.runAsync('INSERT OR IGNORE INTO hidden_messages_local(id)VALUES(?)',id);
+      await tx.runAsync('DELETE FROM messages WHERE id=?',id);
+      await tx.runAsync('DELETE FROM search WHERE id=?',id);
+    }));
+  }
+  isHidden(id:string) {return this.tombstones.has(id);}
+  async visibleMessages(items:Message[]) {
+    return this.access(async db=>{
+      const hidden=new Set((await db.getAllAsync<{id:string}>('SELECT id FROM hidden_messages_local')).map(row=>row.id));
+      return items.filter(item=>!hidden.has(item.id) && !this.tombstones.has(item.id));
     });
   }
   async pruneRooms(ids: string[]) {

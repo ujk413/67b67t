@@ -11,8 +11,9 @@ export async function getMobileMessage(
   pool,
   id,
   decodeMetadata = (value) => value,
+  viewerId = null,
 ) {
-  const { rows } = await pool.query(`${messageSelect} WHERE m.id=$1`, [id]);
+  const { rows } = await pool.query(`${messageSelect} WHERE m.id=$1 AND ($2::uuid IS NULL OR NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$2))`, [id,viewerId]);
   if (!rows[0]) return null;
   const { rows: reactions } = await pool.query(
     "SELECT user_id,emoji FROM reactions WHERE message_id=$1",
@@ -90,11 +91,16 @@ export async function installMobileRoutes(app, deps) {
     const me = await member(req, reply);
     if (!me) return;
     const { id } = req.params;
+    // Apply personal tombstones to every page, cursor, unread anchor and count.
+    const visibleQuery=(sql,args=[])=>pool.query(
+      `WITH visible_messages AS (SELECT m.* FROM messages m WHERE NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$${args.length+1})) ` + sql.replace(/\bmessages\b/g,'visible_messages'),
+      [...args,me.id],
+    );
     const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 50));
     const anchor = req.query.around || req.query.before || req.query.after;
     let target = null;
     if (anchor) {
-      const { rows } = await pool.query(
+      const { rows } = await visibleQuery(
         // JS Date truncates PostgreSQL microseconds and can repeat/skip a cursor.
         "SELECT id,created_at::text AS created_at FROM messages WHERE id=$1 AND room_id=$2",
         [anchor, id],
@@ -105,11 +111,11 @@ export async function installMobileRoutes(app, deps) {
     let messages;
     if (req.query.around) {
       const half = Math.floor(limit / 2);
-      const { rows: left } = await pool.query(
+      const { rows: left } = await visibleQuery(
         `${messageSelect} WHERE m.room_id=$1 AND (m.created_at,m.id)<=($2,$3) ORDER BY m.created_at DESC,m.id DESC LIMIT $4`,
         [id, target.created_at, target.id, half + 1],
       );
-      const { rows: right } = await pool.query(
+      const { rows: right } = await visibleQuery(
         `${messageSelect} WHERE m.room_id=$1 AND (m.created_at,m.id)>($2,$3) ORDER BY m.created_at,m.id LIMIT $4`,
         [id, target.created_at, target.id, half],
       );
@@ -122,7 +128,7 @@ export async function installMobileRoutes(app, deps) {
         clause = ` AND (m.created_at,m.id)${req.query.after ? ">" : "<"}($2,$3)`;
       }
       args.push(limit);
-      const { rows } = await pool.query(
+      const { rows } = await visibleQuery(
         `${messageSelect} WHERE m.room_id=$1${clause} ORDER BY m.created_at ${req.query.after ? "ASC" : "DESC"},m.id ${req.query.after ? "ASC" : "DESC"} LIMIT $${args.length}`,
         args,
       );
@@ -130,7 +136,7 @@ export async function installMobileRoutes(app, deps) {
     }
     const first = messages[0],
       last = messages.at(-1);
-    const { rows: more } = await pool.query(
+    const { rows: more } = await visibleQuery(
       `SELECT EXISTS(SELECT 1 FROM messages WHERE room_id=$1 AND (created_at,id)<
         (SELECT created_at,id FROM messages WHERE room_id=$1 AND id=$2)) AS older,
       EXISTS(SELECT 1 FROM messages WHERE room_id=$1 AND (created_at,id)>
@@ -141,7 +147,7 @@ export async function installMobileRoutes(app, deps) {
         last?.id || null,
       ],
     );
-    const { rows: unread } = await pool.query(
+    const { rows: unread } = await visibleQuery(
       `SELECT id FROM messages WHERE room_id=$1 AND sender_id<>$2 AND NOT coalesce(read_by,'[]') @> $3::jsonb ORDER BY created_at,id LIMIT 1`,
       [id, me.id, JSON.stringify([me.id])],
     );
@@ -174,7 +180,7 @@ export async function installMobileRoutes(app, deps) {
       const message =
         row.operation === "delete"
           ? null
-          : await getMobileMessage(pool, row.message_id, decryptMetadata);
+          : await getMobileMessage(pool, row.message_id, decryptMetadata, me.id);
       changes.push({
         seq: String(row.seq),
         room_id: row.room_id,
@@ -244,20 +250,28 @@ export async function installMobileRoutes(app, deps) {
     return { ok: true };
   });
   app.get("/rooms/:id/media", async (req, reply) => {
-    if (!(await member(req, reply))) return;
+    const me=await member(req,reply);if(!me)return;
     const before = req.query.before || null;
     const kind = ["image", "video", "file"].includes(req.query.kind) ? req.query.kind : "all";
     return (
       await pool.query(
         `${messageSelect} WHERE m.room_id=$1 AND m.media_id IS NOT NULL
+        AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id=$4)
         AND ($2::uuid IS NULL OR (m.created_at,m.id)<(SELECT created_at,id FROM messages WHERE id=$2 AND room_id=$1))
         AND ($3='all' OR ($3='image' AND coalesce(m.meta#>>'{media_encryption,mime}',md.mime) LIKE 'image/%')
           OR ($3='video' AND (m.type='video_note' OR coalesce(m.meta#>>'{media_encryption,mime}',md.mime) LIKE 'video/%'))
           OR ($3='file' AND m.type<>'voice' AND m.type<>'video_note' AND coalesce(m.meta#>>'{media_encryption,mime}',md.mime,'') NOT LIKE 'image/%' AND coalesce(m.meta#>>'{media_encryption,mime}',md.mime,'') NOT LIKE 'video/%'))
         ORDER BY m.created_at DESC,m.id DESC LIMIT 100`,
-        [req.params.id, before, kind],
+        [req.params.id, before, kind,me.id],
       )
     ).rows;
+  });
+  app.get('/me/hidden-messages',async(req)=>{
+    const me=await requireAuth(req),after=req.query.after || null;
+    if(after && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(after))throw Object.assign(Error('bad_cursor'),{statusCode:400});
+    const {rows}=await pool.query(`SELECT h.message_id,m.room_id FROM hidden_messages h JOIN messages m ON m.id=h.message_id
+      WHERE h.user_id=$1 AND ($2::uuid IS NULL OR h.message_id>$2) ORDER BY h.message_id LIMIT 200`,[me.id,after]);
+    return {items:rows,next_cursor:rows.length===200?rows.at(-1).message_id:null};
   });
   app.post("/rooms/:id/invites", async (req, reply) => {
     const me = await member(req, reply);

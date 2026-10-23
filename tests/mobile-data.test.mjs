@@ -38,6 +38,7 @@ const keys = new Map(),
   connections = [],
   events = [];
 let cipher = true;
+let pauseHiddenRead=null;
 const { AccountRepository } = load("../mobile/src/data/repository.ts", {
   "expo-secure-store": {
     getItemAsync: async (key) => keys.get(key) || null,
@@ -58,7 +59,11 @@ const { AccountRepository } = load("../mobile/src/data/repository.ts", {
               ? { cipher_version: "native-adapter-test" }
               : null
             : db.prepare(sql).get(...args),
-        getAllAsync: async (sql, ...args) => db.prepare(sql).all(...args),
+        getAllAsync: async (sql, ...args) => {
+          const rows=db.prepare(sql).all(...args);
+          if(sql==='SELECT id FROM hidden_messages_local' && pauseHiddenRead)await pauseHiddenRead();
+          return rows;
+        },
         runAsync: async (sql, ...args) => db.prepare(sql).run(...args),
         closeAsync: async () => db.close(),
       };
@@ -95,6 +100,28 @@ test("repository keys the connection before schema creation and refuses a build 
   cipher = false;
   await assert.rejects(new AccountRepository("unsupported").open(), /APK/);
   cipher = true;
+});
+
+test('personal tombstones prevent stale updates from returning to native history and FTS after reopen',async()=>{
+ let repo=new AccountRepository('personal-hidden');await repo.open();
+ await repo.saveMessages([msg('hidden','room','private text')]);
+ assert.equal(typeof repo.hideMessage,'function');await repo.hideMessage('hidden');
+ await repo.saveMessages([msg('hidden','room','edited text')]);
+ assert.equal((await repo.messages('room')).length,0);assert.equal((await repo.search('edited')).length,0);
+ await repo.close();repo=new AccountRepository('personal-hidden');await repo.open();
+ await repo.saveMessages([msg('hidden','room','late edit')]);assert.equal((await repo.messages('room')).length,0);
+ await repo.close();
+});
+
+test('native message handler cannot resurrect a hide queued behind its visibility snapshot',async()=>{
+ const repo=new AccountRepository('native-ui-race');await repo.open();let rendered=[msg('hidden','room','before')],resume,started;
+ const began=new Promise(r=>started=r);pauseHiddenRead=()=>{started();return new Promise(r=>resume=r);};
+ const source=fs.readFileSync(new URL('../mobile/App.tsx',import.meta.url),'utf8'),start=source.indexOf('    if (data.type === "message.new" || data.type === "message.update") {');
+ const block=source.slice(start,source.indexOf("    if (data.type === 'sender_key.available'",start));
+ const scope={mergeMessages,exports:{},data:{type:'message.update',message:msg('hidden','room','edited')},baseUrl:'test',token:'t',receivingToken:'t',tokenRef:{current:'t'},activeRoomIdRef:{current:'room'},local:{repository:{current:repo}},me:{id:'alice'},prepareMessage:async m=>m,setRooms(){},reorderRooms:x=>x,updateRoomPreview:x=>x,setMessages:f=>rendered=typeof f==='function'?f(rendered):f};
+ vm.runInNewContext(ts.transpileModule('async function receive(){'+block+'}\nexports.receive=receive;', {compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,scope);
+ const incoming=scope.exports.receive();await began;const hiding=repo.hideMessage('hidden');rendered=[];pauseHiddenRead=null;resume();await incoming;await hiding;
+ assert.equal(rendered.length,0);await repo.close();
 });
 
 test('FTS history is finalized once when logout and cleanup close the same repository together',async()=>{
