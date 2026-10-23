@@ -70,3 +70,11 @@ Staging is isolated at /opt/67chat-staging-20261023 with separate DB/credentials
 Host benchmark:1000 real chat-row renders46.38ms,10000-event firstscan10.68ms/100pages, next event0.053ms/0fetches, native bounded-window4.79ms. Full API/web312pass before latest focused adapters/activation changes; mobile final suite pending. Physical phone acceptance is waived by user. Source/API/web/APK publication will be recorded only after actual deployment.
 
 Ruling: bounded inline export remains20MiB and live location stops in background; approved plan requires optional attachments and a limited-time broadcast but does not require unbounded streaming export/background tracking. Limits are visible and documented in USER_GUIDE. Own OSM overview satisfies local coordinate rendering; street tiles remain a stated product limitation. Cost if broader behavior was expected: follow-up export/map/background implementation.
+
+## Фактический выпуск1.3.6/code17 — 23.10.2026
+
+Этот раздел заменяет прежние отметки SOURCE ONLY/pending для этапов2–8. Интегрированные функции из RELEASE_1_3_6 опубликованы на сервере/сайте и в подписанном APK. Финальное ревью и узкая повторная проверка приняты; API/web349/349, mobile249/249, TS чистый; repository2/2, deployment rollback4/4. Реальные шесть внешних RTC-клиентов, отзыв медиа/доступа, веб в обеих темах и переключение аккаунтов проверены. Рабочий сервер прошёл live_server_check, все133 хеша пакета совпали.
+
+APK1.3.6/code17 опубликован18:36:24UTC,67,862,178байт,SHA256085e7957232656d37616f1ea22f983e7d7c79c89d224e9e1027b6abb84377e44; исходники181f00c, прежняя подпись сохранена. Публичные манифест,206 диапазоны0/1MiB и полный поток проверены. Backup: /opt/messenger67/data/backups/release136_20261023_183517.
+
+Не заявляем физическую установку, аппаратные звонки/PiP/TalkBack/разрешения/переход сети и upgrade16→17 на телефоне: пользователь отменил USB-приёмку. Обзорная карта без улиц,20MiB inline-экспорта, остановка live location в фоне и ограничения секретных чатов/прокси описаны в RELEASE_1_3_6 и USER_GUIDE. Это сохраняющиеся границы, а не скрытые завершённые проверки.
