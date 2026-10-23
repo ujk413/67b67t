@@ -1,3 +1,4 @@
+import {t as uiText,isUiCopy,getLanguage} from "../../web/i18n.js";
 const messages: Record<string, string> = {
   username_taken: "Это имя пользователя уже занято. Выберите другое или войдите в существующий аккаунт.",
   username_too_short: "Имя пользователя должно содержать не менее 3 символов.",
@@ -14,11 +15,13 @@ const messages: Record<string, string> = {
 };
 export function userError(value: unknown): string {
   const raw = value instanceof Error ? value.message : String(value || "");
-  if (messages[raw]) return messages[raw];
+  if (messages[raw]) return uiText(messages[raw]);
   if (/network|failed to fetch|network request failed|offline/i.test(raw))
-    return "Нет соединения. Проверьте интернет и повторите попытку.";
-  if (/timeout|timed out/i.test(raw)) return messages.request_timeout;
-  if (/HTTP 429/.test(raw)) return "Слишком много попыток. Подождите минуту.";
-  if (/HTTP 5\d\d/.test(raw)) return "Сервер временно недоступен. Повторите попытку позже.";
-  return raw || "Не удалось выполнить действие. Повторите попытку.";
+    return uiText("Нет соединения. Проверьте интернет и повторите попытку.");
+  if (/timeout|timed out/i.test(raw)) return uiText(messages.request_timeout);
+  if (/HTTP 429/.test(raw)) return uiText("Слишком много попыток. Подождите минуту.");
+  if (/HTTP 5\d\d/.test(raw)) return uiText("Сервер временно недоступен. Повторите попытку позже.");
+  if(isUiCopy(raw))return uiText(raw);
+  if(getLanguage()==='ru'&&/[А-Яа-яЁё]/.test(raw))return raw;
+  return uiText("Не удалось выполнить действие. Повторите попытку.");
 }

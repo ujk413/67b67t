@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 
 function browser() {
-  const requests = [], states = [], listeners = {}, storage = new Map();
-  const subscription = { endpoint: 'browser-subscription', toJSON: () => ({endpoint:'browser-subscription'}), unsubscribe: async () => true };
+  const requests = [], states = [], listeners = {}, storage = new Map();let owner='alice',unsubscribed=0;
+  const subscription = { endpoint: 'browser-subscription', toJSON: () => ({endpoint:'browser-subscription'}), unsubscribe: async () => {unsubscribed++;return true;} };
   const permission = { permission: 'default', requestPermission: async () => { permission.permission='granted'; return 'granted'; } };
   const document = { hidden: false, hasFocus: () => true, addEventListener: (name, fn) => { listeners[name]=fn; } };
   const worker = { pushManager: { getSubscription: async () => subscription } };
@@ -17,14 +17,21 @@ function browser() {
     setInterval:()=>1,clearInterval(){},atob,Uint8Array,
   });
   vm.runInContext(fs.readFileSync(new URL('../web/notifications.js',import.meta.url),'utf8').replace('export function','function'),context);
-  const controller=context.createWebNotifications({ activeRoom:()=> 'room',status:state=>states.push(state),api:async(path,options)=>{
+  const controller=context.createWebNotifications({ account:()=>owner,activeRoom:()=> 'room',status:state=>states.push(state),api:async(path,options)=>{
     requests.push({path,options});
     if(path==='/web-push/config')return{enabled:true,public_key:'BA'};
     if(fail)throw new Error('offline');
     return {ok:true};
   }});
-  return {controller,requests,states,permission,listeners,document,setFailure:value=>{fail=value;}};
+  return {controller,requests,states,permission,listeners,document,setFailure:value=>{fail=value;},switchOwner:value=>{owner=value;},unsubscribed:()=>unsubscribed};
 }
+
+test('switching accounts keeps other push registrations and never unsubscribes the shared browser endpoint',async()=>{
+ const b=browser();await b.controller.enable();await b.controller.pause();b.switchOwner('bob');await b.controller.start();
+ assert.equal(b.requests.filter(r=>r.path==='/me/web-push'&&r.options.method==='PUT').at(-1).options.headers['X-Account-Id'],'bob');
+ await b.controller.disable();assert.equal(b.requests.at(-1).options.headers['X-Account-Id'],'bob');assert.equal(b.unsubscribed(),0);
+ const inactive=b.requests.find(r=>r.path==='/me/web-push'&&r.options.headers?.['X-Account-Id']==='alice'&&JSON.parse(r.options.body).active_room_id===null);assert.ok(inactive);
+});
 
 test('Web Push asks permission only on request, marks hidden pages inactive and removes a disabled subscription',async()=>{
   const b=browser();
@@ -60,7 +67,7 @@ test('service worker displays the branded notification and focuses the correct c
   const clients={matchAll:async()=>[{url:'https://67chat.ru/',focus:async()=>{focused=true;},postMessage:m=>posts.push(m)}],openWindow:async url=>opened.push(url)};
   const context=vm.createContext({self:{addEventListener:(name,fn)=>{handlers[name]=fn;},registration:{showNotification:async(title,options)=>shown.push({title,options})},location:{origin:'https://67chat.ru'}},clients,URL});
   vm.runInContext(fs.readFileSync(new URL('../web/sw.js',import.meta.url),'utf8'),context);
-  handlers.push({data:{json:()=>({roomId:'room',messageId:'message',url:'/?room=room'})},waitUntil:p=>{pending=p;}});
+  handlers.push({data:{json:()=>({roomId:'room',messageId:'message',recipientId:'alice',url:'/?room=room'})},waitUntil:p=>{pending=p;}});
   await pending;
   assert.equal(shown[0].title,'67chat');
   assert.equal(shown[0].options.body,'Новое сообщение');
@@ -68,6 +75,6 @@ test('service worker displays the branded notification and focuses the correct c
   handlers.notificationclick({notification:{data:shown[0].options.data,close:()=>{closed=true;}},waitUntil:p=>{pending=p;}});
   await pending;
   assert.ok(closed&&focused);
-  assert.equal(posts[0].type,'OPEN_ROOM');assert.equal(posts[0].roomId,'room');
+  assert.equal(posts[0].type,'OPEN_ROOM');assert.equal(posts[0].roomId,'room');assert.equal(posts[0].recipientId,'alice');assert.equal(posts[0].messageId,'message');
   assert.equal(opened.length,0);
 });

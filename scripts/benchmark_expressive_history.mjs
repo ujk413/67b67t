@@ -1,0 +1,31 @@
+import {performance} from 'node:perf_hooks';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import {createRequire} from 'node:module';
+import {renderRoomRow} from '../web/views.js';
+import {createExpressiveHistoryLoader} from '../web/expressive-event-history.js';
+import {encodeMessagePayload,reducePoll} from '../web/expressive-payloads.js';
+const ts=createRequire(new URL('../mobile/package.json',import.meta.url))('typescript'),exports={};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync(new URL('../mobile/src/data/messages.ts',import.meta.url),'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,{exports});
+const {mergeMessageWindow,mergeMessages}=exports;
+const at=index=>new Date(Date.UTC(2026,9,23,0,0,index)).toISOString(),pollId='00000000-0000-4000-8000-000000000001',room='benchmark-room';
+const origin={id:'origin',room_id:room,sender_id:'author',created_at:at(0),text:encodeMessagePayload({version:1,kind:'poll',id:pollId,question:'Benchmark',options:[{id:'yes',text:'yes'},{id:'no',text:'no'}],multiple:false,quiz:false,expires_at:at(86400)})};
+const rows=Array.from({length:10000},(_,index)=>({id:String(index),room_id:room,sender_id:'user-'+index%500,created_at:at(index+1),client_message_id:'client-'+index,text:encodeMessagePayload({version:1,kind:'poll_vote',poll_id:pollId,choices:[index%2?'yes':'no'],revision:Math.floor(index/500)+1})}));
+const rooms=Array.from({length:1000},(_,index)=>({id:'room-'+index,kind:'dm',other_user_id:'user-'+index,other_display_name:'Чат '+index,_lastText:'Последнее сообщение '+index,last_msg_at:at(index),unread_count:index%4}));
+const samples=[];
+for(let run=0;run<5;run++){
+ let started=performance.now();const html=rooms.map(row=>renderRoomRow(row,{id:'me'})).join('');const chatRenderMs=performance.now()-started;
+ const load=createExpressiveHistoryLoader();let calls=0;
+ const options={key:'benchmark',version:'session',roomId:room,fetchPage:async(_room,before,limit)=>{calls++;const end=before===null?rows.length:Number(before);return{messages:rows.slice(Math.max(0,end-limit),end),has_older:end>limit};},decode:async row=>({...row,_decrypted:true})};
+ started=performance.now();await load(options).promise;const initialScanMs=performance.now()-started,initialFetches=calls;
+ const update={...rows.at(-1),id:'10000',sender_id:'user-0',created_at:at(10001),text:encodeMessagePayload({version:1,kind:'poll_vote',poll_id:pollId,choices:['yes'],revision:21}),_decrypted:true};
+ started=performance.now();load.reconcile('benchmark',{upserts:[update]});const events=await load(options).promise;const deltaMs=performance.now()-started;
+ started=performance.now();const poll=await reducePoll(origin,events,Date.parse(at(10002)));const reduceMs=performance.now()-started;
+ started=performance.now();const all=mergeMessages(rows,rows.map(row=>({...row,id:'server-'+row.id})));const dedupMs=performance.now()-started;
+ started=performance.now();const window=mergeMessageWindow(rows.slice(0,300),rows.slice(300),{direction:'incoming',atBottom:false});const windowMs=performance.now()-started;
+ if(calls!==100||poll.voters!==500||all.length!==10000||window.messages.length!==300||window.messages[0].id!=='0')throw Error('benchmark_correctness_failed');
+ samples.push({chatRenderMs,htmlBytes:Buffer.byteLength(html),initialScanMs,initialFetches,deltaMs,deltaFetches:calls-initialFetches,retainedEvents:events.length,reduceMs,voters:poll.voters,dedupMs,windowMs,displayedMessages:window.messages.length});
+}
+const median=key=>[...samples].map(sample=>sample[key]).sort((a,b)=>a-b)[2];
+const result={environment:{node:process.version,platform:process.platform,arch:process.arch},workload:{chats:1000,historyMessages:10000,samples:5},median:Object.fromEntries(Object.keys(samples[0]).map(key=>[key,median(key)])),limits:'Node helper timing with synthetic authenticated/decrypted records; no device, browser DOM/layout, network, or scroll FPS acceptance is claimed.',samples};
+console.log(JSON.stringify(result,null,2));

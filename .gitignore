@@ -65,6 +65,8 @@ node_modules/
 __pycache__/
 .expo/
 .gradle/
+**/android/build/
+**/android/.cxx/
 *.apk
 *.aab
 *.log

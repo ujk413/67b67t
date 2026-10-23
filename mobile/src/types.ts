@@ -43,6 +43,7 @@ export type Room = {
 };
 
 export type Message = {
+  is_post?: boolean;
   client_message_id?: string | null;
   edited_at?: string | null;
   delivery?: "queued" | "sending" | "failed";
@@ -59,6 +60,7 @@ export type Message = {
   meta?: Record<string, unknown> | null;
   created_at: string;
   read_by?: string[];
+  listened_by?:string[];
   reply_to?: {
     id?: string;
     text?: string | null;
@@ -76,6 +78,7 @@ export type Message = {
   height?: number | null;
   encrypted_content?: string | null;
   _decrypted?: boolean;
+  _mediaDetails?:import('../../web/media-details.js').MediaDetails;
 };
 
 export type AuthResponse = {

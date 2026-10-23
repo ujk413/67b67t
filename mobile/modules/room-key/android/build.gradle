@@ -26,6 +26,11 @@ def compatibleSignal = tasks.register('compatibleSignal', Jar) {
   exclude 'org/whispersystems/libsignal/fingerprint/FingerprintProtos*'
 }
 dependencies {
+  implementation 'com.facebook.react:react-android'
+  implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+  // Match expo-video's Media3 version to avoid runtime binary conflicts.
+  implementation 'androidx.media3:media3-transformer:1.8.0'
+  implementation 'androidx.media3:media3-effect:1.8.0'
   implementation (findProject(':expo-notifications') ?: 'host.exp.exponent:expo.modules.notifications:55.0.27')
   implementation 'com.google.firebase:firebase-messaging:25.0.1'
   signalProtocol 'org.whispersystems:signal-protocol-java:2.8.1'
@@ -33,4 +38,5 @@ dependencies {
   implementation 'org.whispersystems:curve25519-java:0.5.0'
   implementation 'com.google.protobuf:protobuf-javalite:3.25.9'
   testImplementation 'junit:junit:4.13.2'
+  testImplementation 'org.json:json:20180813'
 }

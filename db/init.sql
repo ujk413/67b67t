@@ -218,6 +218,381 @@ CREATE INDEX IF NOT EXISTS group_sender_keys_inbox_idx ON group_sender_keys(room
 
 CREATE TABLE IF NOT EXISTS hidden_messages (user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, message_id uuid NOT NULL REFERENCES messages(id) ON DELETE CASCADE, created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(user_id,message_id));
 CREATE INDEX IF NOT EXISTS hidden_messages_user_idx ON hidden_messages(user_id);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS listened_by jsonb NOT NULL DEFAULT '[]';
 ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_message_id uuid REFERENCES messages(id) ON DELETE SET NULL;
 ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_at timestamptz;
 ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_by uuid REFERENCES users(id) ON DELETE SET NULL;
+
+-- BEGIN GENERATED REMAINING FEATURE SCHEMA
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by jsonb NOT NULL DEFAULT '[]';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_post boolean NOT NULL DEFAULT false;
+-- Source: api/mobile-schema.sql
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_message_id text;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at timestamptz;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS listened_by jsonb NOT NULL DEFAULT '[]';
+CREATE UNIQUE INDEX IF NOT EXISTS messages_client_id ON messages(sender_id,client_message_id);
+CREATE INDEX IF NOT EXISTS messages_room_order ON messages(room_id,created_at,id);
+CREATE TABLE IF NOT EXISTS room_preferences (
+  user_id uuid REFERENCES users(id) ON DELETE CASCADE,
+  room_id uuid REFERENCES rooms(id) ON DELETE CASCADE,
+  pinned boolean NOT NULL DEFAULT false, muted boolean NOT NULL DEFAULT false,
+  archived boolean NOT NULL DEFAULT false, hidden boolean NOT NULL DEFAULT false,
+  marked_unread boolean NOT NULL DEFAULT false, PRIMARY KEY(user_id,room_id)
+);
+CREATE TABLE IF NOT EXISTS push_devices (
+  installation_id text NOT NULL, user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_id uuid REFERENCES sessions(id) ON DELETE CASCADE,
+  token text NOT NULL, active_room_id uuid, quick_reply boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY(user_id,installation_id)
+);
+ALTER TABLE push_devices ADD COLUMN IF NOT EXISTS quick_reply boolean NOT NULL DEFAULT false;
+-- A physical installation may subscribe several independent accounts.
+DO $push_accounts$
+DECLARE previous_key text;
+BEGIN
+  LOCK TABLE push_devices IN ACCESS EXCLUSIVE MODE;
+  IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='push_devices'::regclass AND contype='p' AND pg_get_constraintdef(oid)='PRIMARY KEY (user_id, installation_id)') THEN
+    SELECT conname INTO previous_key FROM pg_constraint WHERE conrelid='push_devices'::regclass AND contype='p';
+    IF previous_key IS NOT NULL THEN EXECUTE format('ALTER TABLE push_devices DROP CONSTRAINT %I',previous_key);END IF;
+    DELETE FROM push_devices WHERE user_id IS NULL;
+    ALTER TABLE push_devices ADD PRIMARY KEY(user_id,installation_id);
+  END IF;
+END $push_accounts$;
+CREATE INDEX IF NOT EXISTS push_devices_installation ON push_devices(installation_id);
+CREATE TABLE IF NOT EXISTS room_invites (
+  token text PRIMARY KEY, room_id uuid REFERENCES rooms(id) ON DELETE CASCADE,
+  created_by uuid REFERENCES users(id) ON DELETE CASCADE, created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS message_changes (
+  seq bigserial PRIMARY KEY, room_id uuid NOT NULL, message_id uuid NOT NULL,
+  operation text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS message_changes_room_seq ON message_changes(room_id,seq);
+CREATE OR REPLACE FUNCTION track_message_change() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(670024);
+  IF TG_OP='DELETE' THEN
+    INSERT INTO message_changes(room_id,message_id,operation) VALUES(OLD.room_id,OLD.id,'delete');
+    RETURN OLD;
+  END IF;
+  INSERT INTO message_changes(room_id,message_id,operation) VALUES(NEW.room_id,NEW.id,'upsert');
+  IF TG_OP='INSERT' THEN
+    UPDATE room_preferences SET hidden=false WHERE room_id=NEW.room_id;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS messages_sync ON messages;
+CREATE TRIGGER messages_sync AFTER INSERT OR UPDATE OR DELETE ON messages
+  FOR EACH ROW EXECUTE FUNCTION track_message_change();
+
+CREATE TABLE IF NOT EXISTS hidden_messages (user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, message_id uuid NOT NULL REFERENCES messages(id) ON DELETE CASCADE, created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(user_id,message_id));
+CREATE INDEX IF NOT EXISTS hidden_messages_user_idx ON hidden_messages(user_id);
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_message_id uuid REFERENCES messages(id) ON DELETE SET NULL;
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_at timestamptz;
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS pinned_by uuid REFERENCES users(id) ON DELETE SET NULL;
+
+-- Source: api/account-features.sql
+-- Account/privacy services: safe to execute at every boot and on fresh DBs.
+CREATE TABLE IF NOT EXISTS account_contacts (
+ user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ contact_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(),
+ PRIMARY KEY(user_id,contact_id), CHECK(user_id<>contact_id));
+CREATE TABLE IF NOT EXISTS account_privacy (
+ user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ last_seen text NOT NULL DEFAULT 'everyone' CHECK(last_seen IN('everyone','contacts','nobody')),
+ write text NOT NULL DEFAULT 'everyone' CHECK(write IN('everyone','contacts','nobody')),
+ read_receipts boolean NOT NULL DEFAULT true);
+CREATE TABLE IF NOT EXISTS account_security (
+ user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ secret_sealed text, pending_sealed text, pending_until timestamptz,
+ enabled boolean NOT NULL DEFAULT false, approval_required boolean NOT NULL DEFAULT false,
+ last_step bigint NOT NULL DEFAULT -1, failures int NOT NULL DEFAULT 0,
+ locked_until timestamptz, backup_hashes jsonb NOT NULL DEFAULT '[]');
+CREATE TABLE IF NOT EXISTS account_login_audit (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ device_key text, device_name text, ip text, outcome text NOT NULL,
+ created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS account_login_audit_user ON account_login_audit(user_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS account_trusted_devices (
+ user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_hash text NOT NULL,
+ name text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(user_id,device_hash));
+CREATE TABLE IF NOT EXISTS account_auth_challenges (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid REFERENCES users(id) ON DELETE CASCADE,
+ secret_hash text NOT NULL, approval_hash text, kind text NOT NULL CHECK(kind IN('factor','device','handoff')),
+ device_hash text, device_name text, approved boolean NOT NULL DEFAULT false,
+ factor_verified boolean NOT NULL DEFAULT false, failures int NOT NULL DEFAULT 0,
+ expires_at timestamptz NOT NULL DEFAULT now()+interval '2 minutes');
+CREATE INDEX IF NOT EXISTS account_challenge_expiry ON account_auth_challenges(expires_at);
+CREATE TABLE IF NOT EXISTS account_secret_chats (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(), initiator uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ recipient uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, initiator_device text NOT NULL,
+ recipient_device text NOT NULL, ttl int NOT NULL CHECK(ttl BETWEEN 30 AND 86400),
+ created_at timestamptz NOT NULL DEFAULT now(), closed_at timestamptz, CHECK(initiator<>recipient));
+CREATE TABLE IF NOT EXISTS account_secret_mailbox (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(), chat_id uuid NOT NULL REFERENCES account_secret_chats(id) ON DELETE CASCADE,
+ sender_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, nonce text NOT NULL,
+ ciphertext text NOT NULL CHECK(octet_length(ciphertext) BETWEEN 24 AND 65536),
+ created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz NOT NULL,
+ UNIQUE(chat_id,sender_id,nonce));
+CREATE INDEX IF NOT EXISTS account_secret_mailbox_expiry ON account_secret_mailbox(expires_at);
+
+-- Source: api/account-integration.sql
+-- Critical session/device ownership binding. New sessions are unbound until key publication.
+CREATE TABLE IF NOT EXISTS account_session_devices (
+ session_id uuid PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+ user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ device_id text NOT NULL, public_key_hash text NOT NULL,
+ created_at timestamptz NOT NULL DEFAULT now(),
+ FOREIGN KEY(user_id,device_id) REFERENCES user_devices(user_id,device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS account_session_devices_user ON account_session_devices(user_id);
+CREATE TABLE IF NOT EXISTS account_media_purge_jobs (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(), media_id uuid NOT NULL,
+ local_path text,thumb_path text,s3_path text,created_at timestamptz NOT NULL DEFAULT now(),
+ attempts int NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL DEFAULT now(),
+ last_error text, UNIQUE(media_id)
+);
+
+ALTER TABLE account_session_devices ADD COLUMN IF NOT EXISTS proof_verified_at timestamptz;
+CREATE TABLE IF NOT EXISTS account_device_proofs(
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),session_id uuid NOT NULL REFERENCES sessions(id)ON DELETE CASCADE,
+ user_id uuid NOT NULL REFERENCES users(id)ON DELETE CASCADE,device_id text NOT NULL,public_key_hash text NOT NULL,
+ challenge text NOT NULL,expires_at timestamptz NOT NULL DEFAULT now()+interval '2 minutes'
+);
+CREATE INDEX IF NOT EXISTS account_device_proofs_expiry ON account_device_proofs(expires_at);
+CREATE TABLE IF NOT EXISTS account_backup_restores(
+ session_id uuid PRIMARY KEY REFERENCES sessions(id)ON DELETE CASCADE,
+ user_id uuid NOT NULL REFERENCES users(id)ON DELETE CASCADE,
+ device_id text NOT NULL,public_key_hash text NOT NULL,created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Source: api/account-push-policy.sql
+-- Installation capability is device scoped, deliberately independent of accounts.
+CREATE TABLE IF NOT EXISTS account_push_installations (
+  installation_id text PRIMARY KEY,
+  secret_hash text NOT NULL,
+  epoch integer NOT NULL DEFAULT 1 CHECK(epoch>0),
+  paused boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Source: api/conversation-features.sql
+-- Shared by fresh installs and boot migrations. No extensions required.
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS conversation_epoch bigint NOT NULL DEFAULT 0;
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS slow_mode_seconds integer NOT NULL DEFAULT 0;
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS auto_delete_seconds integer NOT NULL DEFAULT 0;
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS public_slug text;
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS public_title text;
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS public_description text NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS rooms_public_slug ON rooms(public_slug) WHERE public_slug IS NOT NULL;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS self_destruct_seconds integer NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS self_destruct_started_at timestamptz;
+CREATE INDEX IF NOT EXISTS messages_expiry ON messages(expires_at) WHERE expires_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS room_pins(room_id uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,message_id uuid NOT NULL REFERENCES messages(id) ON DELETE CASCADE,pinned_by uuid REFERENCES users(id) ON DELETE SET NULL,created_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(room_id,message_id));
+INSERT INTO room_pins(room_id,message_id) SELECT r.id,r.pinned_message_id FROM rooms r JOIN messages m ON m.id=r.pinned_message_id AND m.room_id=r.id ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS encrypted_drafts(user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,room_id uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,revision integer NOT NULL DEFAULT 0,encrypted_content text,updated_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(user_id,room_id));
+CREATE TABLE IF NOT EXISTS message_edit_history(id bigserial PRIMARY KEY,message_id uuid NOT NULL REFERENCES messages(id) ON DELETE CASCADE,encrypted_content text NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS message_edit_history_message ON message_edit_history(message_id,id);
+CREATE TABLE IF NOT EXISTS scheduled_messages(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),room_id uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_content text NOT NULL,send_at timestamptz NOT NULL,kind text NOT NULL DEFAULT 'message' CHECK(kind IN ('message','reminder')),epoch bigint NOT NULL,status text NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','due','cancelled','needs_reencrypt')),message_id uuid REFERENCES messages(id) ON DELETE SET NULL,created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS scheduled_messages_due ON scheduled_messages(send_at) WHERE status='pending';
+ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS last_error text;
+CREATE INDEX IF NOT EXISTS scheduled_messages_retry ON scheduled_messages(next_attempt_at,send_at) WHERE status='pending';
+CREATE TABLE IF NOT EXISTS conversation_send_limits(room_id uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,last_sent_at timestamptz NOT NULL,last_hash text NOT NULL,PRIMARY KEY(room_id,user_id));
+CREATE TABLE IF NOT EXISTS chat_folders(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,title text NOT NULL,room_ids jsonb NOT NULL DEFAULT '[]',created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE chat_folders ADD COLUMN IF NOT EXISTS position integer NOT NULL DEFAULT 0;
+ALTER TABLE chat_folders ADD COLUMN IF NOT EXISTS revision integer NOT NULL DEFAULT 0;
+ALTER TABLE chat_folders ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+CREATE OR REPLACE FUNCTION conversation_epoch_changed() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF TG_OP='DELETE' THEN UPDATE rooms SET conversation_epoch=conversation_epoch+1 WHERE id=OLD.room_id; RETURN OLD; END IF;
+ UPDATE rooms SET conversation_epoch=conversation_epoch+1 WHERE id=NEW.room_id; RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS conversation_members_epoch ON room_members;
+CREATE TRIGGER conversation_members_epoch AFTER INSERT OR DELETE ON room_members FOR EACH ROW EXECUTE FUNCTION conversation_epoch_changed();
+CREATE OR REPLACE FUNCTION conversation_e2e_changed() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF NEW.e2e_enabled IS DISTINCT FROM OLD.e2e_enabled THEN NEW.conversation_epoch=OLD.conversation_epoch+1; END IF; RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS conversation_e2e_epoch ON rooms;
+CREATE TRIGGER conversation_e2e_epoch BEFORE UPDATE OF e2e_enabled ON rooms FOR EACH ROW EXECUTE FUNCTION conversation_e2e_changed();
+CREATE OR REPLACE FUNCTION conversation_capture_edit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF OLD.encrypted_content IS NOT NULL AND OLD.encrypted_content IS DISTINCT FROM NEW.encrypted_content THEN
+ INSERT INTO message_edit_history(message_id,encrypted_content) VALUES(OLD.id,jsonb_build_object('v',1,'body',jsonb_build_object('encrypted_content',OLD.encrypted_content,'meta',jsonb_build_object('e2e_group',OLD.meta->'e2e_group','v',OLD.meta->'v')))::text);
+ ELSIF OLD.encrypted_content IS NULL AND OLD.meta->>'encrypted'='true' AND (OLD.text IS DISTINCT FROM NEW.text OR OLD.meta->>'iv' IS DISTINCT FROM NEW.meta->>'iv') THEN
+ INSERT INTO message_edit_history(message_id,encrypted_content) VALUES(OLD.id,jsonb_build_object('v',1,'body',jsonb_build_object('text',OLD.text,'meta',jsonb_build_object('encrypted',true,'e2ee_v',OLD.meta->'e2ee_v','iv',OLD.meta->'iv')))::text);
+ END IF; RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS conversation_edit_history ON messages;
+CREATE TRIGGER conversation_edit_history BEFORE UPDATE OF encrypted_content,text,meta ON messages FOR EACH ROW EXECUTE FUNCTION conversation_capture_edit();
+CREATE OR REPLACE FUNCTION conversation_start_self_destruct() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF NEW.self_destruct_seconds>0 AND OLD.self_destruct_started_at IS NULL AND EXISTS(SELECT 1 FROM jsonb_array_elements_text(COALESCE(NEW.read_by,'[]'::jsonb)) AS reader(value) WHERE reader.value<>NEW.sender_id::text) THEN
+ NEW.self_destruct_started_at=clock_timestamp(); NEW.expires_at=LEAST(NEW.expires_at,NEW.self_destruct_started_at+make_interval(secs=>NEW.self_destruct_seconds));
+ END IF; RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS conversation_read_expiry ON messages;
+CREATE TRIGGER conversation_read_expiry BEFORE UPDATE OF read_by ON messages FOR EACH ROW EXECUTE FUNCTION conversation_start_self_destruct();
+CREATE OR REPLACE FUNCTION conversation_legacy_pin() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+ IF NEW.pinned_message_id IS DISTINCT FROM OLD.pinned_message_id AND NEW.pinned_message_id IS NOT NULL THEN
+ INSERT INTO room_pins(room_id,message_id) SELECT NEW.id,NEW.pinned_message_id WHERE EXISTS(SELECT 1 FROM messages WHERE id=NEW.pinned_message_id AND room_id=NEW.id) ON CONFLICT DO NOTHING;
+ ELSIF NEW.pinned_message_id IS NULL AND OLD.pinned_message_id IS NOT NULL THEN DELETE FROM room_pins WHERE room_id=NEW.id AND message_id=OLD.pinned_message_id;
+ END IF; RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS conversation_legacy_pin_sync ON rooms;
+CREATE TRIGGER conversation_legacy_pin_sync AFTER UPDATE OF pinned_message_id ON rooms FOR EACH ROW EXECUTE FUNCTION conversation_legacy_pin();
+CREATE OR REPLACE FUNCTION conversation_guard_send() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE settings rooms%ROWTYPE; previous conversation_send_limits%ROWTYPE; actor_role text; fingerprint text;
+BEGIN
+ IF NEW.client_message_id IS NOT NULL AND EXISTS(SELECT 1 FROM messages WHERE sender_id=NEW.sender_id AND client_message_id=NEW.client_message_id) THEN RETURN NEW; END IF;
+ SELECT * INTO settings FROM rooms WHERE id=NEW.room_id FOR UPDATE;
+ SELECT role INTO actor_role FROM room_members WHERE room_id=NEW.room_id AND user_id=NEW.sender_id;
+ IF actor_role IS NULL THEN RAISE EXCEPTION 'not_member' USING ERRCODE='42501'; END IF;
+ IF NEW.type<>'call' THEN
+ fingerprint=md5(COALESCE(NEW.encrypted_content,NEW.text,'') || ':' || COALESCE(NEW.meta::text,'') || ':' || COALESCE(to_jsonb(NEW)->>'media_id',''));
+ SELECT * INTO previous FROM conversation_send_limits WHERE room_id=NEW.room_id AND user_id=NEW.sender_id;
+ IF actor_role NOT IN ('owner','admin') AND previous.last_sent_at + make_interval(secs=>settings.slow_mode_seconds)>clock_timestamp() THEN RAISE EXCEPTION 'slow_mode' USING ERRCODE='P0001'; END IF;
+ IF previous.last_hash=fingerprint AND previous.last_sent_at + interval '10 seconds'>clock_timestamp() THEN RAISE EXCEPTION 'duplicate_spam' USING ERRCODE='P0001'; END IF;
+ INSERT INTO conversation_send_limits(room_id,user_id,last_sent_at,last_hash) VALUES(NEW.room_id,NEW.sender_id,clock_timestamp(),fingerprint) ON CONFLICT(room_id,user_id) DO UPDATE SET last_sent_at=EXCLUDED.last_sent_at,last_hash=EXCLUDED.last_hash;
+ END IF;
+ IF settings.auto_delete_seconds>0 THEN NEW.expires_at=clock_timestamp()+make_interval(secs=>settings.auto_delete_seconds); END IF;
+ IF NEW.meta ? 'self_destruct_seconds' THEN
+ IF NEW.meta->>'self_destruct_seconds' !~ '^[0-9]{1,6}$' THEN RAISE EXCEPTION 'bad_self_destruct_seconds'; END IF;
+ NEW.self_destruct_seconds=(NEW.meta->>'self_destruct_seconds')::integer;
+ END IF;
+ IF NEW.self_destruct_seconds<0 OR NEW.self_destruct_seconds>604800 THEN RAISE EXCEPTION 'bad_self_destruct_seconds'; END IF;
+ RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS conversation_message_guard ON messages;
+CREATE TRIGGER conversation_message_guard BEFORE INSERT ON messages FOR EACH ROW EXECUTE FUNCTION conversation_guard_send();
+
+-- Source: api/expressive-features.sql
+-- Apply to fresh databases and as an idempotent startup migration.
+-- Polls, answers, votes and coordinates intentionally have NO server tables.
+CREATE TABLE IF NOT EXISTS expressive_packs (
+ id uuid PRIMARY KEY, owner_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ title text NOT NULL CHECK (length(title) BETWEEN 1 AND 100),
+ tags text[] NOT NULL DEFAULT '{}', visibility text NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','public')),
+ created_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS expressive_packs_owner ON expressive_packs(owner_id) WHERE deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS expressive_installed_packs (
+ user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ pack_id uuid NOT NULL REFERENCES expressive_packs(id) ON DELETE CASCADE,
+ added_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(user_id,pack_id)
+);
+CREATE TABLE IF NOT EXISTS expressive_catalog (
+ id uuid PRIMARY KEY, pack_id uuid NOT NULL REFERENCES expressive_packs(id) ON DELETE CASCADE,
+ media_id uuid NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+ kind text NOT NULL CHECK (kind IN ('sticker','gif')), label text NOT NULL DEFAULT '', tags text[] NOT NULL DEFAULT '{}',
+ created_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz,
+ UNIQUE(pack_id,media_id)
+);
+CREATE INDEX IF NOT EXISTS expressive_catalog_media ON expressive_catalog(media_id) WHERE deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS expressive_recent (
+ user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ item_id uuid NOT NULL REFERENCES expressive_catalog(id) ON DELETE CASCADE,
+ used_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(user_id,item_id)
+);
+CREATE TABLE IF NOT EXISTS expressive_dice (
+ id uuid PRIMARY KEY, room_id uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+ sender_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ value smallint NOT NULL CHECK (value BETWEEN 1 AND 6), created_at timestamptz NOT NULL DEFAULT now(),
+ message_id uuid UNIQUE REFERENCES messages(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS expressive_dice_recent ON expressive_dice(sender_id,created_at DESC);
+-- Certificates cannot be rerolled after issuance. Only binding to a message is mutable.
+CREATE OR REPLACE FUNCTION expressive_dice_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NEW.id<>OLD.id OR NEW.room_id<>OLD.room_id OR NEW.sender_id<>OLD.sender_id OR NEW.value<>OLD.value OR NEW.created_at<>OLD.created_at THEN
+  RAISE EXCEPTION 'immutable_dice';
+ END IF;
+ IF OLD.message_id IS NOT NULL AND NEW.message_id IS DISTINCT FROM OLD.message_id THEN
+  RAISE EXCEPTION 'immutable_dice_binding';
+ END IF;
+ RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS expressive_dice_immutable_trigger ON expressive_dice;
+CREATE TRIGGER expressive_dice_immutable_trigger BEFORE UPDATE ON expressive_dice FOR EACH ROW EXECUTE FUNCTION expressive_dice_immutable();
+CREATE OR REPLACE FUNCTION expressive_dice_message_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF EXISTS(SELECT 1 FROM expressive_dice WHERE message_id=OLD.id) AND
+   (NEW.text IS DISTINCT FROM OLD.text OR NEW.encrypted_content IS DISTINCT FROM OLD.encrypted_content OR NEW.meta IS DISTINCT FROM OLD.meta OR NEW.room_id<>OLD.room_id OR NEW.sender_id<>OLD.sender_id) THEN
+  RAISE EXCEPTION 'immutable_dice_message';
+ END IF;
+ RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS expressive_dice_message_trigger ON messages;
+CREATE TRIGGER expressive_dice_message_trigger BEFORE UPDATE ON messages FOR EACH ROW EXECUTE FUNCTION expressive_dice_message_immutable();
+
+-- Source: api/call-features.sql
+CREATE TABLE IF NOT EXISTS call_history (
+ id uuid PRIMARY KEY, room_id uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+ caller_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ callee_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ is_video boolean NOT NULL DEFAULT false,
+ started_at timestamptz NOT NULL, answered_at timestamptz, ended_at timestamptz,
+ duration_ms bigint NOT NULL DEFAULT 0,
+ status text NOT NULL DEFAULT 'ringing' CHECK(status IN ('ringing','active','completed','missed','rejected','busy','cancelled','interrupted')),
+ reason text
+);
+CREATE INDEX IF NOT EXISTS call_history_caller_time ON call_history(caller_id,started_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS call_history_callee_time ON call_history(callee_id,started_at DESC,id DESC);
+CREATE TABLE IF NOT EXISTS group_call_leases (
+ user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ room_id uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+ expires_at timestamptz NOT NULL
+);
+ALTER TABLE group_call_leases ADD COLUMN IF NOT EXISTS lease_id uuid NOT NULL DEFAULT gen_random_uuid();
+-- Deliberately no session FK: deleting a session must not erase the SFU lease
+-- before the revocation hook has disconnected its participant.
+ALTER TABLE group_call_leases ADD COLUMN IF NOT EXISTS session_id uuid;
+ALTER TABLE group_call_leases ADD COLUMN IF NOT EXISTS revoking_at timestamptz;
+
+-- Source: api/quality-features.sql
+CREATE TABLE IF NOT EXISTS quality_preferences (
+  user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  language text NOT NULL DEFAULT 'ru' CHECK(language IN ('ru','en')),
+  quiet_enabled boolean NOT NULL DEFAULT false,
+  quiet_start text NOT NULL DEFAULT '22:00',
+  quiet_end text NOT NULL DEFAULT '08:00',
+  time_zone text NOT NULL DEFAULT 'Europe/Moscow',
+  group_notifications boolean NOT NULL DEFAULT true,
+  download_policy jsonb NOT NULL DEFAULT '{"wifi":{"image":true,"video":false,"voice":true,"file":false},"mobile":{"image":false,"video":false,"voice":false,"file":false}}'::jsonb,
+  cache_max_mb integer NOT NULL DEFAULT 256 CHECK(cache_max_mb BETWEEN 64 AND 2048),
+  wallpaper text NOT NULL DEFAULT 'plain' CHECK(wallpaper IN ('plain','dots','mesh')),
+  accent text NOT NULL DEFAULT 'emerald' CHECK(accent IN ('emerald','blue','violet')),
+  crash_consent boolean NOT NULL DEFAULT false,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS quality_crash_reports (
+  id uuid PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  platform text NOT NULL,
+  code text NOT NULL,
+  component text NOT NULL,
+  app_version text NOT NULL,
+  occurred_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS quality_crash_user_created ON quality_crash_reports(user_id,created_at DESC);
+ALTER TABLE IF EXISTS push_devices ADD COLUMN IF NOT EXISTS quick_reply boolean NOT NULL DEFAULT false;
+
+-- Source: api/web-push.js webPushSchema
+CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+  endpoint text NOT NULL, user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  subscription jsonb NOT NULL, active_room_id uuid, updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY(user_id,endpoint)
+);
+DO $web_push_accounts$
+DECLARE previous_key text;
+BEGIN
+  LOCK TABLE web_push_subscriptions IN ACCESS EXCLUSIVE MODE;
+  IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='web_push_subscriptions'::regclass AND contype='p' AND pg_get_constraintdef(oid)='PRIMARY KEY (user_id, endpoint)') THEN
+    SELECT conname INTO previous_key FROM pg_constraint WHERE conrelid='web_push_subscriptions'::regclass AND contype='p';
+    IF previous_key IS NOT NULL THEN EXECUTE format('ALTER TABLE web_push_subscriptions DROP CONSTRAINT %I',previous_key);END IF;
+    ALTER TABLE web_push_subscriptions ADD PRIMARY KEY(user_id,endpoint);
+  END IF;
+END $web_push_accounts$;
+CREATE INDEX IF NOT EXISTS web_push_user ON web_push_subscriptions(user_id);

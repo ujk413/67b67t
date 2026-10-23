@@ -3,7 +3,7 @@ import * as SecureStore from "expo-secure-store";
 import type { Message, Room } from "../types";
 export type Draft = { text: string; reply?: Message | null };
 export type Outgoing = {
-  upload?: {uri:string;name:string;mime:string;prepared?:{uri:string;meta:Record<string,unknown>}};
+  upload?: {uri:string;name:string;mime:string;details?:import('../../../web/media-details.js').MediaDetails;prepared?:{uri:string;meta:Record<string,unknown>}};
   createdAt?: string;
   id: string;
   roomId: string;
@@ -18,7 +18,20 @@ export function newId() {
   crypto.getRandomValues(b);
   return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
+export type RepositoryMessagesChange={upserts?:Message[];removed?:string[];reset?:boolean;roomIds?:string[]};
 export class AccountRepository {
+  private messageObservers=new Set<(change:RepositoryMessagesChange)=>void|Promise<void>>();
+  observeMessages(listener:(change:RepositoryMessagesChange)=>void|Promise<void>){
+    if(this.closed)throw Error('Хранилище закрыто');
+    if(this.messageObservers.size>=16)throw Error('Слишком много наблюдателей хранилища');
+    this.messageObservers.add(listener);return()=>{this.messageObservers.delete(listener);};
+  }
+  private emitMessages(change:RepositoryMessagesChange){
+    if(!this.messageObservers.size)return;
+    const freeze=(value:any):any=>{if(value&&typeof value==='object'){for(const child of Object.values(value))freeze(child);Object.freeze(value);}return value;};
+    const snapshot=freeze(JSON.parse(JSON.stringify(change))) as RepositoryMessagesChange;
+    for(const listener of this.messageObservers)try{const result=listener(snapshot);if(result&&typeof result.catch==='function')void result.catch(()=>{});}catch{/* Observers cannot roll back a committed write. */}
+  }
   private db: SQLite.SQLiteDatabase | null = null;
   private pending: Promise<void> | null = null;
   private closed = false;
@@ -34,14 +47,15 @@ export class AccountRepository {
     this.sequence = task.catch(() => {});
     return task;
   }
-  private async transaction(
+  private async transaction<T>(
     db: SQLite.SQLiteDatabase,
-    action: (db: SQLite.SQLiteDatabase) => Promise<void>,
+    action: (db: SQLite.SQLiteDatabase) => Promise<T>,
   ) {
     await db.execAsync("BEGIN IMMEDIATE");
     try {
-      await action(db);
+      const result=await action(db);
       await db.execAsync("COMMIT");
+      return result;
     } catch (error) {
       await db.execAsync("ROLLBACK");
       throw error;
@@ -117,14 +131,50 @@ export class AccountRepository {
       );
     });
   }
+  async update<T>(key:string,fallback:T,change:(value:T)=>T) {
+    return this.access(async db=>{
+      const row=await db.getFirstAsync<{value:string}>('SELECT value FROM kv WHERE key=?',key);
+      const value=change(row?JSON.parse(row.value):fallback);
+      await db.runAsync('INSERT OR REPLACE INTO kv VALUES(?,?)',key,JSON.stringify(value));return value;
+    });
+  }
+  async exportKeyState():Promise<Record<string,unknown>> {
+    return this.access(async db=>{
+      const rows=await db.getAllAsync<{key:string;value:string}>("SELECT key,value FROM kv WHERE (key LIKE 'group:%' OR key LIKE 'e2e:%') AND key NOT LIKE 'group:%:plain:%'");
+      return Object.fromEntries(rows.map(row=>[row.key,JSON.parse(row.value)]));
+    });
+  }
+  validateKeyState(state:unknown) {
+    if(!state || typeof state!=='object' || Array.isArray(state))throw Error('Некорректная копия ключей групп');
+    const entries=Object.entries(state);
+    if(entries.length>20000 || JSON.stringify(state).length>16*1024*1024 || entries.some(([key,value])=>!(/^(group|e2e):[a-f0-9-]{36}(?::[^\s\x00-\x1f]{1,256})?$/i.test(key)) || key.includes(':plain:') || value===null || typeof value!=='object' || Array.isArray(value)))throw Error('Некорректная копия ключей групп');
+    return entries;
+  }
+  async importKeyState(state:unknown) {
+    const entries=this.validateKeyState(state);
+    await this.access(async db=>this.transaction(db,async tx=>{
+      for(const [key,value] of entries)await tx.runAsync('INSERT OR REPLACE INTO kv VALUES(?,?)',key,JSON.stringify(value));
+    }));
+  }
+  async replaceKeyState(state:unknown) {
+    const entries=this.validateKeyState(state);
+    await this.access(async db=>this.transaction(db,async tx=>{
+      await tx.runAsync("DELETE FROM kv WHERE key LIKE 'group:%' OR key LIKE 'e2e:%'");
+      for(const [key,value]of entries)await tx.runAsync('INSERT OR REPLACE INTO kv VALUES(?,?)',key,JSON.stringify(value));
+    }));
+  }
   async rooms() {
     return this.get<Room[]>("rooms", []);
+  }
+  async drafts():Promise<Record<string,Draft>> {
+    return this.access(async db=>Object.fromEntries((await db.getAllAsync<{key:string;value:string}>("SELECT key,value FROM kv WHERE key LIKE 'draft:%'")).map(row=>[row.key.slice(6),JSON.parse(row.value)])));
   }
   async saveRooms(rooms: Room[]) {
     return this.set("rooms", rooms);
   }
   async saveMessages(items: Message[]) {
     return this.access(async (db) => {
+      const written:Message[]=[];
       await this.transaction(db, async (tx) => {
         for (const m of items) {
           if(this.tombstones.has(m.id))continue;
@@ -150,8 +200,10 @@ export class AccountRepository {
               m.room_id,
               m.text || "",
             );
+          written.push(m);
         }
       });
+      this.emitMessages({upserts:written});
     });
   }
   async messages(roomId: string, limit = 100) {
@@ -170,6 +222,7 @@ export class AccountRepository {
         await tx.runAsync("DELETE FROM messages WHERE id=?", id);
         await tx.runAsync("DELETE FROM search WHERE id=?", id);
       });
+      this.emitMessages({removed:[id]});
     });
   }
   async hideMessage(id:string) {
@@ -178,7 +231,7 @@ export class AccountRepository {
       await tx.runAsync('INSERT OR IGNORE INTO hidden_messages_local(id)VALUES(?)',id);
       await tx.runAsync('DELETE FROM messages WHERE id=?',id);
       await tx.runAsync('DELETE FROM search WHERE id=?',id);
-    }));
+    })).then(()=>{this.emitMessages({removed:[id]});});
   }
   isHidden(id:string) {return this.tombstones.has(id);}
   async visibleMessages(items:Message[]) {
@@ -226,6 +279,7 @@ export class AccountRepository {
           }
         }
       });
+      this.emitMessages({roomIds:ids});
     });
   }
   async search(query: string, roomId?: string) {
@@ -270,6 +324,7 @@ export class AccountRepository {
       const key=`attachments:${item.roomId}`;
       const row=await tx.getFirstAsync<{value:string}>('SELECT value FROM kv WHERE key=?',key);
       if(row){const draft=JSON.parse(row.value);draft.items=(draft.items || []).filter((file:{id:string})=>file.id!==item.id);await tx.runAsync('UPDATE kv SET value=? WHERE key=?',JSON.stringify(draft),key);}
+      return !delivered&&!queued;
     }));
   }
   async removeOutgoing(id: string) {
@@ -283,6 +338,7 @@ export class AccountRepository {
         "DELETE FROM messages;DELETE FROM search;DELETE FROM kv WHERE key LIKE 'scan:%' OR key LIKE 'group:%:plain:%';",
       );
       await db.execAsync("PRAGMA wal_checkpoint(TRUNCATE);VACUUM;");
+      this.emitMessages({reset:true});
     });
   }
   async clearAll() {
@@ -290,6 +346,7 @@ export class AccountRepository {
       await db.execAsync(
         "DELETE FROM messages;DELETE FROM search;DELETE FROM outbox;DELETE FROM kv;",
       );
+      this.emitMessages({reset:true});
     });
   }
   async privateFiles() {
@@ -303,7 +360,7 @@ export class AccountRepository {
           ? value?.uri
             ? [value.uri]
             : []
-          : (value?.items || []).map((item: { uri: string }) => item.uri);
+          : (value?.items || []).flatMap((item: { uri: string;original?:{uri:string} }) => [item.uri,...(item.original?[item.original.uri]:[])]);
       }) as string[];
       const queued=await db.getAllAsync<{data:string}>('SELECT data FROM outbox');
       return [...new Set([...drafts,...queued.flatMap(row=>{
@@ -325,6 +382,7 @@ export class AccountRepository {
   }
   close(): Promise<void> {
     if(this.closing)return this.closing;
+    this.emitMessages({reset:true});this.messageObservers.clear();
     this.closed = true;
     this.closing=(async()=>{
       await this.sequence;

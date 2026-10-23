@@ -1,5 +1,7 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { useTheme } from "../ThemeProvider";
 import { useState } from "react";
+import {TransportSettings} from '../features/TransportSettings';
 import {
   ActivityIndicator,
   Pressable,
@@ -20,6 +22,7 @@ type AuthScreenProps = {
   onChangeUsername: (text: string) => void;
   onChangePassword: (text: string) => void;
   onSubmit: () => void;
+  onQR?:()=>void;
 };
 
 export function AuthScreen({
@@ -32,15 +35,18 @@ export function AuthScreen({
   onChangeUsername,
   onChangePassword,
   onSubmit,
+  onQR,
 }: AuthScreenProps) {
   const styles = useStyles();
   const { colors: telegramColors } = useTheme();
+  const [network,setNetwork]=useState(false);
+  if(network)return <TransportSettings onClose={()=>setNetwork(false)}/>;
 
   return (
     <View style={styles.container}>
       <View style={styles.card}>
         <Text style={styles.brand}>67</Text>
-        <Text style={styles.subtitle}>Личные сообщения и звонки</Text>
+        <Text style={styles.subtitle}>{uiText("Личные сообщения и звонки")}</Text>
 
         <View style={styles.modeRow}>
           <Pressable
@@ -57,8 +63,7 @@ export function AuthScreen({
                 authMode === "login" && styles.modeButtonTextActive,
               ]}
             >
-              Вход
-            </Text>
+              {uiText("Вход")}</Text>
           </Pressable>
           <Pressable
             style={[
@@ -74,8 +79,7 @@ export function AuthScreen({
                 authMode === "register" && styles.modeButtonTextActive,
               ]}
             >
-              Регистрация
-            </Text>
+              {uiText("Регистрация")}</Text>
           </Pressable>
         </View>
 
@@ -83,7 +87,7 @@ export function AuthScreen({
           style={styles.input}
           value={username}
           onChangeText={onChangeUsername}
-          placeholder="Имя пользователя"
+          placeholder={uiText("Имя пользователя")}
           placeholderTextColor={telegramColors.composer.hint}
           autoCapitalize="none"
           autoCorrect={false}
@@ -94,7 +98,7 @@ export function AuthScreen({
           style={styles.input}
           value={password}
           onChangeText={onChangePassword}
-          placeholder="Пароль"
+          placeholder={uiText("Пароль")}
           placeholderTextColor={telegramColors.composer.hint}
           secureTextEntry
           editable={!busy}
@@ -114,10 +118,12 @@ export function AuthScreen({
             />
           ) : (
             <Text style={styles.buttonText}>
-              {authMode === "login" ? "Войти" : "Создать аккаунт"}
+              {authMode === "login" ? uiText("Войти") : uiText("Создать аккаунт")}
             </Text>
           )}
         </Pressable>
+        {authMode==='login'&&onQR&&<Pressable accessibilityRole="button" onPress={onQR} disabled={busy} style={{padding:14,minHeight:48}}><Text style={{color:telegramColors.text.blue,textAlign:'center'}}>{uiText("Войти по QR-коду")}</Text></Pressable>}
+        <Pressable accessibilityRole="button" onPress={()=>setNetwork(true)} disabled={busy} style={{padding:14,minHeight:48}}><Text style={{color:telegramColors.text.blue,textAlign:'center'}}>{uiText("Сеть, прокси и Tor")}</Text></Pressable>
       </View>
     </View>
   );

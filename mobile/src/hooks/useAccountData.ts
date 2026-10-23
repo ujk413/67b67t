@@ -1,3 +1,4 @@
+import {expressiveHistoryLoader,expressiveHistoryKey,expressiveHistoryPrefix} from '../../../web/expressive-event-history.js';
 import { useEffect, useRef, useState } from "react";
 import { addNetworkStateListener } from "expo-network";
 import { AppState } from "react-native";
@@ -8,7 +9,7 @@ import {
   type Outgoing,
 } from "../data/repository";
 import { Outbox } from "../data/outbox";
-import { mergeMessages } from "../data/messages";
+import {mergeDisplayMessages as mergeMessages,mergeDisplayWindow,clearMessageWindows,updateMessageWindowPage} from "../data/messages";
 import { api } from "../api";
 import { mobileApi, type History } from "../mobileApi";
 import { encryptRoomText } from "../roomCrypto";
@@ -19,6 +20,7 @@ type Params = {
   upload?: ProtectedUploader;
   me: User | null;
   token: string | null;
+  activationGeneration?: number;
   baseUrl: string;
   activeRoomId: string | null;
   decode: (m: Message) => Promise<Message>;
@@ -33,12 +35,13 @@ export function useAccountData(params: Params) {
   const latest = useRef(params);
   const repository = useRef<AccountRepository | null>(null),
     outbox = useRef<Outbox | null>(null);
+  const repositoryGeneration = useRef<number | null>(null);
   latest.current = {...params,onMessages: update=>params.onMessages(previous=>{
     const messages=typeof update==='function'?update(previous):update;
     return messages.filter(message=>!repository.current?.isHidden(message.id));
   })};
   const generation = useRef(0),
-    syncing = useRef(false);
+    syncing = useRef<AccountRepository|null>(null);
   const [ready, setReady] = useState(false),
     [history, setHistory] = useState<History | null>(null);
   const [loading, setLoading] = useState(false),
@@ -49,7 +52,28 @@ export function useAccountData(params: Params) {
     if (!params.me || !params.token) return;
     const repo = new AccountRepository(params.me.id);
     repository.current = repo;
+    repositoryGeneration.current = params.activationGeneration ?? null;
     let active = true;
+    const historyPrefix=expressiveHistoryPrefix(params.me.id,params.baseUrl,params.token);
+    let eventTimer:ReturnType<typeof setTimeout>|null=null;
+    const eventUpserts=new Map<string,Message>(),eventRemoved=new Set<string>();
+    const unsubscribeEvents=repo.observeMessages(change=>{
+      if(!active)return;
+      if(change.reset){expressiveHistoryLoader.clear(historyPrefix);return;}
+      if(change.roomIds)expressiveHistoryLoader.prune(historyPrefix,change.roomIds);
+      for(const id of change.removed||[]){eventRemoved.add(id);eventUpserts.delete(id);}
+      for(const row of change.upserts||[])if(!eventRemoved.has(row.id))eventUpserts.set(row.id,row);
+      if(eventTimer)return;
+      eventTimer=setTimeout(()=>{
+        eventTimer=null;if(!active)return;
+        try{
+          expressiveHistoryLoader.removeMessages(historyPrefix,[...eventRemoved]);
+          const rooms=new Map<string,Message[]>();for(const row of eventUpserts.values()){if(!rooms.has(row.room_id))rooms.set(row.room_id,[]);rooms.get(row.room_id)!.push(row);}
+          for(const [room,rows] of rooms)expressiveHistoryLoader.reconcile(expressiveHistoryKey(params.me!.id,params.baseUrl,params.token!,room),{upserts:rows});
+        }catch(error){latest.current.onError(String((error as Error).message||error));}
+        eventRemoved.clear();eventUpserts.clear();
+      },16);
+    });
     let serverReady = false;
     const notify = (item: Outgoing, message?: Message) => {
       const p = latest.current;
@@ -175,30 +199,41 @@ export function useAccountData(params: Params) {
       }
     }, 30000);
     return () => {
-      active = false;
+      active = false;clearMessageWindows();unsubscribeEvents();if(eventTimer)clearTimeout(eventTimer);eventUpserts.clear();eventRemoved.clear();
+      expressiveHistoryLoader.clear(expressiveHistoryPrefix(params.me!.id,params.baseUrl,params.token!));
       generation.current++;
       network.remove();
       clearInterval(timer);
       queue.stop();
       setReady(false);
       repository.current = null;
+      repositoryGeneration.current = null;
       outbox.current = null;
       void repo.close();
     };
-  }, [params.me?.id, params.token]);
+  }, [params.me?.id, params.token,params.baseUrl,params.activationGeneration]);
   async function sync() {
     const repo = repository.current,
       p = latest.current;
-    if (!repo || !p.token || syncing.current) return;
-    syncing.current = true;
+    if (!repo || !p.token || syncing.current===repo) return;
+    syncing.current = repo;
     setSyncStatus('syncing');
     try {
+      const receipts=await repo.get<Record<string,{room:string;message:string}>>('pending-listened',{});
+      for(const [key,receipt] of Object.entries(receipts)) {
+        if(repository.current!==repo)return;
+        let remove=false;
+        try{await api.listened(p.baseUrl,p.token,receipt.room,receipt.message);remove=true;}
+        catch(error){remove=[403,404].includes((error as {status:number}).status);}
+        if(remove)await repo.update<Record<string,unknown>>('pending-listened',{},values=>{delete values[key];return values;});
+      }
       let cursor = await repo.get("sync", "0"),
         more = true;
       while (more && repository.current === repo) {
         const result = await mobileApi(p.baseUrl, p.token).sync(cursor);
         if (repository.current !== repo) return;
         await repo.pruneRooms(result.room_ids);
+        expressiveHistoryLoader.prune(expressiveHistoryPrefix(p.me!.id,p.baseUrl,p.token),result.room_ids);
         latest.current.onRooms((prev) =>
           prev.filter((room) => result.room_ids.includes(room.id)),
         );
@@ -234,14 +269,15 @@ export function useAccountData(params: Params) {
         await repo.set("sync", cursor);
         more = result.has_more;
       }
-      setSyncStatus('idle');
+      if(repository.current===repo)setSyncStatus('idle');
     } catch {
       if(repository.current===repo)setSyncStatus('error');
     } finally {
-      syncing.current = false;
+      if(syncing.current===repo)syncing.current = null;
     }
   }
   async function open(room: Room) {
+    clearMessageWindows(room.id);
     const mine = ++generation.current,
       p = latest.current,
       repo = repository.current;
@@ -288,6 +324,7 @@ export function useAccountData(params: Params) {
           );
         } catch {}
       if (mine !== generation.current) return;
+      updateMessageWindowPage(room.id,page);
       setHistory({ ...page, messages: decoded });
       p.onMessages(mergeMessages(decoded, outgoing));
     } catch (e) {
@@ -312,7 +349,7 @@ export function useAccountData(params: Params) {
       if (mine !== generation.current) return;
       await repo?.saveMessages(decoded);
       if(repo)decoded=await repo.visibleMessages(decoded);
-      p.onMessages((prev) => mergeMessages(decoded, prev));
+      p.onMessages((prev) => {const rows=mergeDisplayWindow(prev,decoded,'older');updateMessageWindowPage(id,page,'older');return rows;});
       setHistory((prev) =>
         prev ? { ...prev, has_older: page.has_older } : page,
       );
@@ -341,11 +378,11 @@ export function useAccountData(params: Params) {
       state: "queued",
       body,
     };
-    if(body?.__upload) {
+    if(body) {
       item.upload=body.__upload as Outgoing['upload'];
-      const {__upload,__queue_id,...wire}=body;item.body=wire;
+      const {__upload,__queue_id,...wire}=body;item.body=Object.keys(wire).length?wire:undefined;
     }
-    if(item.upload)await repo.enqueueMedia(item);else await repo.putOutgoing(item);
+    const inserted=await repo.enqueueMedia(item);if(!inserted)return;
     if (latest.current.activeRoomId === item.roomId) {
       p.onMessages((prev) =>
         mergeMessages(prev, [pendingMessage(item, p.me!.id)]),
@@ -375,6 +412,7 @@ export function useAccountData(params: Params) {
     if (latest.current.activeRoomId !== roomId) return;
     await repository.current?.saveMessages(decoded);
     if(repository.current)decoded=await repository.current.visibleMessages(decoded);
+    clearMessageWindows(roomId);updateMessageWindowPage(roomId,page);
     setHistory({ ...page, messages: decoded });
     p.onMessages(decoded);
     return id;
@@ -389,13 +427,14 @@ export function useAccountData(params: Params) {
     if (mine !== generation.current) return;
     await repository.current?.saveMessages(decoded);
     if(repository.current)decoded=await repository.current.visibleMessages(decoded);
-    p.onMessages((prev) => mergeMessages(prev, decoded));
+    p.onMessages((prev) => {const rows=mergeDisplayWindow(prev,decoded,'newer');updateMessageWindowPage(id,page,'newer');return rows;});
     setHistory((prev) =>
       prev ? { ...prev, has_newer: page.has_newer } : page,
     );
   }
   return {
     repository,
+    repositoryGeneration,
     outbox,
     ready,
     history,
@@ -412,6 +451,12 @@ export function useAccountData(params: Params) {
     jump,
     sync,
     syncStatus,
+    markListened:async(message:Message)=>{
+      const repo=repository.current,p=latest.current;if(!repo || !p.me || message.sender_id===p.me.id || message.id.startsWith('local-'))return;
+      await repo.update<Record<string,{room:string;message:string}>>('pending-listened',{},receipts=>({...receipts,[message.id]:{room:message.room_id,message:message.id}}));
+      const updated={...message,listened_by:[...new Set([...(message.listened_by || []),p.me.id])]};await repo.saveMessages([updated]);
+      if(repository.current===repo){p.onMessages(prev=>prev.map(item=>item.id===message.id?updated:item));void sync();}
+    },
   };
 }
 function pendingMessage(item: Outgoing, userId: string): Message {

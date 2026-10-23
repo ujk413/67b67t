@@ -2,12 +2,25 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { webcrypto } from 'node:crypto';
-import { createAccountStore, DurableOutbox, mergeMessages } from '../web/local-data.js';
+import { createAccountStore, eraseAccountStore, DurableOutbox, mergeMessages } from '../web/local-data.js';
 import { plural, listTime } from '../web/ui.js';
 const require = createRequire(import.meta.url), fake = require('../api/node_modules/fake-indexeddb');
 globalThis.indexedDB = fake.indexedDB; globalThis.IDBKeyRange = fake.IDBKeyRange;
 Object.defineProperty(globalThis, 'crypto', { configurable: true, value: webcrypto });
 Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { onLine: true } });
+
+test('erasing a deleted account drains pending writes, destroys its cache key and invalidates old handles',async()=>{
+ const user=crypto.randomUUID(),other=createAccountStore('erase-unrelated'),store=createAccountStore(user);
+ await other.set('draft:room','preserve');await store.set('draft:room','erase');
+ const write=store.setBlob('attachment',new Blob(['private file']));
+ const erased=eraseAccountStore(user);await Promise.allSettled([write]);await erased;
+ await assert.rejects(()=>store.set('draft:room','resurrect'),/удалён/);
+ await assert.rejects(()=>store.get('draft:room'),/удалён/);
+ assert.equal(await other.get('draft:room'),'preserve');
+ const db=await new Promise(resolve=>{const r=indexedDB.open('67chat-local-v1');r.onsuccess=()=>resolve(r.result);});
+ const keys=await new Promise(resolve=>{const r=db.transaction('records').objectStore('records').getAllKeys();r.onsuccess=()=>resolve(r.result);});db.close();
+ assert.ok(!keys.some(key=>String(key).startsWith('user:'+user+':')));
+});
 test('encrypted web history, drafts and outbox persist and stay isolated by account', async () => {
   const a = createAccountStore('A'), b = createAccountStore('B');
   await a.set('draft:room', 'Private draft'); await a.saveMessages('room', [{ id: 'one', created_at: '2026-10-21', text: 'Private message' }]);
@@ -52,4 +65,16 @@ test('russian plural picks the right form for 1, 2, 5 and the teens', () => {
   assert.equal(form(21), 'участник');
   assert.equal(form(102), 'участника');
   assert.equal(form(0), 'участников');
+});
+
+test('actual browser runtime feeds incremental sync, receive, hide and session cleanup into the shared event cache',async()=>{
+ const {createChatRuntime}=await import('../web/chat-runtime.js'),{expressiveHistoryLoader:load,expressiveHistoryKey}=await import('../web/expressive-event-history.js'),{browserSessionGeneration}=await import('../web/browser-accounts.js');
+ const prior={window:globalThis.window,document:globalThis.document,location:globalThis.location};globalThis.window={addEventListener(){}};globalThis.document={hidden:false,addEventListener(){},getElementById(){return null;}};globalThis.location={origin:'https://event.test'};
+ const account='event-runtime-'+crypto.randomUUID(),key=expressiveHistoryKey(account,location.origin,String(browserSessionGeneration()),'room'),options={key,version:'session',roomId:'room',fetchPage:async()=>({messages:[{id:'old',room_id:'room',text:'old'},{id:'deleted',room_id:'room',text:'delete'}],has_older:false}),decode:async m=>m};
+ let cursor=0,calls=0;const state={me:{id:account},messages:[],rooms:[],activeRoomId:'room'},errors=[];
+ const runtime=createChatRuntime({state,eventHistory:true,request:async path=>{assert.match(path,/^\/sync\?cursor=/);calls++;return{room_ids:['room'],cursor:String(++cursor),has_more:false,changes:cursor===1?[{room_id:'room',message_id:'old',message:{id:'old',room_id:'room',created_at:'2026-01-01',text:'edited'}},{room_id:'room',message_id:'deleted',message:null}]:[]};},decode:async(_room,m)=>({...m,_text:m.text}),buildText:async()=>{},mount:async()=>{},refresh:async()=>{},render(){},report:e=>errors.push(e),drafts:new Map(),loadRooms:async()=>{}});
+ try{await runtime.start(state.me);await load(options).promise;await runtime.syncEvents();let rows=await load(options).promise;assert.equal(rows.find(m=>m.id==='old').text,'edited');assert.ok(!rows.some(m=>m.id==='deleted'));
+ await runtime.received({id:'new',room_id:'room',created_at:'2026-01-02',text:'new'});assert.equal((await load(options).promise).length,2);await runtime.hide('room','old');assert.deepEqual((await load(options).promise).map(m=>m.id),['new']);assert.deepEqual(errors,[]);assert.ok(calls<=2);
+ runtime.stop();assert.equal(load.has(key),false);
+ }finally{runtime.stop();for(const [name,value]of Object.entries(prior))if(value===undefined)delete globalThis[name];else globalThis[name]=value;}
 });

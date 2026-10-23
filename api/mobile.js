@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { installOrganization } from "./organization.js";
+import { withPushRegistration } from "./account-push-policy.js";
 
 export const messageSelect = `SELECT m.*,u.username AS sender_username,u.display_name AS sender_display_name,
   u.avatar_id AS sender_avatar_id,md.kind AS media_kind,md.mime AS media_mime,md.size_bytes AS media_size,
@@ -87,6 +88,15 @@ export async function installMobileRoutes(app, deps) {
     await requireAuth(req);
     return { version: 1, idempotent_send: true, sync: true };
   });
+  app.post('/rooms/:id/messages/:messageId/listened',async(req,reply)=>{
+    const me=await member(req,reply);if(!me)return;
+    const {rows}=await pool.query("SELECT m.id,m.type FROM messages m WHERE m.id=$1 AND m.room_id=$2 AND NOT EXISTS(SELECT 1 FROM hidden_messages h WHERE h.user_id=$3 AND h.message_id=m.id)",[req.params.messageId,req.params.id,me.id]);
+    if(!rows.length)return reply.code(404).send({error:'message_not_found'});
+    if(!['voice','video_note'].includes(rows[0].type))return reply.code(400).send({error:'not_playable'});
+    const result=await pool.query("UPDATE messages SET listened_by=listened_by || $2::jsonb WHERE id=$1 AND NOT listened_by @> $2::jsonb RETURNING listened_by",[rows[0].id,JSON.stringify([me.id])]);
+    if(result.rows.length)broadcastToRoom(req.params.id,{type:'message.listened',room_id:req.params.id,message_id:rows[0].id,user_id:me.id,listened_by:result.rows[0].listened_by});
+    return {ok:true};
+  });
   app.get("/rooms/:id/history", async (req, reply) => {
     const me = await member(req, reply);
     if (!me) return;
@@ -151,10 +161,12 @@ export async function installMobileRoutes(app, deps) {
       `SELECT id FROM messages WHERE room_id=$1 AND sender_id<>$2 AND NOT coalesce(read_by,'[]') @> $3::jsonb ORDER BY created_at,id LIMIT 1`,
       [id, me.id, JSON.stringify([me.id])],
     );
-    for (const m of messages) {
-      const full = await getMobileMessage(pool, m.id, decryptMetadata);
-      m.reactions = full?.reactions || {};
+    const reactionsByMessage=new Map();
+    if(messages.length){
+      const {rows}=await pool.query('SELECT message_id,user_id,emoji FROM reactions WHERE message_id=ANY($1::uuid[])',[messages.map(m=>m.id)]);
+      for(const row of rows){let grouped=reactionsByMessage.get(row.message_id);if(!grouped){grouped={};reactionsByMessage.set(row.message_id,grouped);}(grouped[row.emoji]||=[]).push(row.user_id);}
     }
+    for(const m of messages){m.sender_display_name=decryptMetadata(m.sender_display_name);m.reactions=reactionsByMessage.get(m.id)||{};}
     return {
       messages,
       has_older: more[0].older,
@@ -232,13 +244,14 @@ export async function installMobileRoutes(app, deps) {
     )
       return reply.code(400).send({ error: "bad_device" });
     const active = req.body?.active_room_id || null;
+    const quickReply=req.body?.quick_reply===true;
     if (active && !(await isRoomMember(active, me.id)))
       return reply.code(404).send({ error: "not_found" });
-    await pool.query(
-      `INSERT INTO push_devices(installation_id,user_id,session_id,token,active_room_id) VALUES($1,$2,$3,$4,$5)
-      ON CONFLICT(installation_id) DO UPDATE SET user_id=$2,session_id=$3,token=$4,active_room_id=$5,updated_at=now()`,
-      [installation, me.id, me.sessionId, token, active],
-    );
+    await withPushRegistration(pool,me,installation,req.body,client=>client.query(
+      `INSERT INTO push_devices(installation_id,user_id,session_id,token,active_room_id,quick_reply) VALUES($1,$2,$3,$4,$5,$6)
+      ON CONFLICT(user_id,installation_id) DO UPDATE SET session_id=$3,token=$4,active_room_id=$5,quick_reply=$6,updated_at=now()`,
+      [installation, me.id, me.sessionId, token, active,quickReply],
+    ));
     return { ok: true };
   });
   app.delete("/me/push-devices/:installationId", async (req) => {

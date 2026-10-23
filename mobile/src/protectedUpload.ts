@@ -2,9 +2,10 @@ import {requireOptionalNativeModule} from 'expo';
 import * as Files from 'expo-file-system/legacy';
 import {createUploadTask} from './uploads';
 import {newId} from './data/repository';
+import {mediaDetails,type MediaDetails} from '../../web/media-details.js';
 const native=requireOptionalNativeModule<{encryptFileAsync(input:string,output:string,key:string,iv:string):Promise<string>}>('RoomKey');
 export type PreparedUpload={uri:string;meta:Record<string,unknown>};
-export type UploadInput={uri:string;name:string;mime:string;prepared?:PreparedUpload};
+export type UploadInput={uri:string;name:string;mime:string;prepared?:PreparedUpload;details?:MediaDetails};
 export type ProtectedUploader=(roomId:string,file:UploadInput,onProgress:(n:number)=>void,checkpoint?:(prepared:PreparedUpload)=>Promise<void>)=>{request:{abort():void};promise:Promise<{id:string;meta:Record<string,unknown>}>};
 export function protectedUploader(base:string,token:string,encode:(room:string,text:string)=>Promise<any>,owner?:string):ProtectedUploader {
   return (room,file,progress,checkpoint)=>{
@@ -17,7 +18,7 @@ export function protectedUploader(base:string,token:string,encode:(room:string,t
       if(!info.exists)throw Error('Файл больше недоступен');if(info.size>100*1024*1024-16)throw Error('Вложение больше 100 МБ');
       if(!prepared || !(await Files.getInfoAsync(prepared.uri)).exists) {
         const bytes=(n:number)=>btoa(Array.from(crypto.getRandomValues(new Uint8Array(n)),b=>String.fromCharCode(b)).join(''));
-        const key=bytes(32),iv=bytes(12),key_message=await encode(room,JSON.stringify({key,iv}));
+        const key=bytes(32),iv=bytes(12),key_message=await encode(room,JSON.stringify({key,iv,details:mediaDetails(file.details)}));
         await Files.makeDirectoryAsync(`${Files.cacheDirectory}encrypted-uploads/`,{intermediates:true});
         await native.encryptFileAsync(file.uri,output,key,iv);
         prepared={uri:output,meta:{media_encryption:{v:2,key_message,name:file.name,mime:file.mime,size:info.size}}};

@@ -18,9 +18,21 @@ import expo.modules.kotlin.modules.ModuleDefinition
 class RoomKeyModule : Module() {
   private val apkCancelled = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>()
   private val signal by lazy { SignalEngine(requireNotNull(appContext.reactContext)) }
+  private val transcoder by lazy { MediaTranscoder(requireNotNull(appContext.reactContext)) }
   override fun definition() = ModuleDefinition {
     Name("RoomKey")
-    Events("callAction", "apkProgress")
+    Events("callAction", "quickReply", "messageOpen", "apkProgress", "mediaProgress")
+    Function("setUiLanguage") { language:String -> NativeUi.setLanguage(requireNotNull(appContext.reactContext),language) }
+    AsyncFunction("setScreenProtectionAsync") { enabled:Boolean, promise:expo.modules.kotlin.Promise ->
+      val activity=appContext.currentActivity
+      if(activity==null)promise.reject("screen_unavailable","Экран приложения недоступен",null)
+      else activity.runOnUiThread {try{if(enabled)activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE) else activity.window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);promise.resolve(null)}catch(error:Throwable){promise.reject("screen_protection_failed",error.message,error)}}
+    }
+    Function("cancelVideoProcessing") { id:String -> transcoder.cancel(id) }
+    AsyncFunction("transcodeVideoAsync") { uri:String, height:Int, id:String, promise:expo.modules.kotlin.Promise ->
+      try {transcoder.start(uri,height,id,{progress->sendEvent("mediaProgress",mapOf("id" to id,"progress" to progress))},{result->promise.resolve(result)},{error->promise.reject("video_processing_failed",error.message,error)})}
+      catch(error:Throwable){promise.reject("video_processing_failed",error.message,error)}
+    }
     Function("cancelApkDownload") { id: String -> apkCancelled[id]?.set(true); Unit }
     AsyncFunction("downloadApkAsync") { url: String, identity: String, size: Double, hash: String, id: String ->
       require(url.startsWith("https://")) { "invalid_release_url" }
@@ -42,6 +54,19 @@ class RoomKeyModule : Module() {
     }
     OnNewIntent { intent ->
       if(intent.hasExtra("67chat_call_id")) { appContext.currentActivity?.intent=intent;sendEvent("callAction",emptyMap<String,String>()) }
+      if(intent.hasExtra("67chat_reply_room")) { appContext.currentActivity?.intent=intent;sendEvent(if(intent.action=="67chat.notification.open")"messageOpen" else "quickReply",emptyMap<String,String>()) }
+    }
+    Function("consumeQuickReply") {
+      val intent=appContext.currentActivity?.intent
+      val reply=QuickReplyNotifications.fromIntent(intent)
+      if(reply!=null) { intent?.removeExtra("67chat_reply_room");intent?.removeExtra("67chat_reply_recipient") }
+      reply
+    }
+    Function("consumeMessageOpen") {
+      val intent=appContext.currentActivity?.intent
+      val target=QuickReplyNotifications.openFromIntent(intent)
+      if(target!=null) { intent?.removeExtra("67chat_reply_room");intent?.removeExtra("67chat_reply_recipient") }
+      target
     }
     AsyncFunction("pendingCallAsync") {
       val context=requireNotNull(appContext.reactContext)
@@ -55,6 +80,7 @@ class RoomKeyModule : Module() {
     }
     AsyncFunction("clearCallAsync") { id: String -> CallNotifications.clear(requireNotNull(appContext.reactContext),id) }
     AsyncFunction("startCallServiceAsync") { video: Boolean ->
+      AccountTransport.requireDirectCalls()
       val context=requireNotNull(appContext.reactContext)
       val intent=Intent(context,ActiveCallService::class.java).putExtra("video",video)
       if(Build.VERSION.SDK_INT>=26)context.startForegroundService(intent) else context.startService(intent)
@@ -69,7 +95,27 @@ class RoomKeyModule : Module() {
         if(device!=null)audio.setCommunicationDevice(device)
       } else audio.isSpeakerphoneOn=speaker
     }
+    AsyncFunction("audioOutputsAsync") {
+      val context=requireNotNull(appContext.reactContext)
+      val audio=context.getSystemService(AudioManager::class.java)
+      if(Build.VERSION.SDK_INT>=31)audio.availableCommunicationDevices.map { device -> mapOf("id" to device.id,"label" to when(device.type){AudioDeviceInfo.TYPE_BUILTIN_SPEAKER->NativeUi.text(context,"Динамик","Speaker");AudioDeviceInfo.TYPE_BUILTIN_EARPIECE->NativeUi.text(context,"Телефон","Earpiece");AudioDeviceInfo.TYPE_BLUETOOTH_SCO,AudioDeviceInfo.TYPE_BLE_HEADSET->"Bluetooth";AudioDeviceInfo.TYPE_WIRED_HEADSET,AudioDeviceInfo.TYPE_WIRED_HEADPHONES,AudioDeviceInfo.TYPE_USB_HEADSET->NativeUi.text(context,"Наушники","Headphones");else->NativeUi.text(context,"Аудиоустройство ${device.id}","Audio device ${device.id}")}) }
+      else listOf(mapOf("id" to -1,"label" to NativeUi.text(context,"Телефон / наушники","Earpiece / headphones")),mapOf("id" to -2,"label" to NativeUi.text(context,"Динамик","Speaker")))
+    }
+    AsyncFunction("routeAudioAsync") { id:Int ->
+      val audio=requireNotNull(appContext.reactContext).getSystemService(AudioManager::class.java)
+      if(Build.VERSION.SDK_INT>=31){val device=audio.availableCommunicationDevices.firstOrNull{it.id==id} ?: throw IllegalArgumentException("Аудиоустройство отключено");check(audio.setCommunicationDevice(device)){"Не удалось переключить звук"}}
+      else{require(id==-1||id==-2);audio.isSpeakerphoneOn=id==-2}
+    }
     AsyncFunction("signalBundleAsync") { user: String, count: Int -> signal.bundle(user, count) }
+    AsyncFunction("signalDeviceProofAsync") { user:String,challenge:String -> signal.deviceProof(user,challenge) }
+    AsyncFunction("signalClearAccountAsync") { user:String -> signal.clearAccount(user) }
+    AsyncFunction("signalPrepareBackupImportAsync") { user:String,json:String -> signal.prepareBackupImport(user,json) }
+    AsyncFunction("signalSignBackupProofAsync") { user:String,id:String,challenge:String -> signal.signBackupProof(user,id,challenge) }
+    AsyncFunction("signalCommitBackupImportAsync") { user:String,id:String -> signal.commitBackupImport(user,id) }
+    AsyncFunction("signalFinishBackupImportAsync") { user:String,id:String,commit:Boolean -> signal.finishBackupImport(user,id,commit) }
+    AsyncFunction("signalRecoverBackupImportAsync") { user:String,commit:Boolean -> signal.recoverBackupImport(user,commit) }
+    AsyncFunction("signalExportBackupKeysAsync") { user:String -> signal.exportBackupKeys(user) }
+    AsyncFunction("signalImportBackupKeysAsync") { user:String, json:String -> signal.importBackupKeys(user,json) }
     AsyncFunction("signalHasSessionAsync") { user: String, peer: String, device: String -> signal.hasSession(user, peer, device) }
     AsyncFunction("signalSessionAsync") { user: String, peer: String, device: String, bundle: String -> signal.session(user, peer, device, bundle) }
     AsyncFunction("signalEncryptAsync") { user: String, peer: String, device: String, text: String -> signal.encrypt(user, peer, device, text) }

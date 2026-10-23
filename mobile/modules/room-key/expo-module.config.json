@@ -1,6 +1,6 @@
 {
   "platforms": ["android"],
   "android": {
-    "modules": ["ru.b67t.roomkey.RoomKeyModule"]
+    "modules": ["ru.b67t.roomkey.RoomKeyModule", "ru.b67t.roomkey.AccountSecurityModule"]
   }
 }

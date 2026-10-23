@@ -9,19 +9,23 @@ function database() {
     req.onsuccess = () => resolve(req.result); req.onerror = () => { opening = null; reject(req.error); };
   });
 }
-async function access(mode, action) {
+async function accessRecord(mode, action, userId=null) {
   const db = await database();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction('records', mode), store = tx.objectStore('records'); let value;
-    const request = action(store); if (request) request.onsuccess = () => { value = request.result; };
-    tx.oncomplete = () => resolve(value); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || new Error('Не удалось сохранить данные на устройстве'));
+    const tx = db.transaction('records', mode), store = tx.objectStore('records'); let value,error;
+    const perform=()=>{const request=action(store);if(request)request.onsuccess=()=>{value=request.result;};};
+    if(userId){const check=store.get('erased:'+userId);check.onsuccess=()=>{if(check.result===true){error=Error('Аккаунт удалён с этого устройства');tx.abort();}else perform();};}else perform();
+    tx.oncomplete = () => resolve(value); tx.onerror = () => reject(error||tx.error); tx.onabort = () => reject(error||tx.error || new Error('Не удалось сохранить данные на устройстве'));
   });
 }
 export function createAccountStore(userId) {
   if (!userId) throw new Error('Сначала войдите в аккаунт');
   if(stores.has(userId))return stores.get(userId);
-  const prefix = `user:${userId}:`; let keyPromise, writes = Promise.resolve();
+  const prefix = `user:${userId}:`; let keyPromise, writes = Promise.resolve(), closed=false;
+  const access=(mode,action)=>accessRecord(mode,action,userId);
+  function assertOpen(){if(closed)throw Error('Аккаунт удалён с этого устройства');}
   async function key() {
+    assertOpen();
     return keyPromise ||= (async () => {
       const id = prefix + 'key', existing = await access('readonly', s => s.get(id)); if (existing) return existing;
       const created = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
@@ -30,34 +34,37 @@ export function createAccountStore(userId) {
     })();
   }
   async function unpack(value, id) {
+    assertOpen();
     if (!value) return undefined;
     const data = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: value.iv, additionalData: new TextEncoder().encode(id) }, await key(), value.data);
-    return JSON.parse(new TextDecoder().decode(data));
+    assertOpen();return JSON.parse(new TextDecoder().decode(data));
   }
   const store = {
     userId,
-    async get(name, fallback = null) { await writes; const id = prefix + name; const result = await unpack(await access('readonly', s => s.get(id)), id); return result === undefined ? fallback : result; },
+    async get(name, fallback = null) { assertOpen();await writes;assertOpen();const id = prefix + name; const result = await unpack(await access('readonly', s => s.get(id)), id); return result === undefined ? fallback : result; },
     set(name, value) {
       const task = writes.then(async () => {
+        assertOpen();
         const id = prefix + name, iv = crypto.getRandomValues(new Uint8Array(12));
         const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(id) }, await key(), new TextEncoder().encode(JSON.stringify(value)));
         await access('readwrite', s => s.put({ iv, data }, id));
       }); writes = task.catch(() => {}); return task;
     },
-    remove(name) { const task = writes.then(() => access('readwrite', s => s.delete(prefix + name))); writes = task.catch(() => {}); return task; },
+    remove(name) { const task = writes.then(() => {assertOpen();return access('readwrite', s => s.delete(prefix + name));}); writes = task.catch(() => {}); return task; },
     setBlob(name, blob) {
       const task = writes.then(async () => {
+        assertOpen();
         const id = prefix + name, iv = crypto.getRandomValues(new Uint8Array(12));
         const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(id) }, await key(), await blob.arrayBuffer());
         await access('readwrite', s => s.put({ iv, data, mime: blob.type }, id));
       }); writes = task.catch(() => {}); return task;
     },
-    async getBlob(name) { await writes; const id = prefix + name, value = await access('readonly', s => s.get(id)); if (!value) return null;
+    async getBlob(name) { assertOpen();await writes;assertOpen();const id = prefix + name, value = await access('readonly', s => s.get(id)); if (!value) return null;
       const data = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: value.iv, additionalData: new TextEncoder().encode(id) }, await key(), value.data);
-      return new Blob([data], { type: value.mime });
+      assertOpen();return new Blob([data], { type: value.mime });
     },
     async entries(namePrefix) {
-      await writes; const start = prefix + namePrefix, range = IDBKeyRange.bound(start, start + '\uffff');
+      assertOpen();await writes;assertOpen();const start = prefix + namePrefix, range = IDBKeyRange.bound(start, start + '\uffff');
       const db=await database(), rows=await new Promise((resolve,reject)=>{
         const tx=db.transaction('records','readonly'),result=[],cursor=tx.objectStore('records').openCursor(range);
         cursor.onsuccess=()=>{const row=cursor.result;if(row){result.push([row.key,row.value]);row.continue();}};
@@ -68,6 +75,7 @@ export function createAccountStore(userId) {
     async saveMessages(roomId, incoming) {
       // Serialize read/merge/write as one logical operation across network and realtime updates.
       const task = writes.then(async () => {
+        assertOpen();
         const id = prefix + 'messages:' + roomId;
         const previous = await unpack(await access('readonly', s => s.get(id)), id) || [];
         const start=prefix+'hidden:',keys=await access('readonly',s=>s.getAllKeys(IDBKeyRange.bound(start,start+'\uffff')));
@@ -80,16 +88,19 @@ export function createAccountStore(userId) {
     },
     removeMessage(roomId, messageId) {
       const task=writes.then(async()=>{
+        assertOpen();
         const id=prefix+'messages:'+roomId,previous=await unpack(await access('readonly',s=>s.get(id)),id)||[],iv=crypto.getRandomValues(new Uint8Array(12));
         const data=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:new TextEncoder().encode(id)},await key(),new TextEncoder().encode(JSON.stringify(previous.filter(m=>m.id!==messageId))));
         await access('readwrite',s=>s.put({iv,data},id));
       });writes=task.catch(()=>{});return task;
     },
     async clearHistory() { for (const kind of ['messages:','group-plain:'])for (const [name] of await store.entries(kind)) await store.remove(name); },
+    async destroy(){closed=true;await writes;keyPromise=null;await accessRecord('readwrite',s=>{s.put(true,'erased:'+userId);return s.delete(IDBKeyRange.bound(prefix,prefix+'\uffff'));});},
     flush: () => writes,
   };
   stores.set(userId,store);return store;
 }
+export async function eraseAccountStore(userId){await createAccountStore(userId).destroy();}
 export function compareMessages(a, b) { return String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id)); }
 export function mergeMessages(previous, incoming) {
   const byId = new Map(previous.map(m => [m.id, m]));

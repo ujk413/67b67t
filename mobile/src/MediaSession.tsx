@@ -3,7 +3,7 @@ import type {Message} from './types';
 import {resolveMediaSource} from './decryptedMedia';
 export const MediaSession = createContext<Record<string, string>>({});
 export const useMediaHeaders = () => useContext(MediaSession);
-export const MediaDecoder=createContext<{baseUrl:string;userId:string;decode:(message:Message)=>Promise<Message>}|null>(null);
+export const MediaDecoder=createContext<{baseUrl:string;userId:string;decode:(message:Message)=>Promise<Message>;onListened?:(message:Message)=>void}|null>(null);
 export function useProtectedMedia(message:Message,enabled:boolean) {
   const session=useContext(MediaDecoder),headers=useMediaHeaders(),latest=useRef(session);latest.current=session;
   const [uri,setUri]=useState('');

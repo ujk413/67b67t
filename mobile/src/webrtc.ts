@@ -2,6 +2,7 @@
  * WebRTC for voice and video calls
  * React Native implementation
  */
+import {assertCallsAllowed} from './accountRegistry';
 
 import {
   RTCPeerConnection,
@@ -10,7 +11,7 @@ import {
   mediaDevices,
   MediaStream,
   MediaStreamTrack,
-} from 'react-native-webrtc';
+} from '@livekit/react-native-webrtc';
 
 export interface CallConfig {
   audio: boolean;
@@ -23,6 +24,8 @@ export interface CallEvents {
   onIceCandidate?: (candidate: RTCIceCandidate) => void;
   onConnectionStateChange?: (state: string) => void;
   onError?: (error: Error) => void;
+  onRenegotiation?: (offer: RTCSessionDescriptionInit) => void;
+  onScreenShareChange?: (enabled: boolean) => void;
 }
 
 export class WebRTCCall {
@@ -35,6 +38,11 @@ export class WebRTCCall {
   private iceServers: any[] | undefined;
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private remoteReady = false;
+  private screenStream: MediaStream | null = null;
+  private restarting = false;
+  private restartAttempts = 0;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  private generation = 0;
 
   constructor(config: CallConfig, events: CallEvents, isInitiator: boolean, iceServers?: any[]) {
     this.config = config;
@@ -44,10 +52,14 @@ export class WebRTCCall {
   }
 
   async start(): Promise<void> {
+    await assertCallsAllowed();
+    const generation=++this.generation;
     try {
       // Get user media
       const constraints = {
-        audio: this.config.audio,
+        // The native declaration omits W3C audio processing flags; retain a supported
+        // field so structural typing accepts this object without an unsafe cast.
+        audio: this.config.audio ? {deviceId: 'default', echoCancellation: true, noiseSuppression: true, autoGainControl: true} : false,
         video: this.config.video ? {
           width: { ideal: 1280 },
           height: { ideal: 720 },
@@ -56,7 +68,9 @@ export class WebRTCCall {
         } : false,
       };
 
-      this.localStream = await mediaDevices.getUserMedia(constraints);
+      const captured = await mediaDevices.getUserMedia(constraints);
+      if(generation!==this.generation){captured.getTracks().forEach(track=>track.stop());return;}
+      this.localStream = captured;
       this.events.onLocalStream?.(this.localStream);
 
       // Create peer connection
@@ -64,7 +78,7 @@ export class WebRTCCall {
         // Server-issued, time-limited TURN credentials (GET /rtc/ice-servers).
         iceServers: this.iceServers && this.iceServers.length
           ? this.iceServers
-          : [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }],
+          : [],
       });
 
       // Add local tracks
@@ -92,7 +106,13 @@ export class WebRTCCall {
       // Handle connection state
       (this.pc as any).onconnectionstatechange = () => {
         if (this.pc) {
-          this.events.onConnectionStateChange?.((this.pc as any).connectionState || "unknown");
+          const state=this.pc.connectionState || 'unknown';
+          this.events.onConnectionStateChange?.(state);
+          if(state==='connected'){this.restartAttempts=0;if(this.restartTimer)clearTimeout(this.restartTimer);this.restartTimer=null;}
+          if(state==='failed'||state==='disconnected'){
+            if(this.restartTimer)clearTimeout(this.restartTimer);
+            this.restartTimer=setTimeout(()=>{this.restartTimer=null;void this.restartIce().catch(error=>this.events.onError?.(error));},state==='failed'?0:2500);
+          }
         }
       };
 
@@ -105,9 +125,38 @@ export class WebRTCCall {
         await this.pc.setLocalDescription(offer);
       }
     } catch (error) {
+      await this.end();
       this.events.onError?.(error as Error);
       throw error;
     }
+  }
+
+  /** Call after a network-type change. Only the initial caller negotiates to avoid glare. */
+  async restartIce(): Promise<void> {
+    if(!this.pc||!this.isInitiator||this.restarting||this.pc.signalingState!=='stable')return;
+    if(++this.restartAttempts>3){await this.end();this.events.onError?.(new Error('Не удалось восстановить звонок'));return;}
+    this.restarting=true;const pc=this.pc,generation=this.generation;
+    try {const offer=await pc.createOffer({iceRestart:true});if(generation!==this.generation)return;await pc.setLocalDescription(offer);this.events.onRenegotiation?.(offer);}
+    finally{this.restarting=false;}
+  }
+
+  async startScreenShare(): Promise<void> {
+    await assertCallsAllowed();
+    if(!this.pc||this.screenStream)return;
+    const generation=this.generation;
+    const stream=await mediaDevices.getDisplayMedia();
+    if(generation!==this.generation){stream.getTracks().forEach(track=>track.stop());return;}
+    const track=stream.getVideoTracks()[0],sender=this.pc.getSenders().find(item=>item.track?.kind==='video');
+    // Audio-only calls need a negotiated video transceiver first; never pretend it was shared.
+    if(!track||!sender){stream.getTracks().forEach(item=>item.stop());throw new Error('Демонстрация экрана доступна в видеозвонке');}
+    try {await sender.replaceTrack(track);this.screenStream=stream;(track as any).onended=()=>{void this.stopScreenShare().catch(error=>this.events.onError?.(error));};this.events.onScreenShareChange?.(true);}
+    catch(error){stream.getTracks().forEach(item=>item.stop());throw error;}
+  }
+
+  async stopScreenShare(): Promise<void> {
+    const stream=this.screenStream;if(!stream)return;this.screenStream=null;
+    try{const sender=this.pc?.getSenders().find(item=>item.track?.kind==='video');if(sender)await sender.replaceTrack(this.localStream?.getVideoTracks()[0]||null);}
+    finally{stream.getTracks().forEach(track=>{(track as any).onended=null;track.stop();});this.events.onScreenShareChange?.(false);}
   }
 
   async handleOffer(offer: RTCSessionDescriptionInit): Promise<RTCSessionDescriptionInit> {
@@ -169,6 +218,9 @@ export class WebRTCCall {
   }
 
   async end(): Promise<void> {
+    ++this.generation;
+    if(this.restartTimer)clearTimeout(this.restartTimer);this.restartTimer=null;
+    this.screenStream?.getTracks().forEach(track=>{(track as any).onended=null;track.stop();});this.screenStream=null;
     this.pendingCandidates = [];
     this.remoteReady = false;
     if (this.localStream) {
@@ -182,6 +234,7 @@ export class WebRTCCall {
     }
 
     if (this.pc) {
+      (this.pc as any).onconnectionstatechange=null;(this.pc as any).onicecandidate=null;(this.pc as any).ontrack=null;
       this.pc.close();
       this.pc = null;
     }

@@ -1,3 +1,5 @@
+import {locale as uiLocale} from "../../../web/i18n.js";
+import {t as uiText} from "../../../web/i18n.js";
 import {
   Image,
   Pressable,
@@ -7,6 +9,7 @@ import {
 } from "react-native";
 import { useTheme } from "../ThemeProvider";
 import { useMediaHeaders, useProtectedMedia } from "../MediaSession";
+import {useMediaAutoDownload} from '../features/qualityPolicy';
 import { RichText } from "./RichText";
 import type { Message } from "../types";
 export function Album({
@@ -51,9 +54,9 @@ export function Album({
             key={message.id}
             onPress={() => onOpen(message)}
             accessibilityRole="button"
-            accessibilityLabel="Открыть фото из альбома"
+            accessibilityLabel={uiText("Открыть фото из альбома")}
           >
-            <AlbumImage message={message} baseUrl={baseUrl} size={size} />
+            <AlbumImage message={message} baseUrl={baseUrl} size={size} meId={meId}/>
           </Pressable>
         ))}
       </View>
@@ -66,18 +69,17 @@ export function Album({
           paddingTop: 4,
         }}
       >
-        {new Date(first.created_at).toLocaleTimeString("ru-RU", {
+        {new Date(first.created_at).toLocaleTimeString(uiLocale(), {
           hour: "2-digit",
           minute: "2-digit",
         })}{" "}
-        · {messages.length} фото
-      </Text>
+        · {messages.length} {uiText("фото")}</Text>
     </View>
   );
 }
 
-function AlbumImage({message,baseUrl,size}:{message:Message;baseUrl:string;size:number}) {
-  const {autoDownload,colors}=useTheme(),headers=useMediaHeaders(),uri=useProtectedMedia(message,autoDownload);
-  if(message.meta?.media_encryption && !uri)return <View style={{width:size,height:size,borderRadius:12,backgroundColor:colors.windowBackgroundGray,alignItems:'center',justifyContent:'center'}}><Text style={{color:colors.text.secondary}}>Фото · открыть</Text></View>;
+function AlbumImage({message,baseUrl,size,meId}:{message:Message;baseUrl:string;size:number;meId:string}) {
+  const {colors}=useTheme(),autoDownload=useMediaAutoDownload('image',meId),headers=useMediaHeaders(),uri=useProtectedMedia(message,autoDownload);
+  if(message.meta?.media_encryption && !uri)return <View style={{width:size,height:size,borderRadius:12,backgroundColor:colors.windowBackgroundGray,alignItems:'center',justifyContent:'center'}}><Text style={{color:colors.text.secondary}}>{uiText("Фото · открыть")}</Text></View>;
   return <Image source={{uri:uri || `${baseUrl}/media/${message.media_id}/thumb`,headers}} style={{width:size,height:size,borderRadius:12}} />;
 }

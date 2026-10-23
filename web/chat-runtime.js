@@ -1,9 +1,62 @@
+import {expressiveHistoryLoader,expressiveHistoryKey,expressiveHistoryPrefix} from './expressive-event-history.js';
+import {browserSessionGeneration} from './browser-accounts.js';
 import { createAccountStore, DurableOutbox, mergeMessages } from './local-data.js';
 import { userError } from './errors.js';
 import { uploadQueuedFile } from './queued-upload.js';
-export function createChatRuntime({ state, request, decode, buildText, mount, refresh, render, report, drafts, loadRooms }) {
+export function createChatRuntime({ state, request, decode, buildText, mount, refresh, render, report, drafts, loadRooms,eventHistory=false }) {
   let store, queue, owner, ready, generation = 0, opening = 0, olderBusy = false, newerBusy = false, searching = 0, observer, scrollTimer, readTimer, heartbeat;
-  let hidden=new Set(), syncingHidden=null;
+  let hidden=new Set(), syncingHidden=null,listeningSync=null,eventSync=null;
+  const eventPrefix=()=>expressiveHistoryPrefix(owner,globalThis.location?.origin||'web',String(browserSessionGeneration()));
+  const eventKey=room=>expressiveHistoryKey(owner,globalThis.location?.origin||'web',String(browserSessionGeneration()),room);
+  const eventRows=rows=>rows.map(row=>({...row,text:row._text??row.text}));
+  function updateEvents(room,changes){if(eventHistory)try{expressiveHistoryLoader.reconcile(eventKey(room),changes);}catch(error){if(current(room))render();throw error;}}
+  function syncEvents(){
+    if(!eventHistory||eventSync||!store||!owner)return eventSync||Promise.resolve();
+    const local=store,account=owner,mine=generation,prefix=eventPrefix();
+    const valid=()=>store===local&&owner===account&&generation===mine;
+    const task=(async()=>{
+      let cursor=await local.get('expressive:sync','0'),more=true;
+      while(more&&valid()){
+        const page=await request('/sync?cursor='+encodeURIComponent(cursor));if(!valid())return;
+        expressiveHistoryLoader.prune(prefix,page.room_ids);
+        if(state.activeRoomId&&!page.room_ids.includes(state.activeRoomId)){
+          state.messages=[];state.activeRoomId=null;await loadRooms();if(!valid())return;await mount();if(!valid())return;
+        }
+        const changes=new Map();
+        for(const change of page.changes){
+          if(!valid())return;
+          const key=eventKey(change.room_id);if(!expressiveHistoryLoader.has(key))continue;
+          if(!changes.has(change.room_id))changes.set(change.room_id,{upserts:[],removed:[]});
+          if(change.message&&!hidden.has(change.message_id)){
+            const row=await decode(change.room_id,change.message);if(!valid())return;
+            changes.get(change.room_id).upserts.push(...eventRows([row]));
+          }else changes.get(change.room_id).removed.push(change.message_id);
+        }
+        for(const [room,delta] of changes){
+          updateEvents(room,delta);
+          if(room===state.activeRoomId){const byId=new Map(delta.upserts.map(row=>[row.id,row])),removed=new Set(delta.removed);state.messages=state.messages.filter(row=>!removed.has(row.id)).map(row=>byId.get(row.id)||row);}
+        }
+        cursor=page.cursor;await local.set('expressive:sync',cursor);more=page.has_more;
+        if(changes.has(state.activeRoomId))render();
+      }
+    })().catch(error=>{if(valid())report(userError(error));});
+    eventSync=task;void task.finally(()=>{if(eventSync===task)eventSync=null;});return task;
+  }
+  async function flushListened(){
+    if(listeningSync)return listeningSync;const local=store,account=owner;if(!local)return;
+    const task=(async()=>{for(const [key,value] of await local.entries('pending-listened:')){
+      if(owner!==account)return;
+      try{await request(`/rooms/${value.room}/messages/${value.message}/listened`,{method:'POST'});await local.remove(key);}
+      catch(error){if([403,404].includes(error.status))await local.remove(key);}
+    }})();listeningSync=task;try{await task;}finally{if(listeningSync===task)listeningSync=null;}
+  }
+  async function markListened(message){
+    if(!message || !current() || message.sender_id===owner || message.id.startsWith('local-'))return;
+    const account=owner,local=store;
+    await local.set('pending-listened:'+message.id,{room:message.room_id,message:message.id});
+    if(owner!==account)return;
+    message.listened_by=[...new Set([...(message.listened_by || []),account])];await local.saveMessages(message.room_id,[message]);void flushListened();
+  }
   const pending = item => ({ ...item, id: 'local-' + item.id, client_message_id: item.id, sender_id: owner, type: item.body?.type || 'text', _text: item.text, text: item.text });
   const current = id => owner && state.me?.id === owner && (!id || state.activeRoomId === id);
   function changed(item, message) {
@@ -16,7 +69,8 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
   async function page(roomId, options = {}) {
     const result = await request(`/rooms/${roomId}/history?${new URLSearchParams(options)}`);
     const messages = await Promise.all(result.messages.map(m => decode(roomId, m)));
-    return { ...result, messages:messages.filter(m=>!hidden.has(m.id)) };
+    const visible=messages.filter(m=>!hidden.has(m.id));updateEvents(roomId,{upserts:eventRows(visible)});
+    return { ...result, messages:visible };
   }
   function start(user) { if (owner === user.id && store) return ready; stop(); ready = startAccount(user); return ready; }
   async function startAccount(user) {
@@ -32,7 +86,7 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
       if(item.upload && !item.body?.media_id) {
         const blob=await local.getBlob(item.upload.blobKey);
         if(!blob)throw Object.assign(Error('Файл очереди больше недоступен'),{status:410});
-        const media=await uploadQueuedFile(blob,item.upload.kind,signal);
+        const media=await uploadQueuedFile(blob,item.upload.kind,signal,()=>{},user.id);
         if(mine!==generation || signal?.aborted)throw Error('Сессия завершена');
         item.body={...item.body,media_id:media.id};await local.set('outbox:'+item.id,item);
       }
@@ -48,13 +102,15 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
       const sent = await request(`/rooms/${item.room_id}/messages`, { method: 'POST', body: JSON.stringify({ ...item.body, client_message_id: item.id }) });
       return decode(item.room_id, sent);
     } });
-    heartbeat = setInterval(() => { if (!document.hidden) void queue?.flush(); }, 15000);
+    heartbeat = setInterval(() => { if (!document.hidden){void queue?.flush();void flushListened();void syncEvents();} }, 15000);
+    void flushListened();
+    void syncEvents();
     void queue.flush();
   }
-  function stop() { hidden=new Set();syncingHidden=null;++generation; ++opening; ++searching; queue?.stop(); queue = null; store = null; owner = null; ready = null; observer?.disconnect(); clearTimeout(scrollTimer); clearTimeout(readTimer); clearInterval(heartbeat); }
+  function stop() { if(eventHistory&&owner)expressiveHistoryLoader.clear(eventPrefix());eventSync=null;hidden=new Set();syncingHidden=null;++generation; ++opening; ++searching; queue?.stop(); queue = null; store = null; owner = null; ready = null; observer?.disconnect(); clearTimeout(scrollTimer); clearTimeout(readTimer); clearInterval(heartbeat); }
   async function hide(roomId,messageId) {
     const account=owner,local=store,bag=hidden;if(!account || !local)return;
-    bag.add(messageId);
+    bag.add(messageId);updateEvents(roomId,{removed:[messageId]});
     if(owner===account && current(roomId)){state.messages=state.messages.filter(m=>m.id!==messageId);state.searchResults=state.searchResults?.filter(m=>(m.msg || m).id!==messageId) || [];render();}
     await local.set('hidden:'+messageId,roomId);await local.removeMessage(roomId,messageId);
   }
@@ -138,6 +194,7 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
     await local.saveMessages(message.room_id, [prepared]);
     if(bag.has(message.id)){await local.removeMessage(message.room_id,message.id);return;}
     if(owner!==account || state.me?.id!==account)return;
+    updateEvents(message.room_id,{upserts:eventRows([prepared])});
     if (current(message.room_id)) {
       if (state.chatHistory?.has_newer && !state.messages.some(m => m.id === message.id)) state.newMessages = (state.newMessages || 0) + 1;
       else {
@@ -187,8 +244,8 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
       state.searchProgress = 'Вся доступная история проверена'; await update();
     } catch (error) { if (mine === searching) report(userError(error)); }
   }
-  window.addEventListener('online', () => { void syncHidden();void queue?.flush(); if (current()) void loadRooms().catch(() => {}); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { void syncHidden();void queue?.flush(); bind(); } });
-  return { hide,syncHidden,start, stop, saveRooms, draft, enqueue, open, older, newer, jump, received, bind, search, cancelSearch: () => { ++searching; },
+  window.addEventListener('online', () => { void syncEvents();void syncHidden();void queue?.flush(); if (current()) void loadRooms().catch(() => {}); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { void syncEvents();void syncHidden();void queue?.flush(); bind(); } });
+  return { markListened,hide,syncHidden,syncEvents,start, stop, saveRooms, draft, enqueue, open, older, newer, jump, received, bind, search, cancelSearch: () => { ++searching; },
     retry: id => queue?.retry(id), cancel: id => queue?.cancel(id), flush: () => queue?.flush(), local: () => store };
 }

@@ -31,11 +31,11 @@ const browserFiles = [
 
 test('pin and unpin use the actual API client and preserve their captured room',async()=>{
   const source=read('app.js');const window={};const calls=[];
-  const state={activeRoomId:'original-room'};
+  const state={activeRoomId:'original-room',rooms:[{id:'original-room',pinned_message_id:'message'}]};
   const block=source.slice(source.indexOf('window.pinMessage ='),source.indexOf('window.scrollToMessage ='));
-  new Function('window','state','api','toast','loadRooms','mountPreservingInput','mount',block)(window,state,async(...args)=>calls.push(args),()=>{},async()=>{},async()=>{},async()=>{});
+  new Function('window','state','api','toast','loadRooms','mountPreservingInput','mount','uiText',block)(window,state,async(...args)=>calls.push(args),()=>{},async()=>{},async()=>{},async()=>{},text=>text);
   await window.pinMessage('message');await window.unpinMessage();
-  assert.deepEqual(calls.map(c=>c[0]),['/rooms/original-room/pin','/rooms/original-room/pin']);
+  assert.deepEqual(calls.map(c=>c[0]),['/rooms/original-room/pins/message','/rooms/original-room/pins/message']);assert.deepEqual(calls.map(c=>c[1].method),['PUT','DELETE']);
 });
 
 test('room fanout excludes the sockets of users who hid an edited message',()=>{

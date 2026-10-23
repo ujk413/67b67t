@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { useTheme } from "../ThemeProvider";
 import { Icon } from "./Icon";
 import { Pressable, StyleSheet, Text, View } from "react-native";
@@ -27,7 +28,7 @@ export function MainHeader({
           hitSlop={8}
           style={styles.iconButton}
           accessibilityRole="button"
-          accessibilityLabel="Поиск"
+          accessibilityLabel={uiText("Поиск")}
         >
           <Icon name="search" />
         </Pressable>
@@ -36,7 +37,7 @@ export function MainHeader({
           hitSlop={8}
           style={styles.iconButton}
           accessibilityRole="button"
-          accessibilityLabel="Меню"
+          accessibilityLabel={uiText("Меню")}
         >
           <Icon name="more" />
         </Pressable>

@@ -2,7 +2,7 @@
   "expo": {
     "name": "67chat",
     "slug": "messenger67-mobile",
-    "version": "1.3.5",
+    "version": "1.3.6",
     "orientation": "portrait",
     "icon": "./assets/brand/app-1024.png",
     "userInterfaceStyle": "automatic",
@@ -23,7 +23,7 @@
     },
     "android": {
       "package": "ru.b67t.messenger.mobile",
-      "versionCode": 16,
+      "versionCode": 17,
       "adaptiveIcon": {
         "backgroundColor": "#14B88F",
         "foregroundImage": "./assets/brand/app-1024.png"

@@ -2,6 +2,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import fs from "node:fs";
+import { installPushPolicy } from "../api/account-push-policy.js";
 import { createDirectRoom, installMobileRoutes } from "../api/mobile.js";
 const require = createRequire(import.meta.url),
   { PGlite } = require("../api/node_modules/@electric-sql/pglite"),
@@ -11,10 +12,13 @@ const A = "00000000-0000-4000-8000-000000000001",
   C = "00000000-0000-4000-8000-000000000003",
   R = "00000000-0000-4000-8000-000000000010";
 let db, app;
+const queryLog=[];
 const pool = {
   connect: async () => ({ query: (sql, args) => db.query(sql, args), release() {} }),
-  query: async (sql, args) =>
-    args ? db.query(sql, args) : { rows: await db.exec(sql) },
+  query: async (sql, args) => {
+    queryLog.push(sql);
+    return args ? db.query(sql, args) : { rows: await db.exec(sql) };
+  },
 };
 before(async () => {
   db = new PGlite();
@@ -24,12 +28,14 @@ before(async () => {
     CREATE TABLE rooms(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),kind text,title text,created_by uuid);
     CREATE TABLE room_members(room_id uuid REFERENCES rooms(id),user_id uuid REFERENCES users(id),role text,PRIMARY KEY(room_id,user_id));
     CREATE TABLE media(id uuid PRIMARY KEY,kind text,mime text,size_bytes int,thumb_path text,duration_sec int,width int,height int);
-    CREATE TABLE messages(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),room_id uuid REFERENCES rooms(id),sender_id uuid REFERENCES users(id),type text,text text,media_id uuid,meta jsonb DEFAULT '{}',reply_to jsonb,encrypted_content text,read_by jsonb DEFAULT '[]',created_at timestamptz DEFAULT now());
+    CREATE TABLE messages(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),room_id uuid REFERENCES rooms(id),sender_id uuid REFERENCES users(id),type text,text text,media_id uuid,meta jsonb DEFAULT '{}',reply_to jsonb,encrypted_content text,read_by jsonb DEFAULT '[]',is_post boolean DEFAULT false,created_at timestamptz DEFAULT now());
     CREATE TABLE reactions(message_id uuid,user_id uuid,emoji text);
     INSERT INTO users(id,username) VALUES('${A}','alice'),('${B}','bob'),('${C}','outsider');
     INSERT INTO rooms(id,kind) VALUES('${R}','group');INSERT INTO room_members VALUES('${R}','${A}','owner'),('${R}','${B}','member');
     INSERT INTO sessions(id,user_id)VALUES('${A}','${A}'),('${B}','${B}');
   `);
+  await db.exec(`CREATE TABLE push_devices(installation_id text PRIMARY KEY,user_id uuid REFERENCES users(id)ON DELETE CASCADE,session_id uuid REFERENCES sessions(id)ON DELETE CASCADE,token text NOT NULL,active_room_id uuid,updated_at timestamptz NOT NULL DEFAULT now());INSERT INTO push_devices(installation_id,user_id,session_id,token)VALUES('legacy-migrate','${A}','${A}','legacy-token');`);
+  await db.exec(fs.readFileSync(new URL("../api/account-push-policy.sql",import.meta.url),"utf8"));
   app = Fastify();
   await installMobileRoutes(app, {
     pool,
@@ -56,11 +62,55 @@ before(async () => {
     notifyRoomListUpdate: async () => {},
     broadcastToRoom() {},
   });
+  installPushPolicy(app,{pool,requireAuth:async req=>{const id=req.headers["x-user"];if(![A,B].includes(id))throw Object.assign(Error("unauthorized"),{statusCode:401});return{id,sessionId:req.headers["x-session"]||id};}});
   await app.ready();
 });
 after(async () => {
   await app?.close();
   await db?.close();
+});
+
+test('legacy push migration preserves subscriptions and one installation subscribes multiple accounts',async()=>{
+ const initial=(await db.query("SELECT user_id,token FROM push_devices WHERE installation_id='legacy-migrate'")).rows;assert.deepEqual(initial,[{user_id:A,token:'legacy-token'}]);
+ const register=(user,token)=>app.inject({url:'/me/push-devices/legacy-migrate',method:'PUT',headers:{'x-user':user},payload:{token}});
+ assert.equal((await register(B,'same-physical-token')).statusCode,200);
+ assert.equal((await register(A,'same-physical-token')).statusCode,200);
+ assert.equal((await db.query("SELECT * FROM push_devices WHERE installation_id='legacy-migrate'")).rows.length,2);
+ await app.inject({url:'/me/push-devices/legacy-migrate',method:'DELETE',headers:{'x-user':A}});
+ assert.deepEqual((await db.query("SELECT user_id FROM push_devices WHERE installation_id='legacy-migrate'")).rows,[{user_id:B}]);
+ await db.query("DELETE FROM push_devices WHERE installation_id='legacy-migrate'");
+});
+
+test('native registration shares the installation pause epoch across all account subscriptions',async()=>{
+ const id='fenced-installation',secret='a'.repeat(64),path='/me/push-devices/'+id;
+ const claim=await app.inject({method:'POST',url:'/me/account/push-installation',headers:{'x-user':A},payload:{installation_id:id,secret}});assert.equal(claim.statusCode,200);assert.equal(claim.json().epoch,1);
+ const register=(user,epoch,resume_push)=>app.inject({method:'PUT',url:path,headers:{'x-user':user},payload:{token:'shared-token',installation_secret:secret,installation_epoch:epoch,resume_push}});
+ assert.equal((await register(A,1)).statusCode,200);assert.equal((await register(B,1)).statusCode,200);
+ const disabled=await app.inject({method:'POST',url:'/auth/account-push-disable',payload:{installation_id:id,secret}});assert.equal(disabled.statusCode,200);assert.equal(disabled.json().epoch,2);assert.equal((await db.query('SELECT * FROM push_devices WHERE installation_id=$1',[id])).rows.length,0);
+ assert.equal((await register(A,1,true)).statusCode,409);assert.equal((await app.inject({method:'PUT',url:path,headers:{'x-user':A},payload:{token:'legacy'}})).statusCode,409);
+ assert.equal((await register(B,2,true)).statusCode,200);assert.equal((await register(A,1,true)).statusCode,409);
+ assert.deepEqual((await db.query('SELECT user_id FROM push_devices WHERE installation_id=$1',[id])).rows,[{user_id:B}]);await db.query('DELETE FROM push_devices WHERE installation_id=$1',[id]);
+});
+
+test('a history page fetches all reactions in one query and retains each author',async()=>{
+ const mids=[];for(let i=0;i<12;i++){const mid=crypto.randomUUID();mids.push(mid);await db.query("INSERT INTO messages(id,room_id,sender_id,type,text)VALUES($1,$2,$3,'text',$4)",[mid,R,A,'batch-'+i]);await db.query('INSERT INTO reactions(message_id,user_id,emoji)VALUES($1,$2,$3)',[mid,B,'👍']);}
+ queryLog.length=0;
+ const result=await app.inject({url:`/rooms/${R}/history?limit=100`,headers:{'x-user':A}});assert.equal(result.statusCode,200);
+ assert.equal(queryLog.filter(sql=>/FROM reactions\b/.test(sql)).length,1);
+ for(const mid of mids)assert.deepEqual(result.json().messages.find(m=>m.id===mid).reactions,{'👍':[B]});
+ await db.query('DELETE FROM reactions WHERE message_id=ANY($1::uuid[])',[mids]);await db.query('DELETE FROM messages WHERE id=ANY($1::uuid[])',[mids]);
+});
+
+test('listening receipts require room access, exclude personally hidden messages and survive history sync',async()=>{
+  const id=crypto.randomUUID();await db.query("INSERT INTO messages(id,room_id,sender_id,type)VALUES($1,$2,$3,'voice')",[id,R,A]);
+  const path=`/rooms/${R}/messages/${id}/listened`;
+  assert.equal((await app.inject({method:'POST',url:path,headers:{'x-user':C}})).statusCode,404);
+  assert.equal((await app.inject({method:'POST',url:path,headers:{'x-user':B}})).statusCode,200);
+  assert.equal((await app.inject({method:'POST',url:path,headers:{'x-user':B}})).statusCode,200);
+  assert.deepEqual((await db.query('SELECT listened_by FROM messages WHERE id=$1',[id])).rows[0].listened_by,[B]);
+  await db.query('INSERT INTO hidden_messages(user_id,message_id)VALUES($1,$2)',[A,id]);
+  assert.equal((await app.inject({method:'POST',url:path,headers:{'x-user':A}})).statusCode,404);
+  await db.query('DELETE FROM messages WHERE id=$1',[id]);
 });
 const call = (url, user = A, method = "GET", payload) =>
   app.inject({ url, method, headers: { "x-user": user }, payload });
@@ -139,7 +189,7 @@ test("production insert SQL deduplicates the same sender/client ID and keeps the
     "utf8",
   );
   const sql = source.match(
-    /`(INSERT INTO messages\(room_id, sender_id, type, text, media_id, meta, reply_to, encrypted_content, client_message_id\)[^`]+)`/,
+    /`(INSERT INTO messages\(room_id, sender_id, type, text, media_id, meta, reply_to, encrypted_content, client_message_id,is_post\)[^`]+)`/,
   )[1];
   const args = [
     R,
@@ -151,6 +201,7 @@ test("production insert SQL deduplicates the same sender/client ID and keeps the
     null,
     null,
     "request-0001",
+    false,
   ];
   const first = await db.query(sql, args);
   args[3] = "must-not-overwrite";
@@ -278,6 +329,9 @@ test("push registrations are scoped to sessions and cannot be deleted by another
   );
   await call("/me/push-devices/device-00001", B, "DELETE");
   assert.equal((await db.query("SELECT * FROM push_devices")).rows.length, 1);
+  assert.equal((await db.query("SELECT quick_reply FROM push_devices")).rows[0].quick_reply,false,'older APKs keep standard notifications');
+  await call('/me/push-devices/device-00001', A, 'PUT', {token:'fcm-test',quick_reply:true});
+  assert.equal((await db.query("SELECT quick_reply FROM push_devices")).rows[0].quick_reply,true,'new APK opts into native replies');
   const newer='00000000-0000-4000-8000-000000000099';
   await db.query('INSERT INTO sessions(id,user_id) VALUES($1,$2)',[newer,A]);
   await db.query('UPDATE push_devices SET session_id=$1 WHERE user_id=$2',[newer,A]);

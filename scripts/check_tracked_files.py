@@ -12,7 +12,8 @@ def forbidden(name):
         r'(^|/)(?:\.env(?:\..*)?|secrets?|data|builds|backups?|uploads|node_modules)(?:/|$)'
         r'|\.(?:db(?:-.*)?|sqlite3?(?:-.*)?|dump|backup|keystore|jks|pem|key|p12|pfx|apk|aab|zip|tar|tgz|tar\.gz)$'
         r'|(^|/)(?:google-services\.json|GoogleService-Info\.plist|key\.properties|[^/]*service[-_]account[^/]*\.json|credentials[^/]*\.json)$'
-        r'|^mobile/(?:android|ios)/', name, re.I))
+        r'|^mobile/(?:android|ios)/'
+        r'|^mobile/modules/[^/]+/android/(?:build|\.cxx|\.gradle)/', name, re.I))
 
 
 def main():

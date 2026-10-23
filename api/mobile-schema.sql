@@ -1,5 +1,6 @@
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_message_id text;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at timestamptz;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS listened_by jsonb NOT NULL DEFAULT '[]';
 CREATE UNIQUE INDEX IF NOT EXISTS messages_client_id ON messages(sender_id,client_message_id);
 CREATE INDEX IF NOT EXISTS messages_room_order ON messages(room_id,created_at,id);
 CREATE TABLE IF NOT EXISTS room_preferences (
@@ -10,10 +11,25 @@ CREATE TABLE IF NOT EXISTS room_preferences (
   marked_unread boolean NOT NULL DEFAULT false, PRIMARY KEY(user_id,room_id)
 );
 CREATE TABLE IF NOT EXISTS push_devices (
-  installation_id text PRIMARY KEY, user_id uuid REFERENCES users(id) ON DELETE CASCADE,
+  installation_id text NOT NULL, user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   session_id uuid REFERENCES sessions(id) ON DELETE CASCADE,
-  token text NOT NULL, active_room_id uuid, updated_at timestamptz NOT NULL DEFAULT now()
+  token text NOT NULL, active_room_id uuid, quick_reply boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY(user_id,installation_id)
 );
+ALTER TABLE push_devices ADD COLUMN IF NOT EXISTS quick_reply boolean NOT NULL DEFAULT false;
+-- A physical installation may subscribe several independent accounts.
+DO $push_accounts$
+DECLARE previous_key text;
+BEGIN
+  LOCK TABLE push_devices IN ACCESS EXCLUSIVE MODE;
+  IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='push_devices'::regclass AND contype='p' AND pg_get_constraintdef(oid)='PRIMARY KEY (user_id, installation_id)') THEN
+    SELECT conname INTO previous_key FROM pg_constraint WHERE conrelid='push_devices'::regclass AND contype='p';
+    IF previous_key IS NOT NULL THEN EXECUTE format('ALTER TABLE push_devices DROP CONSTRAINT %I',previous_key);END IF;
+    DELETE FROM push_devices WHERE user_id IS NULL;
+    ALTER TABLE push_devices ADD PRIMARY KEY(user_id,installation_id);
+  END IF;
+END $push_accounts$;
+CREATE INDEX IF NOT EXISTS push_devices_installation ON push_devices(installation_id);
 CREATE TABLE IF NOT EXISTS room_invites (
   token text PRIMARY KEY, room_id uuid REFERENCES rooms(id) ON DELETE CASCADE,
   created_by uuid REFERENCES users(id) ON DELETE CASCADE, created_at timestamptz NOT NULL DEFAULT now()

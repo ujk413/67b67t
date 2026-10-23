@@ -1,6 +1,8 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { useEffect, useRef, useState } from "react";
 import { Image, Linking, Pressable, Text, View } from "react-native";
 import { useTheme } from "../ThemeProvider";
+import {tokenizeMessage} from '../../../web/message-format.js';
 export function RichText({
   text,
   onUsername,
@@ -20,11 +22,11 @@ export function RichText({
     } | null>(null),
     [loading, setLoading] = useState(false);
   const controller = useRef<AbortController | null>(null);
+  const [revealed,setRevealed]=useState<Record<number,boolean>>({});
+  useEffect(()=>{setRevealed({});setPreview(null);controller.current?.abort();},[text]);
   useEffect(() => () => controller.current?.abort(), []);
-  const pieces = text.split(
-    /(https?:\/\/[^\s<>]+|@[a-zA-Z0-9_]{3,}|\*\*[^*]+\*\*|`[^`]+`)/g,
-  );
-  const url = pieces.find((part) => /^https?:\/\//.test(part));
+  const pieces=tokenizeMessage(text);
+  const url=pieces.find(part=>part.type==='link')?.href;
   const load = async () => {
     if (!url) return;
     setLoading(true);
@@ -72,41 +74,45 @@ export function RichText({
         }}
       >
         {pieces.map((part, i) => {
-          if (/^https?:\/\//.test(part))
+          if (part.type==='link')
             return (
               <Text
                 key={i}
                 style={{ color: colors.text.blue }}
                 onPress={() => {
-                  void Linking.openURL(part);
+                  void Linking.openURL(part.href!);
                 }}
               >
-                {part}
+                {part.text}
               </Text>
             );
-          if (part.startsWith("@"))
+          if (part.type==='mention')
             return (
               <Text
                 key={i}
                 style={{ color: colors.text.blue }}
-                onPress={() => onUsername?.(part.slice(1))}
+                onPress={() => onUsername?.(part.username!)}
               >
-                {part}
+                {part.text}
               </Text>
             );
-          if (part.startsWith("**") && part.endsWith("**"))
+          if (part.type==='bold')
             return (
               <Text key={i} style={{ fontWeight: "700" }}>
-                {part.slice(2, -2)}
+                {part.text}
               </Text>
             );
-          if (part.startsWith("`") && part.endsWith("`"))
+          if (part.type==='code'||part.type==='codeblock')
             return (
               <Text key={i} style={{ fontFamily: "monospace" }}>
-                {part.slice(1, -1)}
+                {part.type==='codeblock'?'\n'+part.text+'\n':part.text}
               </Text>
             );
-          return part;
+          if(part.type==='italic')return <Text key={i} style={{fontStyle:'italic'}}>{part.text}</Text>;
+          if(part.type==='strike')return <Text key={i} style={{textDecorationLine:'line-through'}}>{part.text}</Text>;
+          if(part.type==='quote')return <Text key={i} style={{color:colors.text.secondary,fontStyle:'italic'}}>┃ {part.text}</Text>;
+          if(part.type==='spoiler')return <Text key={i} accessibilityRole="button" accessibilityLabel={revealed[i]?part.text:uiText("Скрытый текст. Нажмите, чтобы показать")} onPress={()=>setRevealed(old=>({...old,[i]:!old[i]}))} style={{backgroundColor:colors.windowBackgroundGray,color:revealed[i]?colors.text.primary:colors.text.secondary}}>{revealed[i]?part.text:'▰'.repeat(Math.min(24,Math.max(3,part.text.length)))}</Text>;
+          return part.text;
         })}
         {reserveMeta ? "\u00a0".repeat(reserveMeta) : null}
       </Text>
@@ -116,7 +122,7 @@ export function RichText({
           style={{ paddingVertical: 12, minHeight: 48 }}
         >
           <Text style={{ color: colors.text.blue, fontSize: 13 }}>
-            {loading ? "Загрузка…" : "Предпросмотр ссылки"}
+            {loading ? uiText("Загрузка…") : uiText("Предпросмотр ссылки")}
           </Text>
         </Pressable>
       )}

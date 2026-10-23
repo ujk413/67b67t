@@ -21,6 +21,11 @@ test('auth flow prevents duplicate submissions and preserves the specific server
   const first = authenticate('register', {}); await authenticate('register', {}); release(); await first;
   assert.equal(requests, 1); assert.match(reports.at(-1), /Имя уже занято/);
 });
+
+test('account challenge and key restore finish before exposing the authenticated user or starting sync',async()=>{
+ const trace=[];const authenticate=createAuthFlow({request:async()=>({challenge:{id:'challenge'}}),resolveChallenge:async challenge=>{assert.equal(challenge.id,'challenge');trace.push('factor');return{user:{id:'alice'}};},prepareUser:async()=>{trace.push('keys');},setUser:()=>trace.push('user'),initialize:async()=>trace.push('sync'),render:()=>trace.push('render'),report(){},busy(){}});
+ await authenticate('login',{});assert.deepEqual(trace,['factor','keys','user','render','sync']);
+});
 test('registration rolls back the account when creation of its session fails', async () => {
   const db = new PGlite(); await db.exec(`CREATE TABLE users(id text DEFAULT 'new-user',username text,password_hash text,created_at timestamptz DEFAULT now());
     CREATE TABLE user_public_names(user_id text,name text UNIQUE,kind text); CREATE TABLE rooms(id text,kind text,title text); CREATE TABLE room_members(room_id text,user_id text,role text);`);

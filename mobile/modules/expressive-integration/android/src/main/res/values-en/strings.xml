@@ -1,0 +1,7 @@
+<resources>
+  <string name="expressive_shortcut_chats">Chats</string>
+  <string name="expressive_shortcut_open">Open 67chat</string>
+  <string name="expressive_shortcut_compose">Compose</string>
+  <string name="expressive_shortcut_saved">Saved messages</string>
+  <string name="expressive_widget_empty">No unread messages</string>
+</resources>

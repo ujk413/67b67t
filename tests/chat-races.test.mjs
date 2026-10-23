@@ -13,6 +13,19 @@ globalThis.window={addEventListener(){}};globalThis.document={getElementById:()=
 const deferred=()=>{let resolve;const promise=new Promise(r=>resolve=r);return{promise,resolve};};
 const message=(room,id)=>({id,room_id:room,sender_id:'peer',text:id,type:'text',created_at:'2026-10-21T00:00:00Z'});
 const page=messages=>({messages,has_older:false,has_newer:false});
+test('an old account notification cleanup cannot log out a newly selected browser account',async()=>{
+ const ts=createRequire(new URL('../mobile/package.json',import.meta.url))('typescript'),source=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),tree=ts.createSourceFile('app.js',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.JS),fn=tree.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='api');
+ let logouts=0;
+ const api=vm.runInNewContext('('+fn.getText(tree)+')',{API:'/api',AbortController,FormData,setTimeout,clearTimeout,browserSessionGeneration:()=>5,selectedBrowserAccount:()=> 'bob',browserAccountHeaders:()=>({'X-Account-Id':'bob'}),fetch:async()=>({status:401,ok:false,json:async()=>({error:'unauthorized'})}),isAuthEntryPath:()=>false,handleUnauthorized:()=>{logouts++;}});
+ await assert.rejects(api('/me/web-push',{method:'DELETE',headers:{'X-Account-Id':'alice'}}));assert.equal(logouts,0);
+ await assert.rejects(api('/rooms'));assert.equal(logouts,1);
+});
+test('a room-list response from a previous browser session cannot decrypt or write into a new account',async()=>{
+ const requireMobile=createRequire(new URL('../mobile/package.json',import.meta.url)),ts=requireMobile('typescript'),source=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),tree=ts.createSourceFile('app.js',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.JS),fn=tree.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='loadRooms');
+ const delayed=deferred(),state={me:{id:'original'},rooms:[]},writes=[];let generation=0,decrypts=0;
+ const callback=vm.runInNewContext('('+fn.getText(tree)+')',{state,browserSessionGeneration:()=>generation,api:()=>delayed.promise,chatRuntime:{local:()=>({set:async(...args)=>writes.push(args)})},prepareRoomPreviews:async rooms=>{decrypts++;return rooms;},updateRoomsList:()=>{}});
+ const pending=callback();state.me={id:'new'};generation++;delayed.resolve([{id:'private-original-room'}]);await pending;assert.equal(decrypts,0);assert.equal(writes.length,0);assert.equal(state.rooms.length,0);
+});
 async function harness(options={}) {
  const state={me:{id:crypto.randomUUID()},rooms:[{id:'A'},{id:'B'}],messages:[],activeRoomId:null},drafts=new Map();
  const request=options.request || (async path=>path.includes('/history')?page([]):[]);

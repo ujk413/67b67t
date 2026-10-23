@@ -1,0 +1,7 @@
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+  <shortcut android:shortcutId="open_chats" android:enabled="true" android:icon="@drawable/expressive_shortcut" android:shortcutShortLabel="@string/expressive_shortcut_chats" android:shortcutLongLabel="@string/expressive_shortcut_open">
+    <intent android:action="android.intent.action.VIEW" android:targetPackage="ru.b67t.messenger.mobile" android:targetClass="ru.b67t.messenger.mobile.MainActivity" />
+  </shortcut>
+  <shortcut android:shortcutId="compose" android:enabled="true" android:icon="@drawable/expressive_shortcut" android:shortcutShortLabel="@string/expressive_shortcut_compose"><intent android:action="android.intent.action.VIEW" android:targetPackage="ru.b67t.messenger.mobile" android:targetClass="ru.b67t.messenger.mobile.MainActivity" android:data="67chat://action/compose"/></shortcut>
+  <shortcut android:shortcutId="saved" android:enabled="true" android:icon="@drawable/expressive_shortcut" android:shortcutShortLabel="@string/expressive_shortcut_saved"><intent android:action="android.intent.action.VIEW" android:targetPackage="ru.b67t.messenger.mobile" android:targetClass="ru.b67t.messenger.mobile.MainActivity" android:data="67chat://action/saved"/></shortcut>
+</shortcuts>

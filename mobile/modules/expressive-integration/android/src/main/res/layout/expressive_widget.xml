@@ -1,0 +1,4 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:id="@+id/expressive_widget_root" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical" android:gravity="center" android:background="#0B7F61" android:padding="12dp">
+  <TextView android:id="@+id/expressive_widget_title" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="67chat" android:textColor="#ffffff" android:textSize="18sp" android:textStyle="bold" />
+  <TextView android:id="@+id/expressive_widget_count" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/expressive_widget_empty" android:textColor="#ffffff" android:textSize="14sp" />
+</LinearLayout>

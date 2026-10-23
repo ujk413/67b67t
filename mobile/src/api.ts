@@ -81,6 +81,7 @@ export async function request<T>(
 }
 
 export const api = {
+  listened:(base:string,token:string,room:string,message:string)=>request(base,`/rooms/${room}/messages/${message}/listened`,{token,method:'POST'}),
   login(baseUrl: string, username: string, password: string) {
     return request<AuthResponse>(baseUrl, "/auth/login", {
       method: "POST",
@@ -88,9 +89,9 @@ export const api = {
       token: null,
     });
   },
-  mobileLogin(baseUrl: string, username: string, password: string) {
-    return request<AuthResponse>(baseUrl, '/auth/login', {
-      method: 'POST', body: { username, password }, bearerSession: true,
+  mobileLogin(baseUrl: string, username: string, password: string,deviceKey?:string) {
+    return request<AuthResponse|{error:'account_challenge_required';challenge:import('./features/AuthChallenge').AccountChallenge}>(baseUrl, '/auth/login', {
+      method: 'POST', body: { username, password,device_key:deviceKey,device_name:'67chat Android' }, bearerSession: true,
     });
   },
   mobileRegister(baseUrl: string, username: string, password: string) {
@@ -138,7 +139,7 @@ export const api = {
       body: {},
     });
   },
-  uploadE2EKeys(
+  async uploadE2EKeys(
     baseUrl: string,
     token: string,
     deviceId: string,
@@ -149,12 +150,18 @@ export const api = {
       preKeys: Array<{ keyId: number; publicKey: string }>;
     },
   ) {
+    let proof:{id:string;signature:string}|undefined;
+    try{
+      const capabilities=await request<{device_proof?:boolean}>(baseUrl,'/me/account/capabilities',{token});
+      if(capabilities.device_proof){const challenge=await request<{id:string;user_id:string;challenge:string}>(baseUrl,'/e2e/device-proof',{token,method:'POST',body:{device_id:deviceId,identity_key:keys.identityKey}});proof={id:challenge.id,signature:await (await import("./accountRegistry")).signMobileDeviceProof(challenge.user_id,challenge.challenge)};}
+    }catch(error){if((error as {status?:number}).status!==404)throw error;}
     return request<{ ok: boolean }>(baseUrl, "/e2e/keys", {
       method: "POST",
       token,
       body: {
         device_id: deviceId,
         identity_key: keys.identityKey,
+        ...(proof?{device_proof:proof}:{}),
         registration_id: keys.registrationId || 0,
         signed_pre_key: {
           key_id: keys.signedPreKey.keyId,

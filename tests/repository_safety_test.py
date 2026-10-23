@@ -12,7 +12,7 @@ class RepositorySafety(unittest.TestCase):
         for name in ['.env', 'api/.env.production', 'data/postgres/db', 'secrets/firebase.json',
                      'mobile/google-services.json', 'key.properties', 'signing/release.keystore',
                      'archive.tar.gz', 'db/real.sqlite-wal', 'backups/users.dump', 'uploads/photo.png',
-                     'mobile/android/app/build.gradle', 'firebase_service_account.json', 'mobile/src/data/history.sqlite']:
+                     'mobile/android/app/build.gradle', 'mobile/modules/room-key/android/build/outputs/classes.jar', 'firebase_service_account.json', 'mobile/src/data/history.sqlite']:
             with self.subTest(name=name):
                 self.assertTrue(safety.forbidden(name))
 

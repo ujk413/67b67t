@@ -1,7 +1,8 @@
 // Service Worker for Push Notifications and PWA
-const CACHE_NAME = "67chat-20261023d";
+const CACHE_NAME = "67chat-20261023f-017";
 const urlsToCache = [
-  '/manifest.webmanifest', '/icons/app-192.png', '/icons/notification-96.png'
+  '/manifest.webmanifest', '/icons/app-192.png', '/icons/notification-96.png',
+  '/quality-features.js', '/quality-i18n.js', '/quality-policy.js'
 ];
 
 // Install event - cache static assets
@@ -67,21 +68,25 @@ self.addEventListener('push', event => {
   try { data = event.data ? event.data.json() : {}; } catch {}
   event.waitUntil(self.registration.showNotification(data.title || '67chat', {
     body: data.body || 'Новое сообщение', icon: '/icons/app-192.png', badge: '/icons/notification-96.png',
-    tag: data.roomId ? 'room-' + data.roomId : data.tag || '67chat-test',
+    tag: data.tag || (data.roomId ? 'room-' + data.roomId : '67chat-test'),
     renotify: true, vibrate: [120,60,120], silent: false,
-    data: { url: data.url || '/', roomId: data.roomId, messageId: data.messageId },
+    data: { url: data.url || '/', roomId: data.roomId, messageId: data.messageId, recipientId: data.recipientId || data.recipient_id },
   }));
 });
 self.addEventListener('notificationclick', event => {
   event.notification.close();
   let target = new URL(event.notification.data?.url || '/', self.location.origin);
   if (target.origin !== self.location.origin) target = new URL('/', self.location.origin);
+  const data=event.notification.data||{};
+  if(data.recipientId)target.searchParams.set('account_id',data.recipientId);
+  if(data.roomId)target.searchParams.set('room',data.roomId);
+  if(data.messageId)target.searchParams.set('msg',data.messageId);
   event.waitUntil((async () => {
     const windows = await clients.matchAll({ type: 'window', includeUncontrolled: true });
     const client = windows.find(item => new URL(item.url).origin === self.location.origin);
     if (client) {
       await client.focus();
-      client.postMessage({ type: 'OPEN_ROOM', roomId: event.notification.data?.roomId });
+      client.postMessage({ type: 'OPEN_ROOM', roomId: data.roomId, messageId: data.messageId, recipientId: data.recipientId });
       return;
     }
     return clients.openWindow(target.href);

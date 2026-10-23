@@ -13,6 +13,16 @@ FILES = [
     'deploy/Caddyfile', 'deploy/README.md',
     'api/Dockerfile', 'api/.dockerignore', 'api/package.json', 'api/package-lock.json',
     'api/server.js', 'api/socket-session.js', 'api/mobile.js', 'api/mobile-schema.sql', 'api/push.js', 'api/web-push.js', 'api/organization.js', 'api/calls.js', 'api/app-release.js',
+    'api/account-features.js', 'api/account-features.sql', 'api/account-integration.js', 'api/account-integration.sql', 'api/browser-accounts.js',
+    'api/account-push-policy.js', 'api/account-push-policy.sql',
+    'api/conversation-features.js', 'api/conversation-features.sql',
+    'api/expressive-features.js', 'api/expressive-features.sql',
+    'api/quality-features.js', 'api/quality-features.sql',
+    'api/expressive-payloads.js', 'api/message-features.js', 'api/media-access.js',
+    'api/map-bundle.js', 'api/map-data/osm-overview.geojson',
+    'api/call-features.js', 'api/call-features.sql', 'api/sfu-gateway.js', 'docker-compose.calls.yml',
+    'web/.well-known/assetlinks.json',
+    'web/vendor/livekit-LICENSE.txt',
     'scripts/init_server.py', 'scripts/backup_db.sh', 'scripts/configure_web_push.py',
     'scripts/prepare_server_bundle.py', 'scripts/live_server_check.mjs', 'scripts/publish_apk.sh',
 ]
@@ -21,7 +31,7 @@ FILES = [
 def main():
     paths = [ROOT / name for name in FILES]
     paths += sorted((ROOT / 'db').rglob('*.sql'))
-    web_extensions = {'.html', '.js', '.css', '.svg', '.png', '.webmanifest', '.woff', '.woff2'}
+    web_extensions = {'.html', '.js', '.mjs', '.css', '.svg', '.png', '.webmanifest', '.woff', '.woff2'}
     paths += sorted(p for p in (ROOT / 'web').rglob('*') if p.is_file() and p.suffix in web_extensions)
     hashes, payloads = {}, {}
     for path in paths:

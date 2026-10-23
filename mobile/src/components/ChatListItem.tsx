@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { useTheme } from "../ThemeProvider";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { telegramColors, telegramMetrics } from "../theme";
@@ -6,6 +7,7 @@ import { roomTitle, roomPreview, listTime } from "../format";
 import type { Room } from "../types";
 
 type ChatListItemProps = {
+  draft?:string;
   room: Room;
   meId: string;
   baseUrl: string;
@@ -20,6 +22,7 @@ type ChatListItemProps = {
 const AVATAR_SIZE = 50;
 
 export function ChatListItem({
+  draft,
   room,
   meId,
   baseUrl,
@@ -44,7 +47,7 @@ export function ChatListItem({
       onLongPress={onLongPress}
       accessibilityRole="button"
       accessibilityLabel={
-        unreadCount > 0 ? `${title}, непрочитанных: ${unreadCount}` : title
+        unreadCount > 0 ? uiText("{0}, непрочитанных: {1}",title,unreadCount) : title
       }
     >
       <Avatar
@@ -63,7 +66,7 @@ export function ChatListItem({
         </View>
         <View style={styles.bottomRow}>
           <Text style={styles.message} numberOfLines={1}>
-            {preview}
+            {draft?<><Text style={{color:telegramColors.misc.error}}>{uiText("Черновик:")}</Text>{draft}</>:preview}
           </Text>
           {unreadCount > 0 && (
             <View style={[styles.badge, muted && styles.badgeMuted]}>

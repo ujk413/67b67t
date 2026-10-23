@@ -1,3 +1,4 @@
+import {t as uiText} from "../../../web/i18n.js";
 import { useState } from "react";
 import { VoiceRecorder } from "./VoiceRecorder";
 import type { AccountRepository } from "../data/repository";
@@ -9,7 +10,7 @@ import { telegramColors, telegramMetrics } from "../theme";
 type ComposerProps = {
   repository?: AccountRepository | null;
   roomId?: string;
-  onVoiceRecorded?: (uri: string, duration: number) => Promise<void>;
+  onVoiceRecorded?: (uri: string, duration: number, waveform?:number[]) => Promise<void>;
   value: string;
   onChangeText: (text: string) => void;
   onSend: () => void;
@@ -45,7 +46,7 @@ export function Composer({
         <Pressable
           onPress={onAttach}
           accessibilityRole="button"
-          accessibilityLabel="Добавить вложение"
+          accessibilityLabel={uiText("Добавить вложение")}
           hitSlop={8}
           style={styles.iconButton}
           disabled={disabled}
@@ -58,7 +59,7 @@ export function Composer({
         style={[styles.input, { fontSize, display: recordingExpanded ? "none" : "flex" }]}
         value={value}
         onChangeText={onChangeText}
-        placeholder="Сообщение"
+        placeholder={uiText("Сообщение")}
         placeholderTextColor={telegramColors.composer.hint}
         multiline
         editable={!disabled}
@@ -68,7 +69,7 @@ export function Composer({
         <Pressable
           onPress={onSend}
           accessibilityRole="button"
-          accessibilityLabel="Отправить сообщение"
+          accessibilityLabel={uiText("Отправить сообщение")}
           hitSlop={8}
           style={styles.sendButton}
           disabled={disabled}
@@ -101,7 +102,7 @@ export function Composer({
           />
         </Pressable>
       ) : null}
-      {!hasText && !recordingExpanded && onVideoNote && <Pressable onPress={onVideoNote} accessibilityRole="button" accessibilityLabel="Записать видеокружок" style={styles.iconButton}><Icon name="video" /></Pressable>}
+      {!hasText && !recordingExpanded && onVideoNote && <Pressable onPress={onVideoNote} accessibilityRole="button" accessibilityLabel={uiText("Записать видеокружок")} style={styles.iconButton}><Icon name="video" /></Pressable>}
     </View>
   );
 }

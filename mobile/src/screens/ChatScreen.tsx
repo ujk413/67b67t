@@ -1,6 +1,11 @@
+import {messageWindowState,setMessageViewport,messageWindowUnseenCount,consumeMessageWindowUnseen} from '../data/messages';
+import {locale as uiLocale} from "../../../web/i18n.js";
+import {t as uiText} from "../../../web/i18n.js";
 import { presenceText, sameMessageGroup } from "../presentation";
 import { groupAlbums } from "../data/albums";
 import { Album } from "../components/Album";
+import {isExpressiveControl,parseMessagePayload} from '../features/messagePayloads';
+import {selectLoadedRange} from '../../../web/message-selection.js';
 import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -19,6 +24,7 @@ import { Composer } from "../components/Composer";
 import { MessageBubble } from "../components/MessageBubble";
 import { dayLabel, participantsLabel } from "../format";
 import { useTheme } from "../ThemeProvider";
+import {WallpaperPattern} from '../features/WallpaperPattern';
 import type { AccountRepository } from "../data/repository";
 import type { Message, Room, User } from "../types";
 
@@ -36,7 +42,7 @@ type Props = {
   recording?: boolean;
   playingId: string | null;
   disabled?: boolean;
-  onVoiceRecorded?: (uri: string, duration: number) => Promise<void>;
+  onVoiceRecorded?: (uri: string, duration: number, waveform?:number[]) => Promise<void>;
   onBack: () => void;
   onRefresh: () => void;
   onChangeComposer: (text: string) => void;
@@ -75,13 +81,18 @@ type Props = {
   onCancelReply?: () => void;
   onJump?: (id: string) => void;
   onUnpin?: () => void;
+  onPins?: () => void;
   onRetry?: (id: string) => void;
   onCancelSend?: (id: string) => void;
 };
 export function ChatScreen(p: Props) {
-  const { colors } = useTheme();
+  const { colors,wallpaper,dark } = useTheme();
   const [headerMenu, setHeaderMenu] = useState(false);
-  const grouped = groupAlbums(p.messages);
+  const windowState=messageWindowState(p.room.id),hasOlder=!!p.hasOlder||windowState.hasOlder,hasNewer=!!p.hasNewer||windowState.hasNewer;
+  const unseen=messageWindowUnseenCount(p.room.id,p.meId);
+  const [,refreshWindow]=useState(0);
+  const visibleMessages=p.messages.filter(message=>!isExpressiveControl(parseMessagePayload(message.text)));
+  const grouped = groupAlbums(visibleMessages);
   const groupedRef = useRef(grouped);
   groupedRef.current = grouped;
   const list = useRef<FlatList<Message>>(null),
@@ -91,7 +102,6 @@ export function ChatScreen(p: Props) {
   const latest = useRef(p);
   latest.current = p;
   const [selected, setSelected] = useState<string[]>([]),
-    [unseen, setUnseen] = useState(0),
     [highlight, setHighlight] = useState<string | null>(null);
   useEffect(() => setSelected([]), [p.selectionReset]);
   const previousIds = useRef(new Set<string>()),
@@ -120,7 +130,8 @@ export function ChatScreen(p: Props) {
       const last = lastItem
         ? groupedRef.current.groupFor(lastItem)?.at(-1) || lastItem
         : undefined;
-      if (!last) return;
+      if (!last||last.room_id!==latest.current.room.id) return;
+      if(consumeMessageWindowUnseen(latest.current.room.id,last))refreshWindow(value=>value+1);
       const first = items[0]?.item;
       anchor.current = first?.id || null;
       if (positionTimer.current) clearTimeout(positionTimer.current);
@@ -139,7 +150,6 @@ export function ChatScreen(p: Props) {
     nearBottom.current = true;
     previousIds.current = new Set();
     setSelected([]);
-    setUnseen(0);
     return () => {
       if (positionTimer.current) clearTimeout(positionTimer.current);
     };
@@ -167,13 +177,9 @@ export function ChatScreen(p: Props) {
     }
     const additions = p.messages.filter((m) => !previousIds.current.has(m.id));
     if (previousIds.current.size && additions.length) {
-      if (nearBottom.current && !p.loadingOlder && !p.focusId)
+      if (nearBottom.current && !hasNewer && !p.loadingOlder && !p.focusId)
         requestAnimationFrame(() =>
           list.current?.scrollToEnd({ animated: true }),
-        );
-      else if (!p.loadingOlder)
-        setUnseen(
-          (n) => n + additions.filter((m) => m.sender_id !== p.meId).length,
         );
     }
     previousIds.current = new Set(p.messages.map((m) => m.id));
@@ -192,17 +198,17 @@ export function ChatScreen(p: Props) {
           subtitle={
             p.typingNames.length
               ? p.typingNames.length === 1
-                ? `${p.typingNames[0]} печатает…`
-                : `${p.typingNames.join(", ")} печатают…`
+                ? uiText("{0} печатает…",p.typingNames[0])
+                : uiText("{0} печатают…",p.typingNames.join(", "))
               : p.room.kind === "dm"
                 ? p.connection && p.connection !== "connected"
-                  ? "Подключение…"
+                  ? uiText("Подключение…")
                   : presenceText(p.peer)
                 : p.room.kind === "channel"
-                  ? "Канал"
+                  ? uiText("Канал")
                   : p.participants && p.participants.length > 1
                     ? participantsLabel(p.participants.length)
-                    : "Группа"
+                    : uiText("Группа")
           }
           online={
             !!p.typingNames.length ||
@@ -233,18 +239,20 @@ export function ChatScreen(p: Props) {
               style={{ padding: 12, minHeight: 48 }}
             >
               <Text style={{ color: colors.text.blue }}>
-                Действия · {selected.length}
+                {uiText("Действия ·")}{selected.length}
               </Text>
             </Pressable>
             <Pressable
               onPress={() => setSelected([])}
               style={{ padding: 12, minHeight: 48 }}
             >
-              <Text style={{ color: colors.text.blue }}>Отмена</Text>
+              <Text style={{ color: colors.text.blue }}>{uiText("Отмена")}</Text>
             </Pressable>
+            <Pressable accessibilityRole="button" onPress={()=>Alert.alert(uiText("Диапазон выделения"),uiText("Только сообщения из загруженной истории, включая выбранное."),[{text:uiText("Выбрать до"),onPress:()=>setSelected(selectLoadedRange(visibleMessages,selected.at(-1)!,'before'))},{text:uiText("Выбрать после"),onPress:()=>setSelected(selectLoadedRange(visibleMessages,selected.at(-1)!,'after'))},{text:uiText("Все загруженные"),onPress:()=>setSelected(selectLoadedRange(visibleMessages,'','all'))}],{cancelable:true})} style={{padding:12,minHeight:48}}><Text style={{color:colors.text.blue}}>{uiText("Диапазон")}</Text></Pressable>
           </>
         )}
       </View>
+      {!!selected.length&&<Text style={{paddingHorizontal:14,paddingVertical:4,color:colors.text.secondary,backgroundColor:colors.windowBackground}}>{(()=>{const chosen=p.messages.filter(message=>selected.includes(message.id));return chosen.length?uiText("Границы: {0} — {1}",new Date(chosen[0].created_at).toLocaleString(uiLocale()),new Date(chosen.at(-1)!.created_at).toLocaleString(uiLocale())):'';})()}</Text>}
       {p.searchMatches && (
         <View
           style={{
@@ -254,12 +262,12 @@ export function ChatScreen(p: Props) {
           }}
         >
           <Pressable
-            accessibilityLabel="Предыдущее совпадение"
+            accessibilityLabel={uiText("Предыдущее совпадение")}
             disabled={p.searchMatches.index === 0}
             onPress={() => p.onSearchNavigate?.(-1)}
             style={{ padding: 14, minHeight: 48 }}
           >
-            <Text style={{ color: colors.text.blue }}>Назад</Text>
+            <Text style={{ color: colors.text.blue }}>{uiText("Назад")}</Text>
           </Pressable>
           <Text
             style={{
@@ -268,22 +276,22 @@ export function ChatScreen(p: Props) {
               color: colors.text.secondary,
             }}
           >
-            {p.searchMatches.index + 1} из {p.searchMatches.total}
+            {p.searchMatches.index + 1} {uiText("из")}{p.searchMatches.total}
           </Text>
           <Pressable
-            accessibilityLabel="Следующее совпадение"
+            accessibilityLabel={uiText("Следующее совпадение")}
             disabled={p.searchMatches.index === p.searchMatches.total - 1}
             onPress={() => p.onSearchNavigate?.(1)}
             style={{ padding: 14, minHeight: 48 }}
           >
-            <Text style={{ color: colors.text.blue }}>Далее</Text>
+            <Text style={{ color: colors.text.blue }}>{uiText("Далее")}</Text>
           </Pressable>
           <Pressable
-            accessibilityLabel="Закрыть результаты поиска"
+            accessibilityLabel={uiText("Закрыть результаты поиска")}
             onPress={p.onCloseSearch}
             style={{ padding: 14, minHeight: 48 }}
           >
-            <Text style={{ color: colors.text.blue }}>Готово</Text>
+            <Text style={{ color: colors.text.blue }}>{uiText("Готово")}</Text>
           </Pressable>
         </View>
       )}
@@ -320,8 +328,7 @@ export function ChatScreen(p: Props) {
               style={{ padding: 16, minHeight: 48 }}
             >
               <Text style={{ color: colors.text.primary, fontSize: 16 }}>
-                Поиск в переписке
-              </Text>
+                {uiText("Поиск в переписке")}</Text>
             </Pressable>
             <Pressable
               accessibilityRole="button"
@@ -332,21 +339,22 @@ export function ChatScreen(p: Props) {
               style={{ padding: 16, minHeight: 48 }}
             >
               <Text style={{ color: colors.text.primary, fontSize: 16 }}>
-                Информация
-              </Text>
+                {uiText("Информация")}</Text>
             </Pressable>
           </View>
         </Pressable>
       </Modal>
       {p.loading && <ActivityIndicator color={colors.text.blue} />}
       {!!p.room.pinned_message_id && <View style={{flexDirection:'row',alignItems:'center',backgroundColor:colors.windowBackground}}>
-        <Pressable accessibilityRole="button" accessibilityLabel="Перейти к закреплённому сообщению" onPress={() => jump(p.room.pinned_message_id!)} style={{flex:1,padding:12,borderLeftWidth:3,borderColor:colors.text.blue}}>
-          <Text style={{color:colors.text.blue,fontWeight:'600'}}>Закреплённое сообщение</Text>
-          <Text numberOfLines={1} style={{color:colors.text.secondary}}>{p.messages.find(m=>m.id===p.room.pinned_message_id)?.text || 'Нажмите, чтобы открыть'}</Text>
+        <Pressable accessibilityRole="button" accessibilityLabel={uiText("Перейти к закреплённому сообщению")} onPress={() => jump(p.room.pinned_message_id!)} style={{flex:1,padding:12,borderLeftWidth:3,borderColor:colors.text.blue}}>
+          <Text style={{color:colors.text.blue,fontWeight:'600'}}>{uiText("Закреплённое сообщение")}</Text>
+          <Text numberOfLines={1} style={{color:colors.text.secondary}}>{p.messages.find(m=>m.id===p.room.pinned_message_id)?.text || uiText("Нажмите, чтобы открыть")}</Text>
         </Pressable>
-        {p.onUnpin && <Pressable accessibilityRole="button" accessibilityLabel="Открепить сообщение" onPress={p.onUnpin} style={{padding:16}}><Text style={{color:colors.text.secondary}}>✕</Text></Pressable>}
+        {p.onPins && <Pressable accessibilityRole="button" accessibilityLabel={uiText("Все закрепления")} onPress={p.onPins} style={{padding:12}}><Text style={{color:colors.text.blue}}>{uiText("Все")}</Text></Pressable>}
+        {p.onUnpin && <Pressable accessibilityRole="button" accessibilityLabel={uiText("Открепить сообщение")} onPress={p.onUnpin} style={{padding:16}}><Text style={{color:colors.text.secondary}}>✕</Text></Pressable>}
       </View>}
       <View style={{ flex: 1, backgroundColor: colors.chat.wallpaper }}>
+        <WallpaperPattern mode={wallpaper} dark={dark}/>
         <FlatList
           ref={list}
           data={grouped.display}
@@ -367,12 +375,13 @@ export function ChatScreen(p: Props) {
             nearBottom.current =
               contentOffset.y + layoutMeasurement.height >=
               contentSize.height - 100;
-            if (nearBottom.current) setUnseen(0);
+            setMessageViewport(p.room.id,nearBottom.current);
+            if (nearBottom.current&&!hasNewer&&consumeMessageWindowUnseen(p.room.id))refreshWindow(value=>value+1);
             if (
               loadingFromGesture.current &&
               contentOffset.y < 50 &&
               restored.current &&
-              latest.current.hasOlder &&
+              (latest.current.hasOlder||messageWindowState(latest.current.room.id).hasOlder) &&
               !latest.current.loadingOlder &&
               !latest.current.loading
             ) {
@@ -396,7 +405,7 @@ export function ChatScreen(p: Props) {
             }, 200);
           }}
           ListHeaderComponent={
-            p.hasOlder ? (
+            hasOlder ? (
               <Pressable
                 onPress={p.onOlder}
                 disabled={p.loadingOlder}
@@ -408,21 +417,19 @@ export function ChatScreen(p: Props) {
                   <Text
                     style={{ textAlign: "center", color: colors.text.blue }}
                   >
-                    Загрузить предыдущие сообщения
-                  </Text>
+                    {uiText("Загрузить предыдущие сообщения")}</Text>
                 )}
               </Pressable>
             ) : null
           }
           ListFooterComponent={
-            p.hasNewer ? (
+            hasNewer ? (
               <Pressable
                 onPress={p.onNewer}
                 style={{ padding: 16, minHeight: 48 }}
               >
                 <Text style={{ color: colors.text.blue, textAlign: "center" }}>
-                  Загрузить следующие сообщения
-                </Text>
+                  {uiText("Загрузить следующие сообщения")}</Text>
               </Pressable>
             ) : null
           }
@@ -435,8 +442,7 @@ export function ChatScreen(p: Props) {
                   color: colors.text.secondary,
                 }}
               >
-                Сообщений пока нет
-              </Text>
+                {uiText("Сообщений пока нет")}</Text>
             ) : null
           }
           contentContainerStyle={{ padding: 8 }}
@@ -475,8 +481,7 @@ export function ChatScreen(p: Props) {
                       color: colors.text.blue,
                     }}
                   >
-                    Непрочитанные сообщения
-                  </Text>
+                    {uiText("Непрочитанные сообщения")}</Text>
                 )}
                 <SwipeReply
                   onReply={() => p.onReply?.(item)}
@@ -545,16 +550,14 @@ export function ChatScreen(p: Props) {
                       style={{ padding: 12, minHeight: 48 }}
                     >
                       <Text style={{ color: colors.misc.error }}>
-                        Повторить
-                      </Text>
+                        {uiText("Повторить")}</Text>
                     </Pressable>
                     <Pressable
                       onPress={() => p.onCancelSend?.(item.client_message_id!)}
                       style={{ padding: 12, minHeight: 48 }}
                     >
                       <Text style={{ color: colors.text.secondary }}>
-                        Убрать
-                      </Text>
+                        {uiText("Убрать")}</Text>
                     </Pressable>
                   </View>
                 )}
@@ -562,13 +565,13 @@ export function ChatScreen(p: Props) {
             );
           }}
         />
-        {unseen > 0 && (
+        {(unseen > 0||hasNewer) && (
           <Pressable
             onPress={() => {
+              if(hasNewer)p.onNewer?.();
               list.current?.scrollToEnd({ animated: true });
-              setUnseen(0);
             }}
-            accessibilityLabel="Перейти к новым сообщениям"
+            accessibilityLabel={uiText("Перейти к новым сообщениям")}
             style={{
               position: "absolute",
               right: 16,
@@ -578,7 +581,7 @@ export function ChatScreen(p: Props) {
               backgroundColor: colors.composer.background,
             }}
           >
-            <Text style={{ color: colors.text.blue }}>Вниз · {unseen}</Text>
+            <Text style={{ color: colors.text.blue }}>{unseen?uiText("Вниз ·")+unseen+(windowState.unseenCapped?'+':''):uiText("Вниз")}</Text>
           </Pressable>
         )}
       </View>
@@ -596,18 +599,18 @@ export function ChatScreen(p: Props) {
           >
             <Text style={{ color: colors.text.blue }}>
               {p.editing
-                ? "Редактирование"
-                : `Ответ: ${p.reply.sender_display_name || p.reply.sender_username || ""}`}
+                ? uiText("Редактирование")
+                : uiText("Ответ: {0}",p.reply.sender_display_name || p.reply.sender_username || "")}
             </Text>
             <Text numberOfLines={2} style={{ color: colors.text.primary }}>
-              {p.reply.text || "Вложение"}
+              {p.reply.text || uiText("Вложение")}
             </Text>
           </Pressable>
           <Pressable
             onPress={p.onCancelReply}
             style={{ padding: 12, minWidth: 48 }}
           >
-            <Text style={{ color: colors.text.secondary }}>Отмена</Text>
+            <Text style={{ color: colors.text.secondary }}>{uiText("Отмена")}</Text>
           </Pressable>
         </View>
       )}
