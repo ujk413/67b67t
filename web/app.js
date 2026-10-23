@@ -163,7 +163,7 @@ function previewFor(room, me) {
 
 window.pinMessage = async (id) => {
   if (!state.activeRoomId) return;
-  await request(`/rooms/${state.activeRoomId}/pin`, { method: 'PUT', body: JSON.stringify({ message_id: id }) });
+  await api(`/rooms/${state.activeRoomId}/pin`, { method: 'PUT', body: JSON.stringify({ message_id: id }) });
   toast('Сообщение закреплено');
   await loadRooms();
   await mount();
@@ -171,7 +171,7 @@ window.pinMessage = async (id) => {
 
 window.unpinMessage = async () => {
   if (!state.activeRoomId) return;
-  await request(`/rooms/${state.activeRoomId}/pin`, { method: 'PUT', body: JSON.stringify({ message_id: null }) });
+  await api(`/rooms/${state.activeRoomId}/pin`, { method: 'PUT', body: JSON.stringify({ message_id: null }) });
   await loadRooms();
   await mount();
 };
@@ -1369,6 +1369,7 @@ function connectWS() {
       state.wsAuthed = true;
       if (state.activeRoomId) joinActiveRoom();
       updateChatPresence();
+      void chatRuntime.syncHidden();
       void chatRuntime.flush();
       if (state.messages.some(m => !m.delivery)) void chatRuntime.newer();
 
@@ -1420,7 +1421,7 @@ function connectWS() {
 
     // Handle message deletion
     if (data.type === "message.delete") {
-      void chatRuntime.local()?.removeMessage(data.room_id || state.activeRoomId, data.message_id).catch(() => {});
+      void chatRuntime.hide(data.room_id || state.activeRoomId,data.message_id).catch(()=>{});
       state.messages = state.messages.filter(m => m.id !== data.message_id);
       if (state.editMessage?.id === data.message_id) state.editMessage = null;
       render();
@@ -1494,6 +1495,11 @@ function connectWS() {
     if (data.type === "room.e2e" && data.room_id) {
       groupE2eRooms.set(data.room_id, !!data.enabled);
       if (state.activeRoomId === data.room_id) render();
+    }
+    if (data.type === 'message.hide' && data.message_id) {
+      const room=data.room_id; await chatRuntime.hide(room,data.message_id);
+      if(state.activeRoomId===room){state.messages=state.messages.filter(m=>m.id!==data.message_id);renderMessages();}
+      return;
     }
     if (data.type === "room.pin" && data.room_id) {
       const room = state.rooms.find(item => item.id === data.room_id);
@@ -3023,10 +3029,10 @@ window.openMessageMenu = (id, event) => {
   // leaving the message intact for everyone else.
   add('Удалить у себя', async () => {
     if (!confirm('Удалить сообщение только у себя? У других оно останется.')) return;
-    await request(`/rooms/${state.activeRoomId}/messages/${id}/hide`, { method: 'DELETE' });
-    state.messages = state.messages.filter(item => item.id !== id);
-    await chatRuntime.local()?.removeMessage(state.activeRoomId, id);
-    await mount();
+    const roomId=message.room_id || state.activeRoomId, store=chatRuntime.local();
+    await api(`/rooms/${roomId}/messages/${id}/hide`, { method: 'DELETE' });
+    await chatRuntime.hide(roomId,id);
+    if(state.activeRoomId===roomId){state.messages=state.messages.filter(item=>item.id!==id);await mountPreservingInput();}
   }, true);
   if (message.sender_id === state.me.id) {
     if (message.type === 'text') add('Изменить', () => window.startEditMessage(id));

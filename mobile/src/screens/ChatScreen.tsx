@@ -74,6 +74,7 @@ type Props = {
   editing?: boolean;
   onCancelReply?: () => void;
   onJump?: (id: string) => void;
+  onUnpin?: () => void;
   onRetry?: (id: string) => void;
   onCancelSend?: (id: string) => void;
 };
@@ -338,6 +339,13 @@ export function ChatScreen(p: Props) {
         </Pressable>
       </Modal>
       {p.loading && <ActivityIndicator color={colors.text.blue} />}
+      {!!p.room.pinned_message_id && <View style={{flexDirection:'row',alignItems:'center',backgroundColor:colors.windowBackground}}>
+        <Pressable accessibilityRole="button" accessibilityLabel="Перейти к закреплённому сообщению" onPress={() => jump(p.room.pinned_message_id!)} style={{flex:1,padding:12,borderLeftWidth:3,borderColor:colors.text.blue}}>
+          <Text style={{color:colors.text.blue,fontWeight:'600'}}>Закреплённое сообщение</Text>
+          <Text numberOfLines={1} style={{color:colors.text.secondary}}>{p.messages.find(m=>m.id===p.room.pinned_message_id)?.text || 'Нажмите, чтобы открыть'}</Text>
+        </Pressable>
+        {p.onUnpin && <Pressable accessibilityRole="button" accessibilityLabel="Открепить сообщение" onPress={p.onUnpin} style={{padding:16}}><Text style={{color:colors.text.secondary}}>✕</Text></Pressable>}
+      </View>}
       <View style={{ flex: 1, backgroundColor: colors.chat.wallpaper }}>
         <FlatList
           ref={list}

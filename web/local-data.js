@@ -70,7 +70,9 @@ export function createAccountStore(userId) {
       const task = writes.then(async () => {
         const id = prefix + 'messages:' + roomId;
         const previous = await unpack(await access('readonly', s => s.get(id)), id) || [];
-        const byId = new Map([...previous, ...incoming].map(message => [message.id, message]));
+        const start=prefix+'hidden:',keys=await access('readonly',s=>s.getAllKeys(IDBKeyRange.bound(start,start+'\uffff')));
+        const hidden=new Set(keys.map(key=>key.slice(start.length)));
+        const byId = new Map([...previous, ...incoming].filter(message=>!hidden.has(message.id)).map(message => [message.id, message]));
         const values = [...byId.values()].sort(compareMessages), iv = crypto.getRandomValues(new Uint8Array(12));
         const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(id) }, await key(), new TextEncoder().encode(JSON.stringify(values)));
         await access('readwrite', s => s.put({ iv, data }, id));

@@ -2,10 +2,11 @@ import { createAccountStore, DurableOutbox, mergeMessages } from './local-data.j
 import { userError } from './errors.js';
 export function createChatRuntime({ state, request, decode, buildText, mount, refresh, render, report, drafts, loadRooms }) {
   let store, queue, owner, ready, generation = 0, opening = 0, olderBusy = false, newerBusy = false, searching = 0, observer, scrollTimer, readTimer, heartbeat;
+  let hidden=new Set(), syncingHidden=null;
   const pending = item => ({ ...item, id: 'local-' + item.id, client_message_id: item.id, sender_id: owner, type: item.body?.type || 'text', _text: item.text, text: item.text });
   const current = id => owner && state.me?.id === owner && (!id || state.activeRoomId === id);
   function changed(item, message) {
-    if (!current(item.room_id)) return;
+    if (!current(item.room_id) || (message && hidden.has(message.id))) return;
     if (item.cancelled) state.messages = state.messages.filter(m => m.client_message_id !== item.id);
     else if (message) state.messages = mergeMessages(state.messages, [message]);
     else if (!state.messages.some(m => !m.delivery && m.client_message_id === item.id)) state.messages = mergeMessages(state.messages, [pending(item)]);
@@ -14,13 +15,14 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
   async function page(roomId, options = {}) {
     const result = await request(`/rooms/${roomId}/history?${new URLSearchParams(options)}`);
     const messages = await Promise.all(result.messages.map(m => decode(roomId, m)));
-    return { ...result, messages };
+    return { ...result, messages:messages.filter(m=>!hidden.has(m.id)) };
   }
   function start(user) { if (owner === user.id && store) return ready; stop(); ready = startAccount(user); return ready; }
   async function startAccount(user) {
     const mine = ++generation; owner = user.id; store = createAccountStore(owner); const local = store;
-    const [cached, savedDrafts, folders] = await Promise.all([local.get('rooms', []), local.entries('draft:'),local.get('folders',[])]);
+    const [cached, savedDrafts, folders,tombstones] = await Promise.all([local.get('rooms', []), local.entries('draft:'),local.get('folders',[]),local.entries('hidden:')]);
     if (mine !== generation) return;
+    hidden=new Set(tombstones.map(([key])=>key.slice(7)));
     if (!state.rooms.length && cached.length) state.rooms = cached;
     state.folders=folders;
     for (const [name, text] of savedDrafts) if (!drafts.has(name.slice(6))) drafts.set(name.slice(6), text);
@@ -41,7 +43,25 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
     heartbeat = setInterval(() => { if (!document.hidden) void queue?.flush(); }, 15000);
     void queue.flush();
   }
-  function stop() { ++generation; ++opening; ++searching; queue?.stop(); queue = null; store = null; owner = null; ready = null; observer?.disconnect(); clearTimeout(scrollTimer); clearTimeout(readTimer); clearInterval(heartbeat); }
+  function stop() { hidden=new Set();syncingHidden=null;++generation; ++opening; ++searching; queue?.stop(); queue = null; store = null; owner = null; ready = null; observer?.disconnect(); clearTimeout(scrollTimer); clearTimeout(readTimer); clearInterval(heartbeat); }
+  async function hide(roomId,messageId) {
+    const account=owner,local=store,bag=hidden;if(!account || !local)return;
+    bag.add(messageId);
+    if(owner===account && current(roomId)){state.messages=state.messages.filter(m=>m.id!==messageId);state.searchResults=state.searchResults?.filter(m=>(m.msg || m).id!==messageId) || [];render();}
+    await local.set('hidden:'+messageId,roomId);await local.removeMessage(roomId,messageId);
+  }
+  function syncHidden() {
+    if(syncingHidden)return syncingHidden;
+    const account=owner,local=store;if(!account || !local)return Promise.resolve();
+    const task=(async()=>{try{let after;
+      do {const page=await request('/me/hidden-messages'+(after?'?after='+encodeURIComponent(after):''));
+        if(owner!==account || store!==local)return;
+        for(const item of page.items || []){if(owner!==account || store!==local)return;await hide(item.room_id,item.message_id);}
+        after=page.next_cursor;
+      }while(after);
+    }catch{/* Offline cache remains usable; reconnect retries authoritative tombstones. */}})();
+    syncingHidden=task;void task.finally(()=>{if(syncingHidden===task)syncingHidden=null;});return task;
+  }
   async function saveRooms(rooms) { if (!current()) return; await store?.set('rooms', rooms); }
   function draft(roomId, text) { drafts.set(roomId, text); void store?.set('draft:' + roomId, text).catch(e => report(userError(e))); }
   async function enqueue({ roomId, text = '', body, reply }) {
@@ -60,9 +80,10 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
     await mount();
     const [cached, outgoing] = await Promise.all([local.get('messages:' + id, []), queue.items()]);
     if (!valid()) return;
-    state.messages = mergeMessages(cached.slice(-100), outgoing.filter(x => x.room_id === id).map(pending));
+    state.messages = mergeMessages(cached.filter(m=>!hidden.has(m.id)).slice(-100), outgoing.filter(x => x.room_id === id).map(pending));
     if (state.messages.length) { state.roomLoading = false; render(); }
     try {
+      await syncHidden();if(!valid())return;
       const memberTask = request(`/rooms/${id}/members`).then(members => { if (valid()) state.roomMembers = members; }).catch(()=>{});
       const room = state.rooms.find(r => r.id === id);
       const peerTask = room?.other_user_id ? request(`/users/${room.other_user_id}`).then(peer => { if (valid()) state.activeDmPeer = peer; }).catch(()=>{}) : Promise.resolve();
@@ -70,9 +91,9 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
       const saved = await local.get('position:' + id), anchor = options.latest ? null : options.around || saved || result.first_unread_id;
       if (anchor && !result.messages.some(m => m.id === anchor)) result = await page(id, { around: anchor }).catch(() => result);
       if (!valid()) return;
-      await local.saveMessages(id, result.messages); await Promise.allSettled([memberTask, peerTask]);
+      await local.saveMessages(id, result.messages);result.messages=result.messages.filter(m=>!hidden.has(m.id)); await Promise.allSettled([memberTask, peerTask]);
       if (!valid()) return;
-      state.chatHistory = result; state.messages = mergeMessages(result.messages, state.messages.filter(m => m.delivery || (!m.delivery && m.room_id === id && new Date(m.created_at) > new Date(result.messages.at(-1)?.created_at || 0))));
+      state.chatHistory = result; state.messages = mergeMessages(result.messages, state.messages.filter(m => !hidden.has(m.id) && (m.delivery || (!m.delivery && m.room_id === id && new Date(m.created_at) > new Date(result.messages.at(-1)?.created_at || 0)))));
       state.roomLoading = false; await mount();
       const target = anchor && document.getElementById('msg-' + anchor), box = document.getElementById('msgs');
       if (target) target.scrollIntoView({ block: 'center' }); else if (box) box.scrollTop = box.scrollHeight;
@@ -83,14 +104,14 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
     if (olderBusy || !current(state.activeRoomId) || state.chatHistory?.has_older === false) return;
     const id = state.activeRoomId, before = state.messages.find(m => !m.delivery)?.id, mine = opening; if (!before) return;
     olderBusy = true; state.loadingOlder = true; render();
-    try { const result = await page(id, { before }); if (mine !== opening || !current(id)) return; await store.saveMessages(id, result.messages); state.messages = mergeMessages(result.messages, state.messages); const trimmed=state.messages.length>300;state.messages=state.messages.slice(0,300); state.chatHistory = { ...state.chatHistory, has_older: result.has_older,has_newer:trimmed || state.chatHistory?.has_newer }; }
+    try { const result = await page(id, { before }); if (mine !== opening || !current(id)) return; await store.saveMessages(id, result.messages); state.messages = mergeMessages(result.messages, state.messages).filter(m=>!hidden.has(m.id)); const trimmed=state.messages.length>300;state.messages=state.messages.slice(0,300); state.chatHistory = { ...state.chatHistory, has_older: result.has_older,has_newer:trimmed || state.chatHistory?.has_newer }; }
     catch (error) { report(userError(error)); } finally { olderBusy = false; state.loadingOlder = false; if (current(id)) render(); }
   }
   async function newer() {
     if (newerBusy || !current(state.activeRoomId)) return;
     const id = state.activeRoomId, after = state.messages.filter(m => !m.delivery).at(-1)?.id, mine = opening; if (!after) return;
     newerBusy = true;
-    try { const result = await page(id, { after }); if (mine !== opening || !current(id)) return; await store.saveMessages(id, result.messages); state.messages = mergeMessages(state.messages, result.messages); const trimmed=state.messages.length>300;state.messages=state.messages.slice(-300); state.chatHistory = { ...state.chatHistory, has_newer: result.has_newer,has_older:trimmed || state.chatHistory?.has_older }; render(); }
+    try { const result = await page(id, { after }); if (mine !== opening || !current(id)) return; await store.saveMessages(id, result.messages); state.messages = mergeMessages(state.messages, result.messages).filter(m=>!hidden.has(m.id)); const trimmed=state.messages.length>300;state.messages=state.messages.slice(-300); state.chatHistory = { ...state.chatHistory, has_newer: result.has_newer,has_older:trimmed || state.chatHistory?.has_older }; render(); }
     catch (error) { report(userError(error)); } finally { newerBusy = false; }
   }
   async function jump(id) {
@@ -99,9 +120,11 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
     const target = document.getElementById('msg-' + id); target?.scrollIntoView({ behavior: 'smooth', block: 'center' }); target?.classList.add('search-highlight-current'); setTimeout(() => target?.classList.remove('search-highlight-current'), 1800);
   }
   async function received(message) {
-    const account = owner, local = store; if (!account) return;
-    const prepared = await decode(message.room_id, message); if (owner !== account || state.me?.id !== account) return;
+    const account = owner, local = store,bag=hidden; if (!account || bag.has(message.id)) return;
+    const prepared = await decode(message.room_id, message); if (owner !== account || state.me?.id !== account || bag.has(message.id)) return;
     await local.saveMessages(message.room_id, [prepared]);
+    if(bag.has(message.id)){await local.removeMessage(message.room_id,message.id);return;}
+    if(owner!==account || state.me?.id!==account)return;
     if (current(message.room_id)) {
       if (state.chatHistory?.has_newer && !state.messages.some(m => m.id === message.id)) state.newMessages = (state.newMessages || 0) + 1;
       else {
@@ -139,8 +162,9 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
   async function search(query) {
     const mine = ++searching, roomId = state.activeRoomId, account = owner;
     state.searchQuery = query; state.searchResults = []; state.searchProgress = ''; if (query.trim().length < 2 || !roomId) { await refresh(); return; }
+    await syncHidden();if(owner!==account || roomId!==state.activeRoomId)return;
     const known = new Map((await store.get('messages:' + roomId, [])).map(m => [m.id, m]));
-    const update = async () => { if (mine !== searching || roomId !== state.activeRoomId || owner !== account) return; state.searchResults = [...known.values()].filter(m => (m._text ?? m.text ?? '').toLowerCase().includes(query.toLowerCase())); state.currentSearchIndex = 0; await refresh(); };
+    const update = async () => { if (mine !== searching || roomId !== state.activeRoomId || owner !== account) return; state.searchResults = [...known.values()].filter(m => !hidden.has(m.id) && (m._text ?? m.text ?? '').toLowerCase().includes(query.toLowerCase())); state.currentSearchIndex = 0; await refresh(); };
     await update(); let before, count = 0;
     try {
       do { const result = await page(roomId, before ? { before, limit: 100 } : { limit: 100 }); if (mine !== searching || owner !== account || roomId !== state.activeRoomId) return;
@@ -150,8 +174,8 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
       state.searchProgress = 'Вся доступная история проверена'; await update();
     } catch (error) { if (mine === searching) report(userError(error)); }
   }
-  window.addEventListener('online', () => { void queue?.flush(); if (current()) void loadRooms().catch(() => {}); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { void queue?.flush(); bind(); } });
-  return { start, stop, saveRooms, draft, enqueue, open, older, newer, jump, received, bind, search, cancelSearch: () => { ++searching; },
+  window.addEventListener('online', () => { void syncHidden();void queue?.flush(); if (current()) void loadRooms().catch(() => {}); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { void syncHidden();void queue?.flush(); bind(); } });
+  return { hide,syncHidden,start, stop, saveRooms, draft, enqueue, open, older, newer, jump, received, bind, search, cancelSearch: () => { ++searching; },
     retry: id => queue?.retry(id), cancel: id => queue?.cancel(id), flush: () => queue?.flush(), local: () => store };
 }

@@ -40,8 +40,9 @@ export function UpdateBanner({
       ? `Доступна версия ${release.version || release.versionCode}`
       : state.phase === "downloading"
         ? `Загрузка обновления… ${percent(state.progress)}`
-        : state.phase === "ready" || state.phase === "installing"
-          ? "Открываем установщик…"
+        : state.phase === "ready" ? "Файл готов. Можно повторить установку."
+        : state.phase === "installing"
+          ? "Подтвердите установку в Android или вернитесь в приложение."
           : "Не удалось обновить";
 
   if (state.phase === "available") {
@@ -93,7 +94,7 @@ export function UpdateBanner({
   // Download / install / error: a modal so progress cannot be missed and the
   // installer intent is clearly attributed to a user action.
   return (
-    <Modal transparent animationType="fade" visible onRequestClose={() => {}}>
+    <Modal transparent animationType="fade" visible onRequestClose={onDismiss}>
       <View
         style={{
           flex: 1,
@@ -139,6 +140,9 @@ export function UpdateBanner({
           )}
 
           <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: 10 }}>
+            <Pressable onPress={onDismiss} accessibilityRole="button" style={{minHeight:44,paddingHorizontal:12,justifyContent:'center'}}>
+              <Text style={{color:colors.text.blue}}>{state.phase === 'downloading' ? 'Отменить' : 'Закрыть'}</Text>
+            </Pressable>
             {state.phase === "error" && state.needsPermission && (
               <Pressable
                 onPress={onOpenPermissionSettings}
@@ -148,7 +152,7 @@ export function UpdateBanner({
                 <Text style={{ color: colors.text.blue }}>Настройки</Text>
               </Pressable>
             )}
-            {state.phase === "error" && (
+            {(state.phase === "error" || state.phase === "ready") && (
               <Pressable
                 onPress={onRetryInstall}
                 accessibilityRole="button"

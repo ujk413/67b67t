@@ -1,5 +1,5 @@
 // Service Worker for Push Notifications and PWA
-const CACHE_NAME = '67chat-v20261023-001';
+const CACHE_NAME = "67chat-20261023c";
 const urlsToCache = [
   '/manifest.webmanifest', '/icons/app-192.png', '/icons/notification-96.png'
 ];

@@ -12,6 +12,10 @@ mobile/android/
 key.properties
 *.keystore
 *.jks
+*.pem
+*.key
+*.p12
+*.pfx
 debug.keystore
 release.keystore
 
@@ -19,6 +23,8 @@ release.keystore
 google-services.json
 GoogleService-Info.plist
 firebase-service-account*.json
+*service-account*.json
+credentials*.json
 secrets/
 
 # ─────────────────────────────────────────────────────────────
@@ -30,6 +36,18 @@ data/
 api/uploads/
 uploads/
 builds/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.dump
+*.backup
+*.zip
+*.tar
+*.tar.gz
+*.tgz
 
 # ─────────────────────────────────────────────────────────────
 #  МУСОР, КОТОРЫЙ ТАЩИТ КРЕДЫ ЗА СОБОЙ

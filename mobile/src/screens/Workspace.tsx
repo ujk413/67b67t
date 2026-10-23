@@ -35,6 +35,10 @@ import { MediaTray } from "../components/MediaTray";
 import type { ProtectedUploader } from "../protectedUpload";
 type Props = {
   uploader: ProtectedUploader;
+  lockEnabled: boolean;
+  onChangeLock: () => Promise<void>;
+  onCheckUpdates: () => Promise<void>;
+  updateLabel: string;
   embedded?: boolean;
   onMode: (mode: string) => void;
   mode: string | null;
@@ -814,6 +818,8 @@ export function Workspace(p: Props) {
         {p.mode === "settings" && (
           <>
             <Row label="Профиль" onPress={p.onProfile} />
+            <Row label="Проверить обновления" detail={p.updateLabel} onPress={() => void run(p.onCheckUpdates)} />
+            <Row label="Блокировка приложения" detail={p.lockEnabled ? "Включена · отпечаток, лицо или код устройства" : "Выключена"} onPress={() => void run(p.onChangeLock)} />
             <Row label="Папки чатов" onPress={() => p.onMode("folders")} />
             <Row label="Избранное" onPress={() => void run(async () => { const room = await api.saved(); await p.onRefresh(); await p.onOpen(await api.room(room.id)); })} />
             <Row
@@ -983,6 +989,8 @@ export function MessageActions({
   onEdit,
   onForward,
   onDelete,
+  onPin,
+  onHide,
   onError,
 }: {
   messages: Message[];
@@ -994,6 +1002,8 @@ export function MessageActions({
   onEdit: (m: Message) => void;
   onForward: (items: Message[]) => void;
   onDelete: (items: Message[]) => Promise<void>;
+  onPin?: (message: Message) => Promise<void>;
+  onHide: (items: Message[]) => Promise<void>;
   onError: (error: string) => void;
 }) {
   const { colors, fontSize } = useTheme();
@@ -1107,6 +1117,8 @@ export function MessageActions({
               </>
             )}
             <Row label="Выделить несколько" onPress={onSelectMore} />
+            {messages.length === 1 && !first.delivery && onPin && <Row label="Закрепить сообщение" onPress={() => action(() => { void onPin(first).catch(e => onError(String(e))); })} />}
+            {messages.every(m => !m.delivery) && <Row label="Удалить у себя" danger onPress={() => Alert.alert("Удалить только у себя?", "У собеседника сообщения останутся", [{text:"Отмена"},{text:"Удалить",style:"destructive",onPress:()=>action(()=>{void onHide(messages).catch(e=>onError(String(e)));})}])} />}
             <Row
               label="Копировать"
               onPress={() =>

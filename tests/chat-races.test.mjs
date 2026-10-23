@@ -23,6 +23,30 @@ test('a delayed history response cannot overwrite the newly opened room',async()
  const a=deferred(),started=deferred();const h=await harness({request:async path=>{if(path.startsWith('/rooms/A/history')){started.resolve();return a.promise;}return path.includes('/history')?page([message('B','b')]):[];}});
  try {const first=h.runtime.open('A');await started.promise;await h.runtime.open('B');a.resolve(page([message('A','a')]));await first;assert.equal(h.state.activeRoomId,'B');assert.deepEqual(h.state.messages.map(m=>m.id),['b']);}finally{h.runtime.stop();}
 });
+
+test('personal tombstones survive late edited messages and a restarted web runtime',async()=>{
+ const h=await harness();try{
+  await h.runtime.open('A');await h.runtime.received(message('A','hidden'));
+  assert.equal(typeof h.runtime.hide,'function');await h.runtime.hide('A','hidden');
+  await h.runtime.received({...message('A','hidden'),text:'edited secret'});
+  await h.runtime.local().saveMessages('A',[message('A','hidden')]);
+  assert.equal((await h.runtime.local().get('messages:A',[])).some(m=>m.id==='hidden'),false);
+  assert.equal(h.state.messages.some(m=>m.id==='hidden'),false);
+  const user=h.state.me;h.runtime.stop();await h.runtime.start(user);await h.runtime.open('A');
+  await h.runtime.received(message('A','hidden'));
+  assert.equal((await h.runtime.local().get('messages:A',[])).some(m=>m.id==='hidden'),false);
+ }finally{h.runtime.stop();}
+});
+
+test('missed personal hides are reconciled before reopening cached web history or search',async()=>{
+ let offlineHide=false;
+ const visible=message('A','visible'),hidden={...message('A','hidden'),created_at:'2026-10-22T00:00:00Z'};
+ const h=await harness({request:async path=>path.startsWith('/me/hidden-messages')?{items:offlineHide?[{room_id:'A',message_id:'hidden'}]:[],next_cursor:null}:path.includes('/history')?page(offlineHide?[visible]:[visible,hidden]):[]});
+ try{await h.runtime.open('A');assert.equal(h.state.messages.length,2);offlineHide=true;
+  await h.runtime.open('A');assert.deepEqual(h.state.messages.map(m=>m.id),['visible']);
+  await h.runtime.search('hidden');assert.equal(h.state.searchResults.length,0);
+ }finally{h.runtime.stop();}
+});
 test('a message decoded after switching rooms remains cached in its original room',async()=>{
  const decoded=deferred(),h=await harness({decode:async(room,m)=>m.id==='late'?decoded.promise:m});
  try {await h.runtime.open('A');const incoming=h.runtime.received(message('A','late'));await h.runtime.open('B');decoded.resolve(message('A','late'));await incoming;assert.equal(h.state.messages.length,0);assert.equal((await h.runtime.local().get('messages:A'))[0].id,'late');}finally{h.runtime.stop();}
