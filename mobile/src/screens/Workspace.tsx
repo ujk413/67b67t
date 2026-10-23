@@ -31,6 +31,7 @@ import { roomTitle } from "../format";
 import type { Message, Room, User } from "../types";
 import { pushNotifications } from "../notifications";
 import { MediaTray } from "../components/MediaTray";
+import { ConnectionDiagnostics } from '../components/ConnectionDiagnostics';
 
 import type { ProtectedUploader } from "../protectedUpload";
 type Props = {
@@ -815,9 +816,11 @@ export function Workspace(p: Props) {
             {moreMedia && <Row label={busy ? "Загрузка…" : "Загрузить ещё вложения"} onPress={() => { if (busy || !p.room) return; void run(async () => { const next = await api.media(p.room!.id, { kind: mediaKind, before: media.at(-1)!.id }); setMedia(prev => [...prev, ...next]); setMoreMedia(next.length === 100); }); }} />}
           </>
         )}
+        {p.mode === 'diagnostics' && <ConnectionDiagnostics baseUrl={p.baseUrl} token={p.token}/>}
         {p.mode === "settings" && (
           <>
             <Row label="Профиль" onPress={p.onProfile} />
+            <Row label="Проверить соединение и звонки" onPress={()=>p.onMode('diagnostics')}/>
             <Row label="Проверить обновления" detail={p.updateLabel} onPress={() => void run(p.onCheckUpdates)} />
             <Row label="Блокировка приложения" detail={p.lockEnabled ? "Включена · отпечаток, лицо или код устройства" : "Выключена"} onPress={() => void run(p.onChangeLock)} />
             <Row label="Папки чатов" onPress={() => p.onMode("folders")} />

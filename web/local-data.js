@@ -103,7 +103,7 @@ export class DurableOutbox {
   constructor({ store, send, changed, report }) { Object.assign(this, { store, send, changed, report }); this.running = false; this.stopped = false; }
   async items() { return (await this.store.entries('outbox:')).map(([, value]) => value).sort(compareMessages); }
   async enqueue(item) { await this.store.set('outbox:' + item.id, item); this.changed(item); void this.flush(); }
-  stop() { this.stopped = true; }
+  stop() { this.stopped = true; this.activeUpload?.abort(); }
   async retry(id) { const item = await this.store.get('outbox:' + id); if (item) { item.delivery = 'queued'; delete item.error; await this.store.set('outbox:' + id, item); this.changed(item); await this.flush(); } }
   async cancel(id) { const item = await this.store.get('outbox:' + id); if (item?.delivery === 'sending') throw new Error('Сообщение уже отправляется. Дождитесь подтверждения и удалите его.'); await this.store.remove('outbox:' + id); this.changed({ ...item, id, cancelled: true }); }
   async flush() {
@@ -115,15 +115,16 @@ export class DurableOutbox {
         if (!await this.store.get('outbox:' + item.id)) continue;
         item.delivery = 'sending'; await this.store.set('outbox:' + item.id, item); this.changed(item);
         try {
-          const message = await this.send(item);
+          const controller=new AbortController();this.activeUpload=controller;
+          const message = await this.send(item,controller.signal);
           if (this.stopped) break;
-          await this.store.saveMessages(item.room_id, [message]); await this.store.remove('outbox:' + item.id); this.changed(item, message);
+          await this.store.saveMessages(item.room_id, [message]); await this.store.remove('outbox:' + item.id);if(item.upload?.blobKey)await this.store.remove(item.upload.blobKey); this.changed(item, message);
         } catch (error) {
           if (this.stopped) break;
           const transient = !error.status || error.status >= 500 || error.status === 429;
           item.delivery = transient ? 'queued' : 'failed'; item.error = error.message;
           await this.store.set('outbox:' + item.id, item); this.changed(item); if (transient) break;
-        }
+        } finally {this.activeUpload=null;}
       }
     } catch (error) { this.report(error); } finally { this.running = false; }
   }

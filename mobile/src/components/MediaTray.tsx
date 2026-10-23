@@ -204,18 +204,15 @@ export function MediaTray({
       save(remaining);
       for (const item of [...remaining]) {
         if (stopped.current) break;
-        let mediaId = item.uploaded;
-        if (!mediaId) {
-          const result = await upload(item);mediaId=result.id;item.protectedMeta=result.meta;
-          item.uploaded = mediaId;
-          save(remaining.map((x) => (x.id === item.id ? item : x)));
-        }
+        const mediaId = item.uploaded;
         if (stopped.current) break;
         await onSend(
           item.caption || "",
           {
             type: item.kind === "video_note" ? "video_note" : "media",
             media_id: mediaId,
+            __queue_id:item.id,
+            ...(!mediaId?{__upload:{uri:item.uri,name:item.name,mime:item.mime}}:{}),
             text: item.caption || "",
             meta: { album_id: item.albumId, filename: item.name, ...item.protectedMeta },
           },
@@ -223,7 +220,7 @@ export function MediaTray({
         );
         remaining = remaining.filter((x) => x.id !== item.id);
         save(remaining);
-        await Files.deleteAsync(item.uri, { idempotent: true });
+        // The durable outbox owns this file until delivery/cancellation.
       }
       if (!remaining.length) {
         setCaption("");

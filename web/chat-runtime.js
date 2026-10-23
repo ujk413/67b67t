@@ -1,5 +1,6 @@
 import { createAccountStore, DurableOutbox, mergeMessages } from './local-data.js';
 import { userError } from './errors.js';
+import { uploadQueuedFile } from './queued-upload.js';
 export function createChatRuntime({ state, request, decode, buildText, mount, refresh, render, report, drafts, loadRooms }) {
   let store, queue, owner, ready, generation = 0, opening = 0, olderBusy = false, newerBusy = false, searching = 0, observer, scrollTimer, readTimer, heartbeat;
   let hidden=new Set(), syncingHidden=null;
@@ -26,8 +27,15 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
     if (!state.rooms.length && cached.length) state.rooms = cached;
     state.folders=folders;
     for (const [name, text] of savedDrafts) if (!drafts.has(name.slice(6))) drafts.set(name.slice(6), text);
-    queue = new DurableOutbox({ store: local, changed, report: e => report(userError(e)), send: async item => {
+    queue = new DurableOutbox({ store: local, changed:(...args)=>{if(mine===generation)changed(...args);}, report: e => {if(mine===generation)report(userError(e));}, send: async (item,signal) => {
       if (mine !== generation) throw new Error('Сессия завершена');
+      if(item.upload && !item.body?.media_id) {
+        const blob=await local.getBlob(item.upload.blobKey);
+        if(!blob)throw Object.assign(Error('Файл очереди больше недоступен'),{status:410});
+        const media=await uploadQueuedFile(blob,item.upload.kind,signal);
+        if(mine!==generation || signal?.aborted)throw Error('Сессия завершена');
+        item.body={...item.body,media_id:media.id};await local.set('outbox:'+item.id,item);
+      }
       if (!item.body) {
         item.body = await buildText(item.room_id, state.rooms.find(r => r.id === item.room_id), item.text);
         if (item.reply) item.body.reply_to = { id: item.reply.id, sender_name: item.reply.sender_display_name || item.reply.sender_username, text: 'Ответ на сообщение' };
@@ -64,17 +72,22 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
   }
   async function saveRooms(rooms) { if (!current()) return; await store?.set('rooms', rooms); }
   function draft(roomId, text) { drafts.set(roomId, text); void store?.set('draft:' + roomId, text).catch(e => report(userError(e))); }
-  async function enqueue({ roomId, text = '', body, reply }) {
+  async function enqueue({ roomId, text = '', body, reply, upload, clientId }) {
     if (!queue || !store || !current()) throw new Error('Локальное хранилище ещё загружается. Повторите попытку.');
-    const item = { id: crypto.randomUUID(), room_id: roomId, text, body, reply, delivery: 'queued', created_at: new Date().toISOString() };
-    await queue.enqueue(item); return item;
+    const local=store,account=owner,box=queue;
+    const item = { id: clientId || crypto.randomUUID(), room_id: roomId, text, body, reply, delivery: 'queued', created_at: new Date().toISOString() };
+    if(clientId){const existing=await local.get('outbox:'+clientId);if(existing)return existing;}
+    if(account!==owner)throw Error('Сессия завершена');
+    if(upload){const blobKey='outbox-blob:'+item.id;await local.setBlob(blobKey,upload.file);item.upload={blobKey,kind:upload.kind};}
+    if(account!==owner)throw Error('Сессия завершена');
+    await box.enqueue(item); return item;
   }
   async function open(id, options = {}) {
     await start(state.me); const mine = ++opening, local = store, account = owner;
     const valid = () => mine === opening && account === owner && current(id);
     state.selectedMessages?.clear();
     state.activeRoomId = id; state.messages = []; state.roomMembers = []; state.activeDmPeer = null;
-    state.roomLoading = true; state.roomLoadError = false; state.replyTo = null; state.editMessage = null;
+    state.roomLoading = true; state.syncing=true;state.roomLoadError = false; state.replyTo = null; state.editMessage = null;
     state.searchMode = false; state.searchResults = []; state.composeOpen = false; state.settingsOpen = false; state.uiMenu = null;
     state.composerText = drafts.get(id) || ''; state.newMessages = 0; state.chatHistory = null; state.lastReadId = null;
     await mount();
@@ -94,11 +107,11 @@ export function createChatRuntime({ state, request, decode, buildText, mount, re
       await local.saveMessages(id, result.messages);result.messages=result.messages.filter(m=>!hidden.has(m.id)); await Promise.allSettled([memberTask, peerTask]);
       if (!valid()) return;
       state.chatHistory = result; state.messages = mergeMessages(result.messages, state.messages.filter(m => !hidden.has(m.id) && (m.delivery || (!m.delivery && m.room_id === id && new Date(m.created_at) > new Date(result.messages.at(-1)?.created_at || 0)))));
-      state.roomLoading = false; await mount();
+      state.roomLoading = false;state.syncing=false; await mount();
       const target = anchor && document.getElementById('msg-' + anchor), box = document.getElementById('msgs');
       if (target) target.scrollIntoView({ block: 'center' }); else if (box) box.scrollTop = box.scrollHeight;
       bind();
-    } catch (error) { if (valid()) { state.roomLoading = false; state.roomLoadError = !state.messages.length; state.chatHistory ||= { has_older: true, has_newer: false }; await mount(); report(userError(error)); bind(); } }
+    } catch (error) { if (valid()) { state.roomLoading = false;state.syncing=false; state.roomLoadError = !state.messages.length; state.chatHistory ||= { has_older: true, has_newer: false }; await mount(); report(userError(error)); bind(); } }
   }
   async function older() {
     if (olderBusy || !current(state.activeRoomId) || state.chatHistory?.has_older === false) return;

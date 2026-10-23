@@ -1,4 +1,6 @@
 import { protectedUploader } from "./src/protectedUpload";
+import * as FileSystem from 'expo-file-system/legacy';
+import { newId } from './src/data/repository';
 import { nativeCalls } from "./src/nativeCalls";
 import { GroupEncryption } from "./src/groupEncryption";
 import { getMobileDeviceId } from "./src/crypto";
@@ -239,6 +241,7 @@ function App() {
   }, [lockEnabled]);
 
   const local = useAccountData({
+    upload: protectedUploader(baseUrl,token || '',encodeText,me?.id),
     me,
     token,
     baseUrl,
@@ -970,7 +973,12 @@ function App() {
     const sendingToken=token;
     try {
       setBusyUpload(true);
-      const uploaded = await protectedUploader(baseUrl,token,encodeText)(roomId,{...file,mime:file.type},()=>{}).promise;
+      const repository=local.repository.current;
+      if(!repository || repository.userId!==me?.id)throw Error('Хранилище ещё загружается');
+      const directory=`${FileSystem.documentDirectory}draft-media/${repository.userId}/`;
+      await FileSystem.makeDirectoryAsync(directory,{intermediates:true});
+      const durable=directory+newId()+'-'+file.name.replace(/[^a-zA-Z0-9._-]/g,'_');
+      await FileSystem.copyAsync({from:file.uri,to:durable});
       if(tokenRef.current!==sendingToken)throw Error('Сеанс изменился. Вложение сохранено для повторной отправки.');
       await local.send(
         "",
@@ -981,9 +989,9 @@ function App() {
               : kind === "video_note"
                 ? "video_note"
                 : "media",
-          media_id: uploaded.id,
+          __upload: {uri:durable,name:file.name,mime:file.type},
           text: "",
-          meta: {...uploaded.meta,...(duration ? {duration_ms:duration} : {})},
+          meta: {...(duration ? {duration_ms:duration} : {})},
         },
         roomId,
       );
@@ -1560,7 +1568,7 @@ function App() {
       <SafeAreaView style={styles.screen}>
         <StatusBar style={theme.dark ? "light" : "dark"} />
         <ConnectionBanner
-          status={connection}
+          status={connection==='connected' && local.syncStatus==='syncing'?'syncing':connection}
           error={error}
           onDismiss={() => setError(null)}
         />

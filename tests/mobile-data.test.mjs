@@ -22,6 +22,7 @@ function load(file, deps = {}, globals = {}) {
     {
       exports,
       crypto: webcrypto,
+      AbortController,
       ...globals,
       require(name) {
         assert.ok(name in deps, `Unexpected import ${name}`);
@@ -32,6 +33,28 @@ function load(file, deps = {}, globals = {}) {
   return exports;
 }
 const { Outbox } = load("../mobile/src/data/outbox.ts");
+
+test('cancelling an in-flight media upload aborts it and does not resurrect the queue item',async()=>{
+  const items=new Map();let started,fail;const waiting=new Promise(r=>started=r);
+  const repo={outgoing:async()=>[...items.values()],putOutgoing:async item=>items.set(item.id,structuredClone(item)),removeOutgoing:async id=>items.delete(id),saveMessages:async()=>{throw Error('cancelled send must not be saved');}};
+  items.set('media',{id:'media',roomId:'room-a',text:'caption',state:'queued',upload:{uri:'file:///draft/one.jpg'}});
+  let aborted=false;
+  const queue=new Outbox(repo,async(item,signal)=>{started();return new Promise((_,reject)=>{fail=reject;signal.addEventListener('abort',()=>{aborted=true;reject(Error('offline'));});});},()=>{});
+  const task=queue.flush();await waiting;await queue.cancel('media');fail(Error('offline'));await task;
+  assert.equal(aborted,true);assert.equal(items.size,0);
+});
+
+test('a queued attachment transfers ownership atomically, survives restart and protects its prepared ciphertext from cache cleanup',async()=>{
+  const user='11111111-1111-4111-8111-111111111111',file={id:'stable-attachment',uri:'file:///original.jpg'};
+  let repo=new AccountRepository(user);await repo.open();await repo.set('attachments:room-media',{items:[file],caption:'caption'});
+  const item={id:file.id,roomId:'room-media',text:'caption',state:'queued',body:{type:'media'},upload:{...file,name:'one.jpg',mime:'image/jpeg',prepared:{uri:'file:///encrypted.bin',meta:{media_encryption:{v:2}}}}};
+  await repo.enqueueMedia(item);await repo.enqueueMedia({...item,text:'must not replace the original'});
+  assert.equal((await repo.get('attachments:room-media',null)).items.length,0);
+  await repo.close();repo=new AccountRepository(user);await repo.open();
+  assert.equal((await repo.outgoing()).length,1);assert.equal((await repo.outgoing())[0].text,'caption');
+  assert.deepEqual(Array.from(await repo.privateFiles()).sort(),['file:///encrypted.bin','file:///original.jpg']);
+  await repo.clearCache();assert.equal((await repo.outgoing()).length,1);await repo.close();
+});
 const { mergeMessages } = load("../mobile/src/data/messages.ts");
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "messenger67-data-test-"));
 const keys = new Map(),

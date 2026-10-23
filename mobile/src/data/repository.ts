@@ -3,6 +3,7 @@ import * as SecureStore from "expo-secure-store";
 import type { Message, Room } from "../types";
 export type Draft = { text: string; reply?: Message | null };
 export type Outgoing = {
+  upload?: {uri:string;name:string;mime:string;prepared?:{uri:string;meta:Record<string,unknown>}};
   createdAt?: string;
   id: string;
   roomId: string;
@@ -261,6 +262,16 @@ export class AccountRepository {
       );
     });
   }
+  async enqueueMedia(item:Outgoing) {
+    return this.access(async db=>this.transaction(db,async tx=>{
+      const delivered=await tx.getFirstAsync('SELECT id FROM messages WHERE json_extract(data,\'$.client_message_id\')=? LIMIT 1',item.id);
+      const queued=await tx.getFirstAsync('SELECT id FROM outbox WHERE id=?',item.id);
+      if(!delivered && !queued)await tx.runAsync('INSERT INTO outbox VALUES(?,?)',item.id,JSON.stringify(item));
+      const key=`attachments:${item.roomId}`;
+      const row=await tx.getFirstAsync<{value:string}>('SELECT value FROM kv WHERE key=?',key);
+      if(row){const draft=JSON.parse(row.value);draft.items=(draft.items || []).filter((file:{id:string})=>file.id!==item.id);await tx.runAsync('UPDATE kv SET value=? WHERE key=?',JSON.stringify(draft),key);}
+    }));
+  }
   async removeOutgoing(id: string) {
     return this.access(async (db) => {
       await db.runAsync("DELETE FROM outbox WHERE id=?", id);
@@ -286,7 +297,7 @@ export class AccountRepository {
       const rows = await db.getAllAsync<{ key: string; value: string }>(
         "SELECT key,value FROM kv WHERE key LIKE 'voice:%' OR key LIKE 'attachments:%'",
       );
-      return rows.flatMap((row) => {
+      const drafts=rows.flatMap((row) => {
         const value = JSON.parse(row.value);
         return row.key.startsWith("voice:")
           ? value?.uri
@@ -294,6 +305,11 @@ export class AccountRepository {
             : []
           : (value?.items || []).map((item: { uri: string }) => item.uri);
       }) as string[];
+      const queued=await db.getAllAsync<{data:string}>('SELECT data FROM outbox');
+      return [...new Set([...drafts,...queued.flatMap(row=>{
+        const upload=(JSON.parse(row.data) as Outgoing).upload;
+        return upload?[upload.uri,...(upload.prepared?[upload.prepared.uri]:[])]:[];
+      })])];
     });
   }
   async size() {

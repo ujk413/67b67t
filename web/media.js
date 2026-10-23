@@ -10,7 +10,7 @@ export function createMediaController({ context, enqueue, encryptFile, report })
     if(context()?.userId!==owner.userId)throw Error('Сеанс изменился. Выберите вложения заново.');
     const valid = () => context()?.userId === owner.userId;
     const name = `media-draft:${owner.roomId}:${kind}`, blobName = name + ':blob';
-    let stream, recorder, chunks = [], blob, savedBlob, uploaded, cancelled = false, busy = false, xhr, timer, startedAt = 0, facing = 'user', urls = [],fileIds=new Map(),captionSent=false,albumId=crypto.randomUUID();
+    let stream, recorder, chunks = [], blob, savedBlob, uploaded, cancelled = false, busy = false, xhr, timer, startedAt = 0, facing = 'user', urls = [],fileIds=new Map(),captionSent=false,albumId=crypto.randomUUID(),messageId=crypto.randomUUID();
     const dialog = element('dialog', kind === 'circle' ? 'media-dialog circle-recorder' : 'media-dialog'), heading = element('h2', '', kind === 'voice' ? 'Голосовое сообщение' : kind === 'circle' ? 'Видеокружок' : 'Вложения');
     const destination = element('p', 'media-destination', 'В чат: ' + owner.title), preview = element('div', 'recording-preview'), status = element('p', 'media-status'), error = element('p', 'form-error'); error.setAttribute('role', 'alert');
     const caption = element('textarea', 'textarea'); caption.placeholder = 'Подпись'; caption.setAttribute('aria-label', 'Подпись к вложениям');
@@ -33,12 +33,12 @@ export function createMediaController({ context, enqueue, encryptFile, report })
       if (blob && blob!==savedBlob) {await owner.store.setBlob(blobName,blob);savedBlob=blob;}
       const manifest=[];
       if(kind==='files')for(const file of files){let id=fileIds.get(file);if(!id){id=name+':file:'+crypto.randomUUID();await owner.store.setBlob(id,file);fileIds.set(file,id);}manifest.push({id,name:file.name,type:file.type,lastModified:file.lastModified});}
-      await owner.store.set(name,{caption:caption.value,uploaded,files:manifest,captionSent,albumId});
+      await owner.store.set(name,{caption:caption.value,uploaded,files:manifest,captionSent,albumId,messageId});
     }
     caption.oninput = () => void save().catch(e => { error.textContent = userError(e); });
     if (kind !== 'files') {
       start.disabled=true;
-      try { const saved = await owner.store.get(name); blob = await owner.store.getBlob(blobName); if (saved) { caption.value = saved.caption || ''; uploaded = saved.uploaded; } if (blob && !cancelled) displayBlob(blob); }
+      try { const saved = await owner.store.get(name); blob = await owner.store.getBlob(blobName); if (saved) { caption.value = saved.caption || ''; uploaded = saved.uploaded;messageId=saved.messageId || messageId; } if (blob && !cancelled) displayBlob(blob); }
       catch (e) { error.textContent = userError(e); }
       finally{start.disabled=false;}
     } else {
@@ -95,20 +95,16 @@ export function createMediaController({ context, enqueue, encryptFile, report })
           for (const original of [...files]) {
             if (original.size > MAX_FILE) throw new Error('Максимальный размер одного файла — 100 МБ.');
             const prepared = await encryptFile(original, owner.roomId); if (cancelled || !valid()) return;
-            const media = await upload(prepared.file, prepared.kind); if (cancelled || !valid()) return;
             const text=captionSent?'':caption.value;
-            await enqueue({ roomId: owner.roomId, text, body: { type: 'media', media_id: media.id, text, meta: { ...prepared.meta, filename: original.name,album_id:albumId } } });captionSent=true;
+            await enqueue({ roomId: owner.roomId, clientId:fileIds.get(original), text, upload:{file:prepared.file,kind:prepared.kind}, body: { type: 'media', text, meta: { ...prepared.meta, filename: original.name,album_id:albumId } } });captionSent=true;
             files = files.filter(item => item !== original);await owner.store.remove(fileIds.get(original));await save();
           }
         } else {
           if (!blob) return;
           const ext = blob.type.includes('mp4') ? (kind === 'voice' ? 'm4a' : 'mp4') : 'webm';
-          if (!uploaded) {
-            const prepared=await encryptFile(new File([blob],`recording.${ext}`,{type:blob.type}),owner.roomId);if(cancelled||!valid())return;
-            uploaded={...await upload(prepared.file,prepared.kind),protectedMeta:prepared.meta};await save();
-          }
+          const prepared=uploaded?null:await encryptFile(new File([blob],`recording.${ext}`,{type:blob.type}),owner.roomId);
           if (cancelled || !valid()) return;
-          await enqueue({ roomId: owner.roomId, text: caption.value, body: { type: kind === 'voice' ? 'voice' : 'video_note', media_id: uploaded.id, text: caption.value,meta:uploaded.protectedMeta } });
+          await enqueue({ roomId: owner.roomId, clientId:messageId, text: caption.value, ...(prepared?{upload:{file:prepared.file,kind:prepared.kind}}:{}), body: { type: kind === 'voice' ? 'voice' : 'video_note', ...(uploaded?{media_id:uploaded.id}:{}), text: caption.value,meta:uploaded?.protectedMeta || prepared.meta } });
           await owner.store.remove(name); await owner.store.remove(blobName);
         }
         dispose();

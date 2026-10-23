@@ -13,8 +13,10 @@ import { api } from "../api";
 import { mobileApi, type History } from "../mobileApi";
 import { encryptRoomText } from "../roomCrypto";
 import type { Message, Room, User } from "../types";
+import type { ProtectedUploader } from "../protectedUpload";
 
 type Params = {
+  upload?: ProtectedUploader;
   me: User | null;
   token: string | null;
   baseUrl: string;
@@ -42,6 +44,7 @@ export function useAccountData(params: Params) {
   const [loading, setLoading] = useState(false),
     [loadingOlder, setLoadingOlder] = useState(false);
   const [reply, setReply] = useState<Message | null>(null);
+  const [syncStatus,setSyncStatus]=useState<'idle'|'syncing'|'error'>('idle');
   useEffect(() => {
     if (!params.me || !params.token) return;
     const repo = new AccountRepository(params.me.id);
@@ -64,7 +67,7 @@ export function useAccountData(params: Params) {
     };
     const queue = new Outbox(
       repo,
-      async (item) => {
+      async (item,signal) => {
         const p = latest.current;
         if (
           !active ||
@@ -95,6 +98,21 @@ export function useAccountData(params: Params) {
             throw error;
           }
         }
+        if(item.upload && !item.body?.media_id) {
+          if(!p.upload)throw Error('Отправка вложений недоступна');
+          const task=p.upload(item.roomId,item.upload,()=>{},async prepared=>{
+            if(signal.aborted || !active)throw Error('Загрузка отменена');
+            item.upload={...item.upload!,prepared};await repo.putOutgoing(item);
+          });
+          const cancel=()=>task.request.abort();signal.addEventListener('abort',cancel,{once:true});
+          try {
+            if(signal.aborted)cancel();
+            const uploaded=await task.promise;
+            if(signal.aborted || !active)throw Error('Загрузка отменена');
+            item.body={...item.body,media_id:uploaded.id,meta:{...(item.body?.meta as object),...uploaded.meta}};
+            await repo.putOutgoing(item);
+          } finally {signal.removeEventListener('abort',cancel);}
+        }
         if (!item.body) {
           const encode = p.encode || (async (roomId:string,text:string) => { const secret=await p.getSecret(roomId); if(!secret)throw Error('Ключ переписки недоступен');return encryptRoomText(roomId,secret,text); });
           const encrypted = await encode(item.roomId,item.text);
@@ -121,7 +139,7 @@ export function useAccountData(params: Params) {
           item.body={...item.body,text:null,meta:{...(item.body.meta as any),caption_message:await p.encode(item.roomId,item.text)}};
           await repo.putOutgoing(item);
         }
-        if(!active || latest.current.token!==params.token)throw Error('Сеанс завершён');
+        if(signal.aborted || !active || latest.current.token!==params.token)throw Error('Сеанс завершён');
         const sent = await api.sendMediaMessage(
           p.baseUrl,
           p.token,
@@ -173,6 +191,7 @@ export function useAccountData(params: Params) {
       p = latest.current;
     if (!repo || !p.token || syncing.current) return;
     syncing.current = true;
+    setSyncStatus('syncing');
     try {
       let cursor = await repo.get("sync", "0"),
         more = true;
@@ -215,7 +234,9 @@ export function useAccountData(params: Params) {
         await repo.set("sync", cursor);
         more = result.has_more;
       }
+      setSyncStatus('idle');
     } catch {
+      if(repository.current===repo)setSyncStatus('error');
     } finally {
       syncing.current = false;
     }
@@ -313,14 +334,18 @@ export function useAccountData(params: Params) {
       throw new Error("Хранилище ещё загружается");
     const item: Outgoing = {
       createdAt: new Date().toISOString(),
-      id: newId(),
+      id: typeof body?.__queue_id==='string'?body.__queue_id:newId(),
       roomId: targetRoomId || p.activeRoomId!,
       text,
       reply: replyOverride === undefined ? reply : replyOverride,
       state: "queued",
       body,
     };
-    await repo.putOutgoing(item);
+    if(body?.__upload) {
+      item.upload=body.__upload as Outgoing['upload'];
+      const {__upload,__queue_id,...wire}=body;item.body=wire;
+    }
+    if(item.upload)await repo.enqueueMedia(item);else await repo.putOutgoing(item);
     if (latest.current.activeRoomId === item.roomId) {
       p.onMessages((prev) =>
         mergeMessages(prev, [pendingMessage(item, p.me!.id)]),
@@ -386,6 +411,7 @@ export function useAccountData(params: Params) {
     cancel,
     jump,
     sync,
+    syncStatus,
   };
 }
 function pendingMessage(item: Outgoing, userId: string): Message {

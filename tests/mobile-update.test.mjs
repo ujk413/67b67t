@@ -22,6 +22,7 @@ function loadUpdates({ buildVersion, platform = "android", fetchImpl, executionE
     clearTimeout,
     console,
     require(name) {
+      if(name==='expo')return {requireOptionalNativeModule:()=>null};
       if (name === "react-native") return { Platform: { OS: platform } };
       if (name === "expo-constants") {
         return {

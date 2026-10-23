@@ -9,6 +9,17 @@ import { userError, toast } from './errors.js';
 import { icon, avatar, groupWith, presenceLabel, reactionPeople, plural } from './ui.js';
 import { renderMessengerShell, renderLogin, renderRoomRow, iconButton } from './views.js';
 import { createWebNotifications } from './notifications.js';
+import { diagnoseConnection } from './diagnostics.js';
+
+window.checkConnection = async () => {
+  const dialog=document.createElement('dialog');dialog.className='actions-dialog';
+  const heading=document.createElement('h2');heading.textContent='Проверка соединения';const body=document.createElement('div');body.textContent='Проверяем API, WebSocket и маршрут звонка…';
+  const close=document.createElement('button');close.textContent='Закрыть';close.onclick=()=>{dialog.close();dialog.remove();};dialog.append(heading,body,close);document.body.append(dialog);dialog.showModal();
+  const account=state.me?.id;
+  const results=await diagnoseConnection({request:api,wsUrl:location.origin.replace(/^http/,'ws')+'/ws'});
+  if(!dialog.open || state.me?.id!==account)return;body.replaceChildren();
+  for(const result of results){const line=document.createElement('p');line.textContent=`${result.title}: ${result.ok?'Работает':'Нужна проверка'}. ${result.action}`;body.append(line);}
+};
 const $ = (q, el=document) => el.querySelector(q);
 const $$ = (q, el=document) => Array.from(el.querySelectorAll(q));
 const API = window.__APP_CONFIG__?.apiBaseUrl || "/api";
@@ -3096,7 +3107,7 @@ function updateChatPresence() {
     node.classList.toggle('online', !!typing.length || !!state.activeDmPeer?.online);
   }
   const connection = $('#webConnection');
-  if (connection) { connection.hidden = state.wsAuthed; connection.textContent = navigator.onLine ? 'Подключение…' : 'Нет сети'; }
+  if (connection) { connection.hidden = state.wsAuthed && !state.syncing; connection.textContent = !navigator.onLine?'Нет сети':!state.wsAuthed?'Подключение…':'Синхронизация…'; }
 }
 let refreshingPresence = false;
 async function refreshWebPresence() {

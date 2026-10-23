@@ -16,10 +16,30 @@ import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 
 class RoomKeyModule : Module() {
+  private val apkCancelled = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>()
   private val signal by lazy { SignalEngine(requireNotNull(appContext.reactContext)) }
   override fun definition() = ModuleDefinition {
     Name("RoomKey")
-    Events("callAction")
+    Events("callAction", "apkProgress")
+    Function("cancelApkDownload") { id: String -> apkCancelled[id]?.set(true); Unit }
+    AsyncFunction("downloadApkAsync") { url: String, identity: String, size: Double, hash: String, id: String ->
+      require(url.startsWith("https://")) { "invalid_release_url" }
+      val context = requireNotNull(appContext.reactContext)
+      val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+      require(apkCancelled.putIfAbsent(id, cancelled) == null) { "download_busy" }
+      try {
+        ApkDownload.download(url, File(context.filesDir, "updates/67chat-update.apk"), identity,
+          size.toLong(), hash, { cancelled.get() }, { bytes, total ->
+            sendEvent("apkProgress", mapOf("id" to id, "bytes" to bytes.toDouble(), "total" to total.toDouble()))
+          })
+      } finally { apkCancelled.remove(id) }
+    }
+    AsyncFunction("apkSha256Async") { uri: String ->
+      val context = requireNotNull(appContext.reactContext)
+      val file = File(URI(uri)).canonicalFile
+      require(file.path.startsWith(context.filesDir.canonicalPath + File.separator) || file.path.startsWith(context.cacheDir.canonicalPath + File.separator))
+      ApkDownload.sha256(file, { false })
+    }
     OnNewIntent { intent ->
       if(intent.hasExtra("67chat_call_id")) { appContext.currentActivity?.intent=intent;sendEvent("callAction",emptyMap<String,String>()) }
     }

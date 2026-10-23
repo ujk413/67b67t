@@ -27,6 +27,7 @@ export function ConnectionBanner({
         {error ||
           {
             connecting: "Подключение…",
+            syncing: "Синхронизация…",
             offline: "Нет соединения",
             connected: "",
           }[status] ||

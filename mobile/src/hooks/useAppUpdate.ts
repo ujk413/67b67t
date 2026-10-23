@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AppState, Platform } from "react-native";
-import {checkForUpdate,discardDownload,downloadRelease,downloadedSize,installRelease,openInstallPermissionSettings,type AppRelease} from "../updates";
+import { addNetworkStateListener } from 'expo-network';
+import {checkForUpdate,discardDownload,downloadRelease,downloadedSize,verifyRelease,installRelease,openInstallPermissionSettings,type AppRelease} from "../updates";
 
 type ReleaseTarget = {release: AppRelease; url: string};
 export type UpdateState =
@@ -17,6 +18,7 @@ export function useAppUpdate(baseUrl: string, enabled: boolean) {
   const [checkStatus,setCheckStatus] = useState("idle");
   const lastCheck=useRef(0),checking=useRef(false),busy=useRef(false);
   const generation=useRef(0),abort=useRef<AbortController|null>(null);
+  const resume=useRef<()=>void>(()=>{});
   const check=useCallback(async(force=false)=>{
     if(!enabled || Platform.OS!=="android" || checking.current) return;
     if(!force && Date.now()-lastCheck.current<CHECK_THROTTLE_MS)return;
@@ -65,7 +67,7 @@ export function useAppUpdate(baseUrl: string, enabled: boolean) {
         setState({...target,phase:"downloading",progress:0});
         fileUri=await downloadRelease(target.url,progress=>{
           if(generation.current===mine)setState({...target,phase:"downloading",progress});
-        },controller.signal);
+        },controller.signal,target.release);
       }
       if(generation.current!==mine)return;
       const actual=await downloadedSize(fileUri);
@@ -73,6 +75,12 @@ export function useAppUpdate(baseUrl: string, enabled: boolean) {
       if(target.release.size>0 && actual!==target.release.size){
         await discardDownload(fileUri);fileUri=undefined;throw Error("incomplete_download");
       }
+      try {await verifyRelease(fileUri,target.release,controller.signal);}
+      catch(error){
+        if(error instanceof Error && error.message==='checksum_mismatch'){await discardDownload(fileUri);fileUri=undefined;}
+        throw error;
+      }
+      if(generation.current!==mine || controller.signal.aborted)return;
       await install(target,fileUri,mine);
     } catch(error) {
       if(generation.current===mine){
@@ -96,5 +104,13 @@ export function useAppUpdate(baseUrl: string, enabled: boolean) {
   const openPermissionSettings=useCallback(async()=>{
     try {await openInstallPermissionSettings();}catch{}
   },[]);
+  resume.current=()=>{
+    if(state.phase==='error' && !state.needsPermission && /network|timeout|offline|incomplete_download|download_http_5|connect|resolve.*host|end of stream/i.test(state.message))void perform(state,state.fileUri);
+  };
+  useEffect(()=>{
+    const network=addNetworkStateListener(value=>{if(value.isConnected && AppState.currentState==='active')resume.current();});
+    const foreground=AppState.addEventListener('change',value=>{if(value==='active')resume.current();});
+    return()=>{network.remove();foreground.remove();};
+  },[baseUrl,enabled]);
   return {state,checkStatus,visible:state.phase!=="idle" && (state.phase!=="available" || dismissed!==state.release.versionCode),start,dismiss,retryInstall,openPermissionSettings,recheck:()=>check(true)};
 }

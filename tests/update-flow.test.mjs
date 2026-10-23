@@ -7,10 +7,10 @@ function harness(overrides={}) {
   const slots=[], effects=[], listeners=[]; let index=0;
   const calls={checks:0,downloads:0,installs:0};
   const release={version:'1.3.3',versionCode:14,size:10,mandatory:false};
-  const native={currentVersionCode:()=>12,checkForUpdate:async()=>{calls.checks++;return {status:'available',release,url:'https://example.test/api/app/android.apk'};},discardDownload:async()=>{},downloadRelease:async()=>{calls.downloads++;return 'file:///cache/update.apk';},downloadedSize:async()=>10,installRelease:async()=>{calls.installs++;return {resultCode:0};},openInstallPermissionSettings:async()=>{},...overrides};
+  const native={currentVersionCode:()=>12,checkForUpdate:async()=>{calls.checks++;return {status:'available',release,url:'https://example.test/api/app/android.apk'};},discardDownload:async()=>{},downloadRelease:async()=>{calls.downloads++;return 'file:///cache/update.apk';},verifyRelease:async()=>{},downloadedSize:async()=>10,installRelease:async()=>{calls.installs++;return {resultCode:0};},openInstallPermissionSettings:async()=>{},...overrides};
   const react={useState(v){const i=index++;if(!(i in slots))slots[i]=typeof v==='function'?v():v;return [slots[i],v=>slots[i]=typeof v==='function'?v(slots[i]):v];},useRef(v){const i=index++;return slots[i]??={current:v};},useCallback:f=>f,useEffect:f=>effects.push(f)};
   const exp={};const code=ts.transpileModule(fs.readFileSync(new URL('../mobile/src/hooks/useAppUpdate.ts',import.meta.url),'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
-  new Function('exports','require',code)(exp,name=>name==='react'?react:name==='react-native'?{Platform:{OS:'android'},AppState:{addEventListener:(_e,f)=>{listeners.push(f);return{remove(){}};}}}:native);
+  new Function('exports','require',code)(exp,name=>name==='react'?react:name==='expo-network'?{addNetworkStateListener:()=>({remove(){}})}:name==='react-native'?{Platform:{OS:'android'},AppState:{currentState:'active',addEventListener:(_e,f)=>{listeners.push(f);return{remove(){}};}}}:native);
   const render=()=>{index=0;effects.length=0;return exp.useAppUpdate('https://example.test/api',true);};
   return {render,calls,native,release,mount(){render();for(const f of effects)f();},foreground:async()=>{for(const f of listeners)f('active');await new Promise(r=>setImmediate(r));}};
 }
@@ -40,4 +40,18 @@ test('dismissing during asynchronous APK size validation never opens the install
 test('a failed initial release check is retried on foreground rather than throttled for an hour',async()=>{
   const h=harness({checkForUpdate:async()=>{h.calls.checks++;return {status:'unavailable',current:12};}});
   h.mount();await new Promise(r=>setImmediate(r));await h.foreground();assert.equal(h.calls.checks,2);
+});
+
+test('a corrupt APK is removed and never passed to the installer',async()=>{
+  let discarded=false;
+  const h=harness({verifyRelease:async()=>{throw Error('checksum_mismatch');},discardDownload:async()=>{discarded=true;}});
+  await h.render().recheck();await h.render().start();
+  assert.equal(h.calls.installs,0);assert.equal(h.render().state.phase,'error');assert.equal(h.render().state.message,'checksum_mismatch');assert.equal(discarded,true);assert.equal(h.render().state.fileUri,undefined);
+});
+
+test('dismissing during SHA verification prevents installer launch',async()=>{
+  let resolveHash,started;const validating=new Promise(r=>started=r);
+  const h=harness({verifyRelease:()=>{started();return new Promise(r=>resolveHash=r);}});
+  await h.render().recheck();const task=h.render().start();await validating;
+  h.render().dismiss();resolveHash();await task;assert.equal(h.calls.installs,0);
 });

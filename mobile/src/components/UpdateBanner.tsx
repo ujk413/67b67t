@@ -133,6 +133,12 @@ export function UpdateBanner({
             <Text style={{ color: colors.misc.error }} accessibilityLiveRegion="polite">
               {state.needsPermission
                 ? "Разрешите установку приложений из этого источника, затем повторите."
+                : state.message === "checksum_mismatch"
+                  ? "Проверка файла не пройдена. Повреждённый APK удалён. Скачайте обновление ещё раз."
+                : state.message === "invalid_release"
+                  ? "На сервере опубликованы неполные данные обновления. Повторите проверку позже."
+                : state.message === "native_update_unavailable"
+                  ? "Для этой сборки нужна ручная установка новой APK поверх приложения. Данные сохранятся."
                 : state.message === "incomplete_download"
                   ? "Файл загрузился не полностью. Проверьте соединение и попробуйте снова."
                   : "Не удалось скачать обновление. Проверьте соединение и попробуйте снова."}
