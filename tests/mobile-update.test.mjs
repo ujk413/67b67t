@@ -8,7 +8,7 @@ const require = createRequire(import.meta.url),
 
 // Load the TypeScript update client with its native dependencies stubbed, so
 // the decision logic (which build counts as newer) runs under plain Node.
-function loadUpdates({ buildVersion, platform = "android", fetchImpl }) {
+function loadUpdates({ buildVersion, platform = "android", fetchImpl, executionEnvironment = "bare", configBuildVersion = 999 }) {
   const source = fs.readFileSync(
     new URL("../mobile/src/updates.ts", import.meta.url),
     "utf8",
@@ -26,10 +26,17 @@ function loadUpdates({ buildVersion, platform = "android", fetchImpl }) {
       if (name === "expo-constants") {
         return {
           default: {
-            nativeBuildVersion: buildVersion,
-            nativeAppVersion: "1.2.0",
-            expoConfig: { version: "1.2.0", android: { package: "ru.b67t.messenger.mobile" } },
+            // Expo 55 ConstantsService exports no nativeBuildVersion or nativeAppVersion.
+            executionEnvironment,
+            expoConfig: { version: "9.9.9", android: { package: "ru.b67t.messenger.mobile", versionCode: configBuildVersion } },
           },
+        };
+      }
+      if (name === "expo-application") {
+        return {
+          nativeBuildVersion: buildVersion,
+          nativeApplicationVersion: "1.2.0",
+          applicationId: "ru.b67t.messenger.mobile",
         };
       }
       if (name === "expo-intent-launcher") {
@@ -156,4 +163,25 @@ test("iOS and builds without a native build number are not updatable", async () 
 
   const expoGo = loadUpdates({ buildVersion: undefined, fetchImpl: async () => jsonResponse(204) });
   assert.equal((await expoGo.checkForUpdate("https://67chat.ru/api")).status, "unsupported");
+});
+
+test("Expo 55 resolves the installed binary version, not the embedded config version", () => {
+  const updates = loadUpdates({ buildVersion: "12" });
+  assert.equal(updates.currentVersionCode(), 12);
+  assert.equal(updates.currentVersionName(), "1.2.0");
+});
+
+test("Expo Go's host build number must not trigger a messenger APK update", async () => {
+  const updates = loadUpdates({
+    buildVersion: "1",
+    executionEnvironment: "storeClient",
+    fetchImpl: () => { throw new Error("Expo Go must not request releases"); },
+  });
+  assert.equal((await updates.checkForUpdate("https://67chat.ru/api")).status, "unsupported");
+});
+
+test("missing or invalid native versions never fall back to app config", () => {
+  for (const buildVersion of [undefined, null, "", "garbage", "0", "-1", "1.5"]) {
+    assert.equal(loadUpdates({ buildVersion }).currentVersionCode(), null);
+  }
 });

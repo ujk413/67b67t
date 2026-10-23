@@ -15,6 +15,7 @@
 
 import { Platform } from "react-native";
 import Constants from "expo-constants";
+import * as Application from "expo-application";
 import * as IntentLauncher from "expo-intent-launcher";
 import * as Files from "expo-file-system/legacy";
 
@@ -41,14 +42,17 @@ const APK_FILE = "67chat-update.apk";
 
 /** Build number of the running binary, or null when it cannot be determined. */
 export function currentVersionCode(): number | null {
-  const fromBuild = Number(Constants.nativeBuildVersion);
+  // Expo Go reports the host's build number, not the messenger's. The installed
+  // binary is authoritative; app config may describe a different JS build.
+  if (Constants.executionEnvironment === "storeClient") return null;
+  const fromBuild = Number(Application.nativeBuildVersion);
   if (Number.isInteger(fromBuild) && fromBuild > 0) return fromBuild;
   // Expo Go / web have no native build number; treat them as not updatable.
   return null;
 }
 
 export function currentVersionName(): string {
-  return String(Constants.nativeAppVersion || Constants.expoConfig?.version || "");
+  return String(Application.nativeApplicationVersion || "");
 }
 
 /**
