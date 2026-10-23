@@ -1909,6 +1909,7 @@ app.put("/me/password", async (req, reply) => {
       `DELETE FROM sessions WHERE user_id=$1 AND token_hash<>$2`,
       [me.id, token_hash],
     );
+    await revokeUserSockets(me.id, me.sessionId);
   }
 
   return { ok: true };

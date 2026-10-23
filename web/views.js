@@ -1,8 +1,9 @@
 import {html as escapeUi} from './ui.js';
 import {t as uiText} from "./i18n.js";
 import { html, icon, avatar, presenceLabel, plural, listTime } from './ui.js';
+import { accountMediaUrl } from './browser-accounts.js';
 
-const mediaUrl = id => id ? `/api/media/${encodeURIComponent(id)}` : '';
+const mediaUrl = id => id ? accountMediaUrl(`/api/media/${encodeURIComponent(id)}`) : '';
 const name = person => person?.display_name || person?.username || uiText("Пользователь");
 export const iconButton = (glyph, label, action, extra = '') => `<button type="button" class="icon-button ${extra}" title="${html(label)}" aria-label="${html(label)}" onclick="${action}">${icon(glyph)}</button>`;
 const menuItem = (label, action, glyph = '') => `<button type="button" role="menuitem" onclick="${action}">${glyph ? icon(glyph) : ''}<span>${html(label)}</span></button>`;
@@ -54,6 +55,7 @@ function renderSettings(state) {
     </div>
     <button class="settings-action" onclick="setWebTheme('system')">${state.themeMode === 'system' ? '✓ ' : ''}${escapeUi(uiText("Как в системе"))}</button>
     <button class="settings-action" onclick="openQualityTool()">${escapeUi(uiText("Качество, язык и оформление"))}</button>
+    <button class="settings-action" onclick="openBrowserAccounts()">${escapeUi(uiText("Аккаунты"))}</button>
     <label class="settings-action">${escapeUi(uiText("Размер сообщений"))} <input type="range" min="12" max="24" value="${state.fontSize}" oninput="setMessageFontSize(this.value)" aria-label="${escapeUi(uiText("Размер текста сообщений"))}"></label>
     <label class="settings-action"><input type="checkbox" ${state.autoDownload ? 'checked' : ''} onchange="setAutoDownload(this.checked)"> ${escapeUi(uiText("Автозагрузка фото"))}</label>
     <h2>${escapeUi(uiText("Звонки"))}</h2><button class="settings-action" onclick="openCallTools('history')">${escapeUi(uiText("История и настройки звонков"))}</button><h2>${escapeUi(uiText("Уведомления"))}</h2><button class="settings-action" onclick="requestNotificationPermission()">${icon('chats')}<span>${escapeUi(uiText("Уведомления"))}<small id="notificationSettingStatus">${state.notificationsEnabled ? uiText("Включены") : uiText("Включить в этом браузере")}</small></span></button>
